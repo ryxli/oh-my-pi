@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import re
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Mapping
+from typing import Any, Literal
 
 from robomp.db import issue_key
 
@@ -24,6 +26,9 @@ class RouteDecision:
     reason: str
     submitter: str | None = None
     association: str | None = None
+    directive: bool = False
+    directive_body: str | None = None
+    directive_author: str | None = None
 
     @property
     def should_queue(self) -> bool:
@@ -80,20 +85,60 @@ def _submitter_info(obj: Mapping[str, Any] | None) -> tuple[str | None, str | No
     return login, (str(assoc) if isinstance(assoc, str) and assoc else None)
 
 
+def extract_mention(body: str | None, bot_login: str) -> str | None:
+    """Return `body` with `@<bot_login>` mentions stripped, or None if no mention.
+
+    Match is case-insensitive and word-boundary aware (hyphens in logins are
+    part of the token, so `@robomp-bot` does NOT match `@robomp-bot-extra`).
+    """
+    if not isinstance(body, str) or not body:
+        return None
+    login = bot_login.strip()
+    if not login:
+        return None
+    pattern = re.compile(
+        rf"(?<![A-Za-z0-9_-])@{re.escape(login)}(?![A-Za-z0-9_-])",
+        re.IGNORECASE,
+    )
+    if not pattern.search(body):
+        return None
+    stripped = pattern.sub("", body)
+    # Collapse the whitespace the strip leaves behind without mangling the rest.
+    stripped = re.sub(r"[ \t]+", " ", stripped)
+    stripped = re.sub(r"\n[ \t]+", "\n", stripped)
+    return stripped.strip()
+
+
+def is_maintainer(
+    login: str | None,
+    association: str | None,
+    *,
+    maintainers: frozenset[str],
+) -> bool:
+    """A maintainer is anyone in `maintainers` or with a trusted association."""
+    if isinstance(login, str) and login and login.lower() in maintainers:
+        return True
+    if isinstance(association, str) and association.upper() in TRUSTED_ASSOCIATIONS:
+        return True
+    return False
+
+
 def route(
     event_type: str,
     payload: Mapping[str, Any],
     *,
     allowlist: frozenset[str],
     bot_login: str,
+    maintainers: frozenset[str] = frozenset(),
     resolve_issue_from_pr: PrIssueResolver = None,
 ) -> RouteDecision:
     """Decide whether and how to handle a webhook event.
 
     `resolve_issue_from_pr(repo, pr_number)` maps a PR number back to its
-    originating-issue key (e.g. `octo/widget#42`). Used so PR-derived events
-    serialize on the *same* inflight key as the issue's own events. When the
-    mapping is unknown (no DB row yet), we fall back to a PR-scoped key.
+    originating-issue key (e.g. `octo/widget#42`). User comments on PRs are
+    only actionable when that mapping exists, so they serialize on the same
+    inflight key as the issue's own events. PR lifecycle cleanup may still
+    fall back to a PR-scoped key when the origin row is gone.
     """
     repo = _repo_full_name(payload)
     if repo is None or repo.lower() not in allowlist:
@@ -108,6 +153,20 @@ def route(
                 return resolved
         return f"{repo}#pr-{pr_number}"
 
+    def _resolve_origin_issue_key(pr_number: int) -> str | None:
+        if resolve_issue_from_pr is None:
+            return None
+        return resolve_issue_from_pr(repo, pr_number)  # type: ignore[arg-type]
+
+    def _directive_kwargs(body: str | None, login: str | None, assoc: str | None) -> dict[str, Any]:
+        """Decide whether this comment is a maintainer directive."""
+        if not is_maintainer(login, assoc, maintainers=maintainers):
+            return {}
+        stripped = extract_mention(body, bot_login)
+        if stripped is None:
+            return {}
+        return {"directive": True, "directive_body": stripped, "directive_author": login}
+
     if event_type == "issues":
         issue = payload.get("issue") or {}
         if "pull_request" in issue:
@@ -118,8 +177,9 @@ def route(
         key = issue_key(repo, number)
         if action == "opened":
             login, assoc = _submitter_info(issue)
-            return RouteDecision("queue", "triage_issue", repo, key, "issues.opened",
-                                 submitter=login, association=assoc)
+            return RouteDecision(
+                "queue", "triage_issue", repo, key, "issues.opened", submitter=login, association=assoc
+            )
         if action == "closed":
             # Cleanup is a lifecycle event, not a user submission; no rate-limit subject.
             return RouteDecision("queue", "cleanup_workspace", repo, key, "issues.closed")
@@ -135,17 +195,36 @@ def route(
             return RouteDecision("skip", None, repo, None, "comment missing issue number")
         if "pull_request" in issue:
             # Conversation comment on a PR. The PR number lives at issue.number
-            # on this payload type; the *originating-issue* key is whatever
-            # the resolver returns. Serialize on the issue, not the PR.
-            key = _resolve_pr_key(number)
+            # on this payload type. Only mapped bot PR follow-ups are
+            # actionable; unknown PRs must not consume per-user quota.
+            key = _resolve_origin_issue_key(number)
+            if key is None:
+                return RouteDecision("skip", None, repo, None, f"PR #{number} is not mapped to an issue")
             login, assoc = _submitter_info(comment)
-            return RouteDecision("queue", "handle_pr_conversation", repo, key,
-                                 f"issue_comment.created on PR #{number}",
-                                 submitter=login, association=assoc)
+            body = str(comment.get("body") or "")
+            return RouteDecision(
+                "queue",
+                "handle_pr_conversation",
+                repo,
+                key,
+                f"issue_comment.created on PR #{number}",
+                submitter=login,
+                association=assoc,
+                **_directive_kwargs(body, login, assoc),
+            )
         key = issue_key(repo, number)
         login, assoc = _submitter_info(comment)
-        return RouteDecision("queue", "handle_comment", repo, key, "issue_comment.created",
-                             submitter=login, association=assoc)
+        body = str(comment.get("body") or "")
+        return RouteDecision(
+            "queue",
+            "handle_comment",
+            repo,
+            key,
+            "issue_comment.created",
+            submitter=login,
+            association=assoc,
+            **_directive_kwargs(body, login, assoc),
+        )
 
     if event_type == "pull_request_review_comment" and action == "created":
         comment = payload.get("comment") or {}
@@ -158,10 +237,21 @@ def route(
         number = pr.get("number")
         if not isinstance(number, int):
             return RouteDecision("skip", None, repo, None, "PR missing number")
+        key = _resolve_origin_issue_key(number)
+        if key is None:
+            return RouteDecision("skip", None, repo, None, f"PR #{number} is not mapped to an issue")
         login, assoc = _submitter_info(comment)
-        return RouteDecision("queue", "handle_review", repo, _resolve_pr_key(number),
-                             "pull_request_review_comment.created",
-                             submitter=login, association=assoc)
+        body = str(comment.get("body") or "")
+        return RouteDecision(
+            "queue",
+            "handle_review",
+            repo,
+            key,
+            "pull_request_review_comment.created",
+            submitter=login,
+            association=assoc,
+            **_directive_kwargs(body, login, assoc),
+        )
 
     if event_type == "pull_request" and action == "closed":
         pr = payload.get("pull_request") or {}
@@ -173,8 +263,7 @@ def route(
         number = pr.get("number")
         if not isinstance(number, int):
             return RouteDecision("skip", None, repo, None, "PR missing number")
-        return RouteDecision("queue", "cleanup_workspace", repo, _resolve_pr_key(number),
-                             "pull_request.merged")
+        return RouteDecision("queue", "cleanup_workspace", repo, _resolve_pr_key(number), "pull_request.merged")
 
     return RouteDecision("skip", None, repo, None, f"{event_type}.{action} not handled")
 
@@ -211,6 +300,8 @@ __all__ = [
     "Decision",
     "RouteDecision",
     "TRUSTED_ASSOCIATIONS",
+    "extract_mention",
+    "is_maintainer",
     "rate_limit_cap",
     "route",
     "verify_signature",

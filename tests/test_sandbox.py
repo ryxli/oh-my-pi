@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -26,12 +25,18 @@ def upstream_repo(tmp_path: Path) -> Path:
     (seed / "README.md").write_text("hello\n", encoding="utf-8")
     _git(["-C", str(seed), "add", "."], cwd=tmp_path)
     env = os.environ | {
-        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
     }
     subprocess.run(
         ["git", "commit", "-m", "init"],
-        cwd=str(seed), check=True, capture_output=True, text=True, env=env,
+        cwd=str(seed),
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
     )
     _git(["-C", str(seed), "remote", "add", "origin", str(repo)], cwd=tmp_path)
     _git(["-C", str(seed), "push", "origin", "main"], cwd=tmp_path)
@@ -61,7 +66,9 @@ def test_ensure_workspace_creates_worktree(tmp_path: Path, upstream_repo: Path) 
     # Branch is checked out.
     result = subprocess.run(
         ["git", "-C", str(ws.repo_dir), "rev-parse", "--abbrev-ref", "HEAD"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     assert result.stdout.strip() == ws.branch
     assert ws.branch.startswith("farm/")
@@ -75,12 +82,18 @@ def test_ensure_workspace_creates_worktree(tmp_path: Path, upstream_repo: Path) 
 def test_ensure_workspace_is_idempotent(tmp_path: Path, upstream_repo: Path) -> None:
     mgr = SandboxManager(tmp_path / "workspaces")
     ws1 = mgr.ensure_workspace(
-        repo="octo/widget", number=5, title="t",
-        clone_url=str(upstream_repo), default_branch="main",
+        repo="octo/widget",
+        number=5,
+        title="t",
+        clone_url=str(upstream_repo),
+        default_branch="main",
     )
     ws2 = mgr.ensure_workspace(
-        repo="octo/widget", number=5, title="t",
-        clone_url=str(upstream_repo), default_branch="main",
+        repo="octo/widget",
+        number=5,
+        title="t",
+        clone_url=str(upstream_repo),
+        default_branch="main",
     )
     assert ws1.repo_dir == ws2.repo_dir
     assert ws1.branch == ws2.branch
@@ -89,8 +102,11 @@ def test_ensure_workspace_is_idempotent(tmp_path: Path, upstream_repo: Path) -> 
 def test_remove_workspace(tmp_path: Path, upstream_repo: Path) -> None:
     mgr = SandboxManager(tmp_path / "workspaces")
     ws = mgr.ensure_workspace(
-        repo="octo/widget", number=12, title="t",
-        clone_url=str(upstream_repo), default_branch="main",
+        repo="octo/widget",
+        number=12,
+        title="t",
+        clone_url=str(upstream_repo),
+        default_branch="main",
     )
     assert ws.repo_dir.exists()
     mgr.remove_workspace(repo="octo/widget", number=12)
@@ -100,6 +116,7 @@ def test_remove_workspace(tmp_path: Path, upstream_repo: Path) -> None:
 
 def test_redact_credentials_strips_userinfo() -> None:
     from robomp.sandbox import redact_credentials
+
     assert (
         redact_credentials("Cloning into 'x' from https://bot:ghp_secret@github.com/o/r.git failed")
         == "Cloning into 'x' from https://***@github.com/o/r.git failed"
@@ -116,8 +133,9 @@ def test_redact_credentials_strips_userinfo() -> None:
 
 def test_git_command_error_redacts_url_in_args_and_stderr(tmp_path: Path) -> None:
     """An ENOENT-style git failure on a credentialed clone URL must not echo the token."""
-    from robomp.sandbox import _run
     import pytest as _pytest
+
+    from robomp.sandbox import _run
 
     cred_url = "https://bot:ghp_abc123secret@example.invalid/o/r.git"
     with _pytest.raises(Exception) as exc:

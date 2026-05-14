@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 import httpx
 
@@ -68,6 +68,7 @@ class PullRequestInfo:
 @dataclass(slots=True, frozen=True)
 class IssueSummary:
     """Lightweight projection of an issue for list views (no body)."""
+
     repo: str
     number: int
     title: str
@@ -149,14 +150,16 @@ class GitHubClient:
             return None
         return resp.json()
 
-    def request_sync(self, method: str, path: str, *, json: Mapping[str, Any] | None = None,
-                     params: Mapping[str, Any] | None = None) -> Any:
+    def request_sync(
+        self, method: str, path: str, *, json: Mapping[str, Any] | None = None, params: Mapping[str, Any] | None = None
+    ) -> Any:
         with self._client() as client:
             resp = client.request(method, path, json=json, params=params)
             return self._check(resp)
 
-    async def request(self, method: str, path: str, *, json: Mapping[str, Any] | None = None,
-                      params: Mapping[str, Any] | None = None) -> Any:
+    async def request(
+        self, method: str, path: str, *, json: Mapping[str, Any] | None = None, params: Mapping[str, Any] | None = None
+    ) -> Any:
         async with self._async_client() as client:
             resp = await client.request(method, path, json=json, params=params)
             return self._check(resp)
@@ -197,21 +200,20 @@ class GitHubClient:
                 continue  # GitHub's /issues endpoint also returns PRs; skip them.
             user = item.get("user") or {}
             labels_raw = item.get("labels") or []
-            out.append(IssueSummary(
-                repo=repo,
-                number=int(item["number"]),
-                title=str(item.get("title") or ""),
-                state=str(item.get("state") or "open"),
-                author=str(user.get("login") or ""),
-                labels=tuple(
-                    str(lbl["name"]) if isinstance(lbl, dict) else str(lbl)
-                    for lbl in labels_raw
-                ),
-                comments=int(item.get("comments") or 0),
-                updated_at=str(item.get("updated_at") or ""),
-                created_at=str(item.get("created_at") or ""),
-                html_url=str(item.get("html_url") or ""),
-            ))
+            out.append(
+                IssueSummary(
+                    repo=repo,
+                    number=int(item["number"]),
+                    title=str(item.get("title") or ""),
+                    state=str(item.get("state") or "open"),
+                    author=str(user.get("login") or ""),
+                    labels=tuple(str(lbl["name"]) if isinstance(lbl, dict) else str(lbl) for lbl in labels_raw),
+                    comments=int(item.get("comments") or 0),
+                    updated_at=str(item.get("updated_at") or ""),
+                    created_at=str(item.get("created_at") or ""),
+                    html_url=str(item.get("html_url") or ""),
+                )
+            )
         return out
 
     async def list_comments(self, repo: str, number: int) -> list[CommentInfo]:
@@ -292,10 +294,7 @@ class GitHubClient:
             f"/repos/{repo}/issues/{number}/labels",
             json={"labels": labels},
         )
-        return tuple(
-            str(lbl["name"]) if isinstance(lbl, dict) else str(lbl)
-            for lbl in (data or [])
-        )
+        return tuple(str(lbl["name"]) if isinstance(lbl, dict) else str(lbl) for lbl in (data or []))
 
     async def add_assignees(self, repo: str, number: int, assignees: list[str]) -> None:
         if not assignees:
@@ -322,10 +321,7 @@ def _repo_from_payload(data: Mapping[str, Any]) -> RepoInfo:
 
 def _issue_from_payload(repo: str, data: Mapping[str, Any]) -> IssueInfo:
     labels_raw = data.get("labels") or []
-    labels = tuple(
-        str(lbl["name"]) if isinstance(lbl, dict) else str(lbl)
-        for lbl in labels_raw
-    )
+    labels = tuple(str(lbl["name"]) if isinstance(lbl, dict) else str(lbl) for lbl in labels_raw)
     user = data.get("user") or {}
     return IssueInfo(
         repo=repo,

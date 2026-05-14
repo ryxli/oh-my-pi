@@ -9,17 +9,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import shlex
 import subprocess
-import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 from omp_rpc import HostTool, HostToolContext, RpcCommandError, host_tool
 
 from robomp import persona
-
 from robomp.db import Database, issue_key
 from robomp.github_client import GitHubClient, GitHubError, IssueInfo, RepoInfo
 from robomp.sandbox import Workspace
@@ -51,8 +49,9 @@ def _run_coro(loop: asyncio.AbstractEventLoop, coro: Any) -> Any:
     return future.result()
 
 
-def _audit(bindings: ToolBindings, name: str, args: Mapping[str, Any], result: Any | None = None,
-           error: str | None = None) -> None:
+def _audit(
+    bindings: ToolBindings, name: str, args: Mapping[str, Any], result: Any | None = None, error: str | None = None
+) -> None:
     bindings.db.log_tool_call(
         issue_key=bindings.issue_key,
         tool=name,
@@ -92,7 +91,10 @@ def _build_post_comment(bindings: ToolBindings) -> HostTool[Any, Any]:
         parameters={
             "type": "object",
             "properties": {
-                "body": {"type": "string", "description": persona.host_tool_parameter_description("gh_post_comment", "body")},
+                "body": {
+                    "type": "string",
+                    "description": persona.host_tool_parameter_description("gh_post_comment", "body"),
+                },
                 "number": {
                     "type": "integer",
                     "description": persona.host_tool_parameter_description("gh_post_comment", "number"),
@@ -105,99 +107,120 @@ def _build_post_comment(bindings: ToolBindings) -> HostTool[Any, Any]:
     )
 
 
+def _guarded_push_branch(bindings: ToolBindings, args: Mapping[str, Any], tool_name: str, branch: str) -> str:
+    if branch != bindings.workspace.branch:
+        _raise_command(
+            f"refusing to push: branch={branch!r} does not match workspace branch {bindings.workspace.branch!r}."
+        )
+    repo_dir = str(bindings.workspace.repo_dir)
+    # Re-pin the configured identity right before push (cheap; idempotent).
+    subprocess.run(
+        ["git", "config", "user.email", bindings.author_email],
+        cwd=repo_dir,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", bindings.author_name],
+        cwd=repo_dir,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    # Verify there's at least one commit on the branch.
+    rev = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if rev.returncode != 0:
+        _audit(bindings, tool_name, args, error=rev.stderr.strip())
+        _raise_command(f"git rev-parse failed: {rev.stderr.strip()}")
+
+    # Identity gate: every commit between the base branch and HEAD must
+    # carry the configured author. Refuse to push otherwise so the agent
+    # fixes it (`git commit --amend --reset-author --no-edit`).
+    base = bindings.repo.default_branch
+    identities = subprocess.run(
+        ["git", "log", "--format=%H%x09%ae%x09%an", f"origin/{base}..HEAD"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if identities.returncode != 0:
+        err = (identities.stderr or identities.stdout).strip()
+        msg = f"refusing to push: could not inspect commit authors for origin/{base}..HEAD: {err}"
+        _audit(bindings, tool_name, args, error=msg)
+        _raise_command(msg)
+    offending: list[str] = []
+    for line in (identities.stdout or "").strip().splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        sha, email, name = parts[0], parts[1], parts[2]
+        if email != bindings.author_email or name != bindings.author_name:
+            offending.append(f"{sha[:12]} {name} <{email}>")
+    if offending:
+        details = "\n  ".join(offending)
+        msg = (
+            "refusing to push: commit author identity mismatch. "
+            f"Expected `{bindings.author_name} <{bindings.author_email}>`. "
+            f"Offending commits:\n  {details}\n"
+            "Amend each commit with `git commit --amend --reset-author --no-edit` "
+            "(or rebase with `git rebase -i origin/" + base + " --exec "
+            "'git commit --amend --reset-author --no-edit'`) and try again."
+        )
+        _audit(bindings, tool_name, args, error=msg)
+        _raise_command(msg)
+
+    # Working-tree cleanliness gate. Any uncommitted change (edits the agent
+    # forgot to `git add && git commit`, files dropped by package managers, etc.)
+    # would silently land in the PR review delta but not in the commit history.
+    # Reject so the agent either commits or stashes them.
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=normal"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if status.stdout.strip():
+        dirty = "\n  ".join(status.stdout.strip().splitlines())
+        msg = (
+            "refusing to push: working tree is dirty.\n  "
+            f"{dirty}\n"
+            "Commit (or `git stash`) every change before pushing — anything in the "
+            "worktree that isn't in a commit won't appear in the PR."
+        )
+        _audit(bindings, tool_name, args, error=msg)
+        _raise_command(msg)
+
+    proc = subprocess.run(
+        ["git", "push", "--set-upstream", "origin", branch],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout).strip()
+        _audit(bindings, tool_name, args, error=err)
+        _raise_command(f"git push failed: {err}")
+    head = rev.stdout.strip()
+    _audit(bindings, tool_name, args, result={"head": head, "branch": branch})
+    return head
+
+
 # ---------- gh_push_branch ----------
 def _build_push_branch(bindings: ToolBindings) -> HostTool[Any, Any]:
     def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
         branch = str(args.get("branch") or bindings.workspace.branch)
-        if branch != bindings.workspace.branch:
-            _raise_command(
-                f"refusing to push: branch={branch!r} does not match workspace branch "
-                f"{bindings.workspace.branch!r}."
-            )
-        repo_dir = str(bindings.workspace.repo_dir)
-        # Re-pin the configured identity right before push (cheap; idempotent).
-        subprocess.run(
-            ["git", "config", "user.email", bindings.author_email],
-            cwd=repo_dir, check=False, capture_output=True, text=True,
-        )
-        subprocess.run(
-            ["git", "config", "user.name", bindings.author_name],
-            cwd=repo_dir, check=False, capture_output=True, text=True,
-        )
-        # Verify there's at least one commit on the branch.
-        rev = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repo_dir, capture_output=True, text=True, check=False,
-        )
-        if rev.returncode != 0:
-            _audit(bindings, "gh_push_branch", args, error=rev.stderr.strip())
-            _raise_command(f"git rev-parse failed: {rev.stderr.strip()}")
-
-        # Identity gate: every commit between the base branch and HEAD must
-        # carry the configured author. Refuse to push otherwise so the agent
-        # fixes it (`git commit --amend --reset-author --no-edit`).
-        base = bindings.repo.default_branch
-        identities = subprocess.run(
-            ["git", "log", "--format=%H%x09%ae%x09%an", f"origin/{base}..HEAD"],
-            cwd=repo_dir, capture_output=True, text=True, check=False,
-        )
-        if identities.returncode != 0:
-            err = (identities.stderr or identities.stdout).strip()
-            msg = f"refusing to push: could not inspect commit authors for origin/{base}..HEAD: {err}"
-            _audit(bindings, "gh_push_branch", args, error=msg)
-            _raise_command(msg)
-        offending: list[str] = []
-        for line in (identities.stdout or "").strip().splitlines():
-            parts = line.split("\t")
-            if len(parts) < 3:
-                continue
-            sha, email, name = parts[0], parts[1], parts[2]
-            if email != bindings.author_email or name != bindings.author_name:
-                offending.append(f"{sha[:12]} {name} <{email}>")
-        if offending:
-            details = "\n  ".join(offending)
-            msg = (
-                "refusing to push: commit author identity mismatch. "
-                f"Expected `{bindings.author_name} <{bindings.author_email}>`. "
-                f"Offending commits:\n  {details}\n"
-                "Amend each commit with `git commit --amend --reset-author --no-edit` "
-                "(or rebase with `git rebase -i origin/" + base + " --exec "
-                "'git commit --amend --reset-author --no-edit'`) and try again."
-            )
-            _audit(bindings, "gh_push_branch", args, error=msg)
-            _raise_command(msg)
-        # Working-tree cleanliness gate. Any uncommitted change (edits the agent
-        # forgot to `git add && git commit`, files dropped by `bun install`, etc.)
-        # would silently land in the PR review delta but not in the commit history.
-        # Reject so the agent either commits or stashes them.
-        status = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=normal"],
-            cwd=repo_dir, capture_output=True, text=True, check=False,
-        )
-        if status.stdout.strip():
-            dirty = "\n  ".join(status.stdout.strip().splitlines())
-            msg = (
-                "refusing to push: working tree is dirty.\n  "
-                f"{dirty}\n"
-                "Commit (or `git stash`) every change before pushing — anything in the "
-                "worktree that isn't in a commit won't appear in the PR."
-            )
-            _audit(bindings, "gh_push_branch", args, error=msg)
-            _raise_command(msg)
-
-        proc = subprocess.run(
-            ["git", "push", "--set-upstream", "origin", branch],
-            cwd=repo_dir, capture_output=True, text=True, check=False,
-        )
-        if proc.returncode != 0:
-            err = (proc.stderr or proc.stdout).strip()
-            _audit(bindings, "gh_push_branch", args, error=err)
-            _raise_command(f"git push failed: {err}")
-        _audit(bindings, "gh_push_branch", args, result={"head": rev.stdout.strip(), "branch": branch})
-        return (
-            f"pushed {branch} at {rev.stdout.strip()[:12]} "
-            f"as {bindings.author_name} <{bindings.author_email}>"
-        )
+        head = _guarded_push_branch(bindings, args, "gh_push_branch", branch)
+        return f"pushed {branch} at {head[:12]} as {bindings.author_name} <{bindings.author_email}>"
 
     return host_tool(
         name="gh_push_branch",
@@ -241,18 +264,8 @@ def _build_open_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
                 "GitHub auto-closes the issue when the PR merges. Put it at the end of the "
                 "Verification section per the template."
             )
-        # Make sure the branch is pushed (idempotent).
-        push_proc = subprocess.run(
-            ["git", "push", "--set-upstream", "origin", bindings.workspace.branch],
-            cwd=str(bindings.workspace.repo_dir),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if push_proc.returncode != 0:
-            err = (push_proc.stderr or push_proc.stdout).strip()
-            _audit(bindings, "gh_open_pr", args, error=err)
-            _raise_command(f"branch push failed: {err}")
+        # Make sure the branch is pushed (idempotent) using the same preflight as gh_push_branch.
+        _guarded_push_branch(bindings, args, "gh_open_pr", bindings.workspace.branch)
         base = args.get("base") or bindings.repo.default_branch
         try:
             pr = _run_coro(
@@ -299,7 +312,10 @@ def _build_open_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
                     "type": "string",
                     "description": persona.host_tool_parameter_description("gh_open_pr", "body"),
                 },
-                "base": {"type": "string", "description": persona.host_tool_parameter_description("gh_open_pr", "base")},
+                "base": {
+                    "type": "string",
+                    "description": persona.host_tool_parameter_description("gh_open_pr", "base"),
+                },
                 "draft": {"type": "boolean", "default": False},
             },
             "required": ["title", "body"],
@@ -400,7 +416,10 @@ def _build_repro_record(bindings: ToolBindings) -> HostTool[Any, Any]:
                 "command": {"type": "string"},
                 "output": {"type": "string"},
                 "exit_code": {"type": "integer"},
-                "reproduced": {"type": "boolean", "description": persona.host_tool_parameter_description("repro_record", "reproduced")},
+                "reproduced": {
+                    "type": "boolean",
+                    "description": persona.host_tool_parameter_description("repro_record", "reproduced"),
+                },
             },
             "required": ["title", "command", "output", "exit_code"],
             "additionalProperties": False,
@@ -502,11 +521,12 @@ _PLATFORMS = ("platform:linux", "platform:macos", "platform:windows", "platform:
 
 def _build_set_issue_labels(bindings: ToolBindings) -> HostTool[Any, Any]:
     """Append labels to the originating issue (or PR)."""
+
     def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
         labels = args.get("labels")
         if not isinstance(labels, list) or not labels:
             _raise_command("set_issue_labels requires a non-empty 'labels' array.")
-        cleaned = [str(l).strip() for l in labels if isinstance(l, str) and l.strip()]
+        cleaned = [str(lbl).strip() for lbl in labels if isinstance(lbl, str) and lbl.strip()]
         if not cleaned:
             _raise_command("set_issue_labels requires at least one non-empty label.")
         target_number = bindings.issue.number
@@ -530,7 +550,10 @@ def _build_set_issue_labels(bindings: ToolBindings) -> HostTool[Any, Any]:
             "type": "object",
             "properties": {
                 "labels": {"type": "array", "items": {"type": "string"}},
-                "number": {"type": "integer", "description": persona.host_tool_parameter_description("set_issue_labels", "number")},
+                "number": {
+                    "type": "integer",
+                    "description": persona.host_tool_parameter_description("set_issue_labels", "number"),
+                },
             },
             "required": ["labels"],
             "additionalProperties": False,
@@ -543,18 +566,15 @@ def _build_classify_issue(bindings: ToolBindings) -> HostTool[Any, Any]:
     """Triage step. Pick a primary type, optional priority/functional/provider/platform,
     apply labels on GitHub, persist the primary type in sqlite, and signal which workflow
     branch the agent should follow."""
+
     def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
         primary = args.get("primary")
         if primary not in _PRIMARY_TYPES:
-            _raise_command(
-                f"classify_issue 'primary' must be one of {_PRIMARY_TYPES}; got {primary!r}."
-            )
+            _raise_command(f"classify_issue 'primary' must be one of {_PRIMARY_TYPES}; got {primary!r}.")
         priority = args.get("priority")
         if primary == "bug":
             if priority not in _PRIORITIES:
-                _raise_command(
-                    f"classify_issue requires 'priority' in {_PRIORITIES} when primary=='bug'."
-                )
+                _raise_command(f"classify_issue requires 'priority' in {_PRIORITIES} when primary=='bug'.")
         elif priority is not None and priority != "":
             _raise_command("classify_issue 'priority' is only valid when primary=='bug'.")
         rationale = args.get("rationale")
@@ -584,7 +604,9 @@ def _build_classify_issue(bindings: ToolBindings) -> HostTool[Any, Any]:
             applied = _run_coro(
                 bindings.loop,
                 bindings.github.add_issue_labels(
-                    bindings.repo.full_name, bindings.issue.number, labels,
+                    bindings.repo.full_name,
+                    bindings.issue.number,
+                    labels,
                 ),
             )
         except GitHubError as exc:
@@ -593,7 +615,9 @@ def _build_classify_issue(bindings: ToolBindings) -> HostTool[Any, Any]:
 
         bindings.db.set_issue_classification(bindings.issue_key, primary)
         _audit(
-            bindings, "classify_issue", args,
+            bindings,
+            "classify_issue",
+            args,
             result={"primary": primary, "labels": list(applied), "rationale": rationale},
         )
         # Echo back the workflow the agent should now follow. The persona prompt
@@ -631,7 +655,10 @@ def _build_classify_issue(bindings: ToolBindings) -> HostTool[Any, Any]:
                     "enum": list(_PLATFORMS),
                     "description": persona.host_tool_parameter_description("classify_issue", "platform"),
                 },
-                "rationale": {"type": "string", "description": persona.host_tool_parameter_description("classify_issue", "rationale")},
+                "rationale": {
+                    "type": "string",
+                    "description": persona.host_tool_parameter_description("classify_issue", "rationale"),
+                },
             },
             "required": ["primary", "rationale"],
             "additionalProperties": False,

@@ -19,9 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shutil
 import subprocess
-import threading
 from pathlib import Path
 from typing import Any
 
@@ -38,8 +36,10 @@ pytestmark = pytest.mark.skipif(
 
 def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     env = os.environ | {
-        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
     }
     return subprocess.run(["git", *args], cwd=str(cwd), check=check, capture_output=True, text=True, env=env)
 
@@ -94,24 +94,37 @@ def test_triage_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
         path = request.url.path
         method = request.method
         if method == "GET" and path == "/repos/octo/widget":
-            return httpx.Response(200, json={
-                "full_name": "octo/widget", "default_branch": "main",
-                "clone_url": str(bare), "private": False,
-            })
+            return httpx.Response(
+                200,
+                json={
+                    "full_name": "octo/widget",
+                    "default_branch": "main",
+                    "clone_url": str(bare),
+                    "private": False,
+                },
+            )
         if method == "GET" and path == "/repos/octo/widget/issues/1":
-            return httpx.Response(200, json={
-                "number": 1, "title": "2+2 should be 4",
-                "body": "Running `node test.js` exits non-zero because the assertion claims 2+2 is 5.",
-                "state": "open", "user": {"login": "alice"}, "labels": [],
-            })
+            return httpx.Response(
+                200,
+                json={
+                    "number": 1,
+                    "title": "2+2 should be 4",
+                    "body": "Running `node test.js` exits non-zero because the assertion claims 2+2 is 5.",
+                    "state": "open",
+                    "user": {"login": "alice"},
+                    "labels": [],
+                },
+            )
         if method == "GET" and path == "/repos/octo/widget/issues/1/comments":
             return httpx.Response(200, json=comments)
         if method == "POST" and path == "/repos/octo/widget/issues/1/comments":
             body = json.loads(request.content)
             next_comment_id[0] += 1
             comment = {
-                "id": next_comment_id[0], "user": {"login": "robomp-bot"},
-                "body": body["body"], "created_at": "now",
+                "id": next_comment_id[0],
+                "user": {"login": "robomp-bot"},
+                "body": body["body"],
+                "created_at": "now",
             }
             comments.append(comment)
             return httpx.Response(201, json=comment)
@@ -135,13 +148,18 @@ def test_triage_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     payload = {
         "action": "opened",
         "issue": {
-            "number": 1, "title": "2+2 should be 4",
+            "number": 1,
+            "title": "2+2 should be 4",
             "body": "Running `node test.js` exits non-zero because the assertion claims 2+2 is 5.",
-            "state": "open", "user": {"login": "alice"}, "labels": [],
+            "state": "open",
+            "user": {"login": "alice"},
+            "labels": [],
         },
         "repository": {
-            "full_name": "octo/widget", "default_branch": "main",
-            "clone_url": str(bare), "private": False,
+            "full_name": "octo/widget",
+            "default_branch": "main",
+            "clone_url": str(bare),
+            "private": False,
         },
     }
 
@@ -150,7 +168,11 @@ def test_triage_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
         github = GitHubClient("ghp_test", transport=transport)
         sandbox = SandboxManager(cfg.workspace_root)
         await triage_issue(
-            settings=cfg, db=db, github=github, sandbox=sandbox, payload=payload,
+            settings=cfg,
+            db=db,
+            github=github,
+            sandbox=sandbox,
+            payload=payload,
         )
         row = db.get_issue("octo/widget#1")
         assert row is not None, "issue row missing"
@@ -167,7 +189,9 @@ def test_triage_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     # Branch should be pushed to the bare repo.
     refs = subprocess.run(
         ["git", "-C", str(bare), "for-each-ref", "--format=%(refname)"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     assert any(r.startswith("refs/heads/farm/") for r in refs.stdout.splitlines()), refs.stdout
     assert comments, "expected at least one comment"

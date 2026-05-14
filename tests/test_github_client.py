@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import threading
 
 import httpx
 import pytest
@@ -16,9 +15,7 @@ def _run_async(coro):
 
 
 def test_4xx_maps_to_github_error_with_message() -> None:
-    transport = httpx.MockTransport(
-        lambda req: httpx.Response(404, json={"message": "Not Found"})
-    )
+    transport = httpx.MockTransport(lambda req: httpx.Response(404, json={"message": "Not Found"}))
     client = GitHubClient("tok", transport=transport)
     with pytest.raises(GitHubError) as exc:
         asyncio.new_event_loop().run_until_complete(client.get_repo("o/r"))
@@ -74,10 +71,15 @@ def test_redirect_target_succeeds_when_followable() -> None:
                 301,
                 headers={"location": "https://api.github.com/repos/new/repo"},
             )
-        return httpx.Response(200, json={
-            "full_name": "new/repo", "default_branch": "main",
-            "clone_url": "https://github.com/new/repo.git", "private": False,
-        })
+        return httpx.Response(
+            200,
+            json={
+                "full_name": "new/repo",
+                "default_branch": "main",
+                "clone_url": "https://github.com/new/repo.git",
+                "private": False,
+            },
+        )
 
     transport = httpx.MockTransport(handler)
     client = GitHubClient("tok", transport=transport)

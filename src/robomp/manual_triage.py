@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from robomp.db import Database, issue_key
+from robomp.db import INACTIVE_EVENT_STATES, Database, issue_key
 from robomp.github_client import GitHubClient
 
 _ISSUE_REF = re.compile(r"^(?P<owner>[^/\s]+)/(?P<repo>[^#\s]+)#(?P<number>\d+)$")
@@ -16,6 +16,19 @@ _ISSUE_REF = re.compile(r"^(?P<owner>[^/\s]+)/(?P<repo>[^#\s]+)#(?P<number>\d+)$
 
 class InvalidIssueRef(ValueError):
     """Raised when the user-supplied issue reference can't be parsed."""
+
+
+class ManualTriageError(ValueError):
+    """Raised when a live GitHub issue cannot be manually triaged."""
+
+
+class ManualTriageConflict(RuntimeError):
+    """Raised when a stable manual delivery id is already active."""
+
+    def __init__(self, delivery_id: str, state: str) -> None:
+        self.delivery_id = delivery_id
+        self.state = state
+        super().__init__(f"{delivery_id} is already {state}")
 
 
 def parse_issue_ref(ref: str) -> tuple[str, int]:
@@ -31,11 +44,11 @@ def manual_delivery_id(repo_full: str, number: int) -> str:
     return f"manual-{repo_full.replace('/', '__')}-{number}"
 
 
-async def build_issues_opened_payload(
-    github: GitHubClient, repo_full: str, number: int
-) -> dict[str, Any]:
+async def build_issues_opened_payload(github: GitHubClient, repo_full: str, number: int) -> dict[str, Any]:
     """Fetch the issue + repo metadata and synthesize an `issues.opened` payload."""
     issue = await github.get_issue(repo_full, number)
+    if issue.is_pull_request:
+        raise ManualTriageError(f"{repo_full}#{number} is a pull request, not an issue")
     repo = await github.get_repo(repo_full)
     return {
         "action": "opened",
@@ -56,30 +69,39 @@ async def build_issues_opened_payload(
     }
 
 
-async def enqueue_manual_triage(
-    *, db: Database, github: GitHubClient, repo_full: str, number: int
-) -> str:
+async def enqueue_manual_triage(*, db: Database, github: GitHubClient, repo_full: str, number: int) -> str:
     """Fetch the issue from GitHub and queue it for the worker pool.
 
     Returns the delivery_id. A row may already exist from a previous manual
-    triage; we drop it so the fresh payload (and reset attempt counter) wins.
+    triage; inactive rows are replaced so the fresh payload (and reset attempt
+    counter) wins. Active rows are left intact.
     """
-    payload = await build_issues_opened_payload(github, repo_full, number)
     delivery = manual_delivery_id(repo_full, number)
-    db.remove_event(delivery)
-    db.record_event(
+    existing = db.get_event(delivery)
+    if existing is not None and existing.state in ("queued", "running"):
+        raise ManualTriageConflict(delivery, existing.state)
+
+    payload = await build_issues_opened_payload(github, repo_full, number)
+    replaced = db.replace_event_if_state_in(
         delivery_id=delivery,
         event_type="issues",
         repo=repo_full,
         issue_key=issue_key(repo_full, number),
         payload=payload,
         state="queued",
+        allowed_existing_states=INACTIVE_EVENT_STATES,
     )
+    if not replaced:
+        current = db.get_event(delivery)
+        state = current.state if current is not None else "active"
+        raise ManualTriageConflict(delivery, state)
     return delivery
 
 
 __all__ = [
     "InvalidIssueRef",
+    "ManualTriageError",
+    "ManualTriageConflict",
     "build_issues_opened_payload",
     "enqueue_manual_triage",
     "manual_delivery_id",

@@ -135,6 +135,30 @@ def kickoff(*, repo: RepoInfo, issue: IssueInfo, workspace: Workspace) -> str:
     return render(_load("kickoff_issue.md"), {"repo": repo, "issue": issue, "workspace": workspace})
 
 
+def kickoff_directive(
+    *,
+    repo: RepoInfo,
+    issue: IssueInfo,
+    workspace: Workspace,
+    directive: Any,
+) -> str:
+    """Kickoff for an untriaged issue that arrived via a maintainer mention.
+
+    `directive` is duck-typed to anything with `body` and `author` string
+    attributes (see `worker.DirectiveInfo`). Imported lazily to avoid a
+    persona → worker circular dependency.
+    """
+    return render(
+        _load("kickoff_directive.md"),
+        {
+            "repo": repo,
+            "issue": issue,
+            "workspace": workspace,
+            "directive": {"body": directive.body, "author": directive.author},
+        },
+    )
+
+
 def followup_comment(
     *,
     repo: RepoInfo,
@@ -150,6 +174,29 @@ def followup_comment(
             "issue": issue,
             "workspace": workspace,
             "comment": comment,
+            "state": {"pr_status": pr_status},
+        },
+    )
+
+
+def directive(
+    *,
+    repo: RepoInfo,
+    issue: IssueInfo,
+    comment: CommentInfo,
+    workspace: Workspace,
+    directive: Any,
+    pr_status: str,
+) -> str:
+    """Follow-up flavor for a comment that is a maintainer directive."""
+    return render(
+        _load("directive.md"),
+        {
+            "repo": repo,
+            "issue": issue,
+            "workspace": workspace,
+            "comment": comment,
+            "directive": {"body": directive.body, "author": directive.author},
             "state": {"pr_status": pr_status},
         },
     )
@@ -180,6 +227,7 @@ def followup_review(
         },
     )
 
+
 def unable_to_reproduce_comment(*, diagnosis: str, info_needed: str) -> str:
     return render(
         _load("unable_to_reproduce_comment.md"),
@@ -195,9 +243,9 @@ def finalized_pr_comment() -> str:
     return _load("finalized_pr_comment.md").strip()
 
 
-
 __all__ = [
     "classify_next_step",
+    "directive",
     "finalized_issue_comment",
     "finalized_pr_comment",
     "followup_comment",
@@ -205,6 +253,7 @@ __all__ = [
     "host_tool_description",
     "host_tool_parameter_description",
     "kickoff",
+    "kickoff_directive",
     "render",
     "seed_phases",
     "system_append",

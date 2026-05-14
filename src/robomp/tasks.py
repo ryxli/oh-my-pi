@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 from urllib.parse import urlparse
-
 
 from robomp import persona
 from robomp.config import Settings
@@ -19,7 +19,7 @@ from robomp.github_client import (
     parse_issue_payload,
 )
 from robomp.sandbox import SandboxManager
-from robomp.worker import TaskInputs, run_task
+from robomp.worker import DirectiveInfo, TaskInputs, run_task
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +41,20 @@ def _comment_from_payload(payload: Mapping[str, Any]) -> CommentInfo:
         body=str(c.get("body") or ""),
         created_at=str(c.get("created_at") or ""),
     )
+
+
+def _directive_from_payload(payload: Mapping[str, Any]) -> DirectiveInfo | None:
+    """Extract the maintainer directive the webhook handler stashed, if any."""
+    raw = payload.get("_robomp_directive")
+    if not isinstance(raw, Mapping):
+        return None
+    body = raw.get("body")
+    author = raw.get("author")
+    if not isinstance(body, str) or not body.strip():
+        return None
+    if not isinstance(author, str) or not author.strip():
+        return None
+    return DirectiveInfo(body=body, author=author)
 
 
 async def _resolve_repo_and_issue(
@@ -77,14 +91,14 @@ async def triage_issue(
         settings.bot_login,
     )
     workspace = sandbox.ensure_workspace(
-            repo=repo.full_name,
-            number=issue.number,
-            title=issue.title,
-            clone_url=clone_url,
-            default_branch=repo.default_branch,
-            author_name=settings.resolved_author_name,
-            author_email=settings.git_author_email,
-        )
+        repo=repo.full_name,
+        number=issue.number,
+        title=issue.title,
+        clone_url=clone_url,
+        default_branch=repo.default_branch,
+        author_name=settings.resolved_author_name,
+        author_email=settings.git_author_email,
+    )
     db.upsert_issue(
         key=key,
         repo=repo.full_name,
@@ -115,35 +129,106 @@ async def handle_comment(
     repo, issue = await _resolve_repo_and_issue(github, payload)
     key = issue_key(repo.full_name, issue.number)
     existing = db.get_issue(key)
-    if existing is None:
-        log.info("skip: comment on unknown issue", extra={"key": key})
-        return
-    if existing.state in ("merged", "closed", "abandoned"):
-        log.info("skip: comment on finalized issue", extra={"key": key, "state": existing.state})
-        try:
-            await github.post_comment(
-                repo.full_name, issue.number,
-                persona.finalized_issue_comment(),
-            )
-        except GitHubError as exc:
-            log.warning("ack comment failed", extra={"err": str(exc)})
-        return
+    directive = _directive_from_payload(payload)
     comment = _comment_from_payload(payload)
     clone_url = _credentialed_clone_url(
         repo.clone_url,
         settings.github_token.get_secret_value(),
         settings.bot_login,
     )
-    workspace = sandbox.ensure_workspace(
+
+    if existing is None:
+        if directive is None:
+            log.info("skip: comment on unknown issue", extra={"key": key})
+            return
+        # Maintainer summon on an untriaged issue: bootstrap a row + workspace,
+        # then route through triage-with-directive so the agent classifies
+        # first and executes the directive in the same RPC turn.
+        log.info("directive bootstrap", extra={"key": key, "author": directive.author})
+        db.upsert_issue(key=key, repo=repo.full_name, number=issue.number, state="reproducing")
+        workspace = sandbox.ensure_workspace(
             repo=repo.full_name,
             number=issue.number,
             title=issue.title,
             clone_url=clone_url,
             default_branch=repo.default_branch,
-            existing_branch=existing.branch,
             author_name=settings.resolved_author_name,
             author_email=settings.git_author_email,
         )
+        db.upsert_issue(
+            key=key,
+            repo=repo.full_name,
+            number=issue.number,
+            state="reproducing",
+            branch=workspace.branch,
+            session_dir=str(workspace.session_dir),
+        )
+        inputs = TaskInputs(
+            settings=settings,
+            db=db,
+            github=github,
+            repo=repo,
+            issue=issue,
+            workspace=workspace,
+        )
+        await run_task(task_kind="triage_issue", inputs=inputs, directive=directive)
+        return
+
+    if existing.state in ("merged", "closed", "abandoned"):
+        if directive is None:
+            log.info("skip: comment on finalized issue", extra={"key": key, "state": existing.state})
+            try:
+                await github.post_comment(
+                    repo.full_name,
+                    issue.number,
+                    persona.finalized_issue_comment(),
+                )
+            except GitHubError as exc:
+                log.warning("ack comment failed", extra={"err": str(exc)})
+            return
+        # Maintainer reopen: tear down stale workspace, reset state, branch
+        # afresh from default. The old branch may have been merged/deleted.
+        log.info("directive reopen", extra={"key": key, "from_state": existing.state, "author": directive.author})
+        sandbox.remove_workspace(repo=repo.full_name, number=issue.number)
+        db.upsert_issue(key=key, repo=repo.full_name, number=issue.number, state="reproducing")
+        workspace = sandbox.ensure_workspace(
+            repo=repo.full_name,
+            number=issue.number,
+            title=issue.title,
+            clone_url=clone_url,
+            default_branch=repo.default_branch,
+            author_name=settings.resolved_author_name,
+            author_email=settings.git_author_email,
+        )
+        db.upsert_issue(
+            key=key,
+            repo=repo.full_name,
+            number=issue.number,
+            state="reproducing",
+            branch=workspace.branch,
+            session_dir=str(workspace.session_dir),
+        )
+        inputs = TaskInputs(
+            settings=settings,
+            db=db,
+            github=github,
+            repo=repo,
+            issue=issue,
+            workspace=workspace,
+        )
+        await run_task(task_kind="handle_comment", inputs=inputs, comment=comment, directive=directive)
+        return
+
+    workspace = sandbox.ensure_workspace(
+        repo=repo.full_name,
+        number=issue.number,
+        title=issue.title,
+        clone_url=clone_url,
+        default_branch=repo.default_branch,
+        existing_branch=existing.branch,
+        author_name=settings.resolved_author_name,
+        author_email=settings.git_author_email,
+    )
     inputs = TaskInputs(
         settings=settings,
         db=db,
@@ -152,7 +237,7 @@ async def handle_comment(
         issue=issue,
         workspace=workspace,
     )
-    await run_task(task_kind="handle_comment", inputs=inputs, comment=comment)
+    await run_task(task_kind="handle_comment", inputs=inputs, comment=comment, directive=directive)
 
 
 async def handle_review(
@@ -190,15 +275,15 @@ async def handle_review(
         settings.bot_login,
     )
     workspace = sandbox.ensure_workspace(
-            repo=repo.full_name,
-            number=issue.number,
-            title=issue.title,
-            clone_url=clone_url,
-            default_branch=repo.default_branch,
-            existing_branch=issue_row.branch,
-            author_name=settings.resolved_author_name,
-            author_email=settings.git_author_email,
-        )
+        repo=repo.full_name,
+        number=issue.number,
+        title=issue.title,
+        clone_url=clone_url,
+        default_branch=repo.default_branch,
+        existing_branch=issue_row.branch,
+        author_name=settings.resolved_author_name,
+        author_email=settings.git_author_email,
+    )
     comment = payload.get("comment") or {}
     user = comment.get("user") or {}
     review_payload = {
@@ -250,17 +335,30 @@ async def handle_pr_conversation(
     if issue_row is None:
         log.info("skip: pr-conversation on unknown PR", extra={"repo": repo_full, "pr": pr_number})
         return
+    directive = _directive_from_payload(payload)
     if issue_row.state in ("merged", "closed", "abandoned"):
-        log.info("skip: pr-conversation on finalized issue", extra={"key": issue_row.key, "state": issue_row.state})
-        # Still acknowledge so the reporter knows the bot saw it.
-        try:
-            await github.post_comment(
-                repo_full, pr_number,
-                persona.finalized_pr_comment(),
-            )
-        except GitHubError as exc:
-            log.warning("ack comment failed", extra={"err": str(exc)})
-        return
+        if directive is None:
+            log.info("skip: pr-conversation on finalized issue", extra={"key": issue_row.key, "state": issue_row.state})
+            # Still acknowledge so the reporter knows the bot saw it.
+            try:
+                await github.post_comment(
+                    repo_full,
+                    pr_number,
+                    persona.finalized_pr_comment(),
+                )
+            except GitHubError as exc:
+                log.warning("ack comment failed", extra={"err": str(exc)})
+            return
+        # Maintainer reopen on a finalized PR: tear down stale workspace and
+        # branch afresh on the originating issue. The agent will open a new
+        # PR if code changes ship.
+        log.info(
+            "directive reopen (pr)",
+            extra={"key": issue_row.key, "from_state": issue_row.state, "author": directive.author},
+        )
+        sandbox.remove_workspace(repo=issue_row.repo, number=issue_row.number)
+        db.upsert_issue(key=issue_row.key, repo=issue_row.repo, number=issue_row.number, state="reproducing")
+        issue_row = db.get_issue(issue_row.key) or issue_row
     try:
         repo = await github.get_repo(repo_full)
         issue = await github.get_issue(repo_full, issue_row.number)
@@ -272,22 +370,40 @@ async def handle_pr_conversation(
         settings.github_token.get_secret_value(),
         settings.bot_login,
     )
+    # On a reopen the prior branch is stale (merged/deleted), so branch from
+    # default; otherwise reuse the existing branch.
+    existing_branch = (
+        None if directive and issue_row.state == "reproducing" and issue_row.branch is None else issue_row.branch
+    )
     workspace = sandbox.ensure_workspace(
-            repo=repo.full_name,
-            number=issue.number,
-            title=issue.title,
-            clone_url=clone_url,
-            default_branch=repo.default_branch,
-            existing_branch=issue_row.branch,
-            author_name=settings.resolved_author_name,
-            author_email=settings.git_author_email,
+        repo=repo.full_name,
+        number=issue.number,
+        title=issue.title,
+        clone_url=clone_url,
+        default_branch=repo.default_branch,
+        existing_branch=existing_branch,
+        author_name=settings.resolved_author_name,
+        author_email=settings.git_author_email,
+    )
+    if directive is not None and (issue_row.branch is None or issue_row.branch != workspace.branch):
+        db.upsert_issue(
+            key=issue_row.key,
+            repo=issue_row.repo,
+            number=issue_row.number,
+            state="reproducing",
+            branch=workspace.branch,
+            session_dir=str(workspace.session_dir),
         )
     comment = _comment_from_payload(payload)
     inputs = TaskInputs(
-        settings=settings, db=db, github=github,
-        repo=repo, issue=issue, workspace=workspace,
+        settings=settings,
+        db=db,
+        github=github,
+        repo=repo,
+        issue=issue,
+        workspace=workspace,
     )
-    await run_task(task_kind="handle_comment", inputs=inputs, comment=comment, pr_number=pr_number)
+    await run_task(task_kind="handle_comment", inputs=inputs, comment=comment, pr_number=pr_number, directive=directive)
 
 
 async def cleanup_workspace(

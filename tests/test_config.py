@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from robomp.config import Settings, reset_settings_cache
 
@@ -24,7 +25,7 @@ def test_settings_missing_required(monkeypatch: pytest.MonkeyPatch, tmp_path) ->
     ):
         monkeypatch.delenv(key, raising=False)
     reset_settings_cache()
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         Settings()  # type: ignore[call-arg]
 
 
@@ -60,7 +61,7 @@ def test_real_replay_token_preserved(monkeypatch: pytest.MonkeyPatch, env: dict[
 def test_blank_bot_login_rejected(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
     monkeypatch.setenv("ROBOMP_BOT_LOGIN", "   ")
     reset_settings_cache()
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         Settings()  # type: ignore[call-arg]
 
 

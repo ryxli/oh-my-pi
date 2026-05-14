@@ -7,9 +7,9 @@ import re
 import secrets
 import shutil
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
 
 log = logging.getLogger(__name__)
 
@@ -81,7 +81,9 @@ class GitCommandError(RuntimeError):
         super().__init__(f"git {' '.join(self.cmd[1:])} failed: {msg}")
 
 
-def _run(cmd: list[str], *, cwd: Path | None = None, env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def _run(
+    cmd: list[str], *, cwd: Path | None = None, env: Mapping[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     log.debug("git", extra={"cmd": _redacted_cmd(cmd), "cwd": str(cwd) if cwd else None})
     proc = subprocess.run(
         cmd,
@@ -138,16 +140,18 @@ class SandboxManager:
             _safe_run(["git", "fetch", "--prune", "origin"], cwd=target)
             return target
         target.mkdir(parents=True, exist_ok=True)
-        _run([
-            "git",
-            "clone",
-            "--filter=blob:none",
-            "--no-tags",
-            "--branch",
-            default_branch,
-            clone_url,
-            str(target),
-        ])
+        _run(
+            [
+                "git",
+                "clone",
+                "--filter=blob:none",
+                "--no-tags",
+                "--branch",
+                default_branch,
+                clone_url,
+                str(target),
+            ]
+        )
         return target
 
     # ---- per-issue workspace ----
@@ -190,10 +194,18 @@ class SandboxManager:
             if check.returncode == 0:
                 _run(["git", "worktree", "add", str(repo_dir), branch], cwd=pool)
             else:
-                _run([
-                    "git", "worktree", "add", "-b", branch, str(repo_dir),
-                    f"origin/{default_branch}",
-                ], cwd=pool)
+                _run(
+                    [
+                        "git",
+                        "worktree",
+                        "add",
+                        "-b",
+                        branch,
+                        str(repo_dir),
+                        f"origin/{default_branch}",
+                    ],
+                    cwd=pool,
+                )
         # Re-set the credentialed origin URL + identity unconditionally so a
         # rotated PAT, changed bot login, or pre-existing worktree all use the
         # current credentials and author config.

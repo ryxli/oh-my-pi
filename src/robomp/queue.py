@@ -6,7 +6,6 @@ import asyncio
 import logging
 import traceback
 from contextlib import suppress
-from typing import Mapping
 
 from robomp import tasks
 from robomp.config import Settings
@@ -74,7 +73,7 @@ class WorkerPool:
                     self._wakeup.clear()
                     try:
                         await asyncio.wait_for(self._wakeup.wait(), timeout=10.0)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         pass
                     continue
                 # Schedule the task; the semaphore caps concurrent execution.
@@ -95,7 +94,7 @@ class WorkerPool:
             key = row.issue_key or row.delivery_id
             if key in self._inflight:
                 # Put it back; another in-flight task is touching the same issue.
-                await asyncio.to_thread(self.db.requeue_event, row.delivery_id)
+                await asyncio.to_thread(self.db.requeue_event, row.delivery_id, from_states=("running",))
                 # Sleep briefly so we don't spin.
                 await asyncio.sleep(0.5)
                 return None
@@ -128,35 +127,53 @@ class WorkerPool:
         )
         if event == "issues" and action == "opened":
             await tasks.triage_issue(
-                settings=self.settings, db=self.db, github=self.github,
-                sandbox=self.sandbox, payload=row.payload,
+                settings=self.settings,
+                db=self.db,
+                github=self.github,
+                sandbox=self.sandbox,
+                payload=row.payload,
             )
         elif event == "issue_comment" and action == "created":
             issue = row.payload.get("issue") or {}
             if "pull_request" in issue:
                 await tasks.handle_pr_conversation(
-                    settings=self.settings, db=self.db, github=self.github,
-                    sandbox=self.sandbox, payload=row.payload,
+                    settings=self.settings,
+                    db=self.db,
+                    github=self.github,
+                    sandbox=self.sandbox,
+                    payload=row.payload,
                 )
             else:
                 await tasks.handle_comment(
-                    settings=self.settings, db=self.db, github=self.github,
-                    sandbox=self.sandbox, payload=row.payload,
+                    settings=self.settings,
+                    db=self.db,
+                    github=self.github,
+                    sandbox=self.sandbox,
+                    payload=row.payload,
                 )
         elif event == "pull_request_review_comment" and action == "created":
             await tasks.handle_review(
-                settings=self.settings, db=self.db, github=self.github,
-                sandbox=self.sandbox, payload=row.payload,
+                settings=self.settings,
+                db=self.db,
+                github=self.github,
+                sandbox=self.sandbox,
+                payload=row.payload,
             )
         elif event == "issues" and action == "closed":
             await tasks.cleanup_workspace(
-                settings=self.settings, db=self.db, sandbox=self.sandbox,
-                payload=row.payload, target_state="closed",
+                settings=self.settings,
+                db=self.db,
+                sandbox=self.sandbox,
+                payload=row.payload,
+                target_state="closed",
             )
         elif event == "pull_request" and action == "closed":
             await tasks.cleanup_workspace(
-                settings=self.settings, db=self.db, sandbox=self.sandbox,
-                payload=row.payload, target_state="merged",
+                settings=self.settings,
+                db=self.db,
+                sandbox=self.sandbox,
+                payload=row.payload,
+                target_state="merged",
             )
         else:
             log.info("no-op dispatch", extra={"event": event, "action": action})

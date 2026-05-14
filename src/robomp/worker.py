@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -47,17 +46,37 @@ class TaskInputs:
     workspace: Workspace
 
 
+@dataclass(slots=True, frozen=True)
+class DirectiveInfo:
+    """A maintainer's `@bot` mention captured as an authoritative instruction."""
+
+    body: str
+    author: str
+
+
 def _build_extra_env(settings: Settings) -> dict[str, str]:
     """Pass the GitHub token to subprocesses that need it (git push uses the credentialed remote)."""
     env: dict[str, str] = {}
     return env
 
 
-
-
-def _build_prompt(task_kind: str, inputs: TaskInputs, *, comment: CommentInfo | None,
-                  pr_number: int | None, review_payload: dict[str, Any] | None) -> str:
+def _build_prompt(
+    task_kind: str,
+    inputs: TaskInputs,
+    *,
+    comment: CommentInfo | None,
+    pr_number: int | None,
+    review_payload: dict[str, Any] | None,
+    directive: DirectiveInfo | None = None,
+) -> str:
     if task_kind == "triage_issue":
+        if directive is not None:
+            return persona.kickoff_directive(
+                repo=inputs.repo,
+                issue=inputs.issue,
+                workspace=inputs.workspace,
+                directive=directive,
+            )
         return persona.kickoff(repo=inputs.repo, issue=inputs.issue, workspace=inputs.workspace)
     if task_kind == "handle_comment":
         assert comment is not None
@@ -72,6 +91,15 @@ def _build_prompt(task_kind: str, inputs: TaskInputs, *, comment: CommentInfo | 
             pr_status = f"PR #{issue_row.pr_number} was closed without merge"
         else:
             pr_status = f"PR #{issue_row.pr_number} is open"
+        if directive is not None:
+            return persona.directive(
+                repo=inputs.repo,
+                issue=inputs.issue,
+                workspace=inputs.workspace,
+                comment=comment,
+                directive=directive,
+                pr_status=pr_status,
+            )
         return persona.followup_comment(
             repo=inputs.repo,
             issue=inputs.issue,
@@ -155,9 +183,7 @@ def _run_rpc_blocking(
         model=chosen_model,
         provider=settings.provider,
         thinking=settings.thinking_level if settings.thinking_level != "off" else None,
-        append_system_prompt=persona.system_append(
-            repo=inputs.repo, issue=inputs.issue, workspace=inputs.workspace
-        ),
+        append_system_prompt=persona.system_append(repo=inputs.repo, issue=inputs.issue, workspace=inputs.workspace),
         custom_tools=host_tools.build(bindings),
         request_timeout=settings.request_timeout_seconds,
         startup_timeout=60.0,
@@ -183,8 +209,13 @@ def _run_rpc_blocking(
                             "id": p.id,
                             "name": p.name,
                             "tasks": [
-                                {"id": t.id, "content": t.content, "status": t.status,
-                                 "notes": t.notes, "details": t.details}
+                                {
+                                    "id": t.id,
+                                    "content": t.content,
+                                    "status": t.status,
+                                    "notes": t.notes,
+                                    "details": t.details,
+                                }
                                 for t in p.tasks
                             ],
                         }
@@ -218,6 +249,7 @@ async def run_task(
     comment: CommentInfo | None = None,
     pr_number: int | None = None,
     review_payload: dict[str, Any] | None = None,
+    directive: DirectiveInfo | None = None,
 ) -> str | None:
     """Async wrapper that runs the synchronous RPC driver on a worker thread."""
     loop = asyncio.get_running_loop()
@@ -231,7 +263,9 @@ async def run_task(
         author_name=inputs.settings.resolved_author_name,
         author_email=inputs.settings.git_author_email,
     )
-    prompt = _build_prompt(task_kind, inputs, comment=comment, pr_number=pr_number, review_payload=review_payload)
+    prompt = _build_prompt(
+        task_kind, inputs, comment=comment, pr_number=pr_number, review_payload=review_payload, directive=directive
+    )
     return await asyncio.to_thread(
         _run_rpc_blocking,
         inputs,
@@ -242,4 +276,4 @@ async def run_task(
     )
 
 
-__all__ = ["TaskInputs", "run_task"]
+__all__ = ["DirectiveInfo", "TaskInputs", "run_task"]

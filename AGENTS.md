@@ -57,7 +57,7 @@ just cleanup owner/repo#N  # force workspace removal + state=abandoned
 
 HTTP/sqlite inspection: `just healthz`, `just readyz`, `just events [N]`, `just issues [N]`, `just sqlite`, `just sql "<SQL>"`, `just tool-calls owner/repo#N`, `just stuck`. Webhook smoke: `just ping`. Danger: `just wipe-workspaces`, `just nuke-data`, `just reset`.
 
-No lint/format tooling is wired up. Don't add one without explicit ask.
+Lint + format via `ruff` (config in `pyproject.toml`): `just lint` to check, `just fix` to auto-fix and reformat. Run before committing non-trivial changes; CI is not yet wired up.
 
 ## Code Conventions & Common Patterns
 

@@ -5,14 +5,16 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-import time
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator, Literal, Mapping
+from typing import Any, Literal
 
 EventState = Literal["queued", "running", "done", "failed", "skipped"]
+INACTIVE_EVENT_STATES: tuple[EventState, ...] = ("done", "failed", "skipped")
+
 IssueState = Literal[
     "new",
     "reproducing",
@@ -80,12 +82,12 @@ CREATE INDEX IF NOT EXISTS submissions_login_ts ON submissions(login, ts);
 
 
 def _utcnow() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def iso_seconds_ago(seconds: float) -> str:
     """ISO-UTC timestamp for `seconds` ago, matching the format `_utcnow` writes."""
-    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return (datetime.now(UTC) - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 @dataclass(slots=True, frozen=True)
@@ -112,6 +114,13 @@ class IssueRow:
     state: IssueState
     updated_at: str
     classification: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class SubmissionAdmission:
+    accepted: bool
+    duplicate: bool
+    used: int
 
 
 def issue_key(repo: str, number: int) -> str:
@@ -269,6 +278,46 @@ class Database:
         with self._lock:
             self._conn.execute("DELETE FROM events WHERE delivery_id=?", (delivery_id,))
 
+    def replace_event_if_state_in(
+        self,
+        *,
+        delivery_id: str,
+        event_type: str,
+        repo: str | None,
+        issue_key: str | None,
+        payload: Mapping[str, Any],
+        state: EventState = "queued",
+        allowed_existing_states: tuple[EventState, ...],
+    ) -> bool:
+        """Replace an existing event only when its current state is permitted."""
+        now = _utcnow()
+        with self._txn() as conn:
+            row = conn.execute(
+                "SELECT state FROM events WHERE delivery_id = ?",
+                (delivery_id,),
+            ).fetchone()
+            if row is not None:
+                if row["state"] not in allowed_existing_states:
+                    return False
+                conn.execute("DELETE FROM events WHERE delivery_id = ?", (delivery_id,))
+            conn.execute(
+                """
+                INSERT INTO events
+                  (delivery_id, event_type, repo, issue_key, payload_json, received_at, state)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    delivery_id,
+                    event_type,
+                    repo,
+                    issue_key,
+                    json.dumps(payload, separators=(",", ":")),
+                    now,
+                    state,
+                ),
+            )
+            return True
+
     def latest_event_for_issue(self, key: str) -> EventRow | None:
         """Return the most recent event whose issue_key matches, or None."""
         with self._lock:
@@ -300,10 +349,8 @@ class Database:
     def event_state_counts(self) -> dict[str, int]:
         """Return current row counts per event state, including states with zero rows."""
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT state, COUNT(*) AS n FROM events GROUP BY state"
-            ).fetchall()
-        counts: dict[str, int] = {s: 0 for s in ("queued", "running", "done", "failed", "skipped")}
+            rows = self._conn.execute("SELECT state, COUNT(*) AS n FROM events GROUP BY state").fetchall()
+        counts: dict[str, int] = dict.fromkeys(("queued", "running", "done", "failed", "skipped"), 0)
         for row in rows:
             counts[row["state"]] = int(row["n"])
         return counts
@@ -357,16 +404,34 @@ class Database:
             last_error=row["last_error"],
         )
 
-    def requeue_event(self, delivery_id: str) -> None:
+    def requeue_event(
+        self,
+        delivery_id: str,
+        *,
+        from_states: tuple[EventState, ...] | None = None,
+    ) -> bool:
         """Move an event back to queued without clobbering last_error.
 
-        The prior failure text stays visible until a new attempt overwrites it.
+        Returns True only when a row was actually transitioned. `from_states`
+        restricts which current states may be requeued; callers use this to
+        keep public retries from mutating queued/running rows while preserving
+        internal recovery of a just-claimed running event.
         """
         with self._lock:
-            self._conn.execute(
-                "UPDATE events SET state='queued' WHERE delivery_id=?",
-                (delivery_id,),
-            )
+            if from_states is None:
+                cur = self._conn.execute(
+                    "UPDATE events SET state='queued' WHERE delivery_id=?",
+                    (delivery_id,),
+                )
+            elif not from_states:
+                return False
+            else:
+                placeholders = ",".join("?" for _ in from_states)
+                cur = self._conn.execute(
+                    f"UPDATE events SET state='queued' WHERE delivery_id=? AND state IN ({placeholders})",
+                    (delivery_id, *from_states),
+                )
+            return cur.rowcount > 0
 
     # ---- issues ----
     def upsert_issue(
@@ -506,6 +571,53 @@ class Database:
             return int(cur.lastrowid or 0)
 
     # ---- submissions (per-user rate limiting) ----
+    def admit_submission(
+        self,
+        *,
+        delivery_id: str,
+        login: str,
+        repo: str | None,
+        since: str,
+        cap: int | None,
+    ) -> SubmissionAdmission:
+        """Atomically check a submitter's rolling cap and record this delivery.
+
+        Duplicate delivery ids are accepted without inserting a second row, so a
+        webhook retry remains idempotent even after the submitter reaches the cap.
+        `used` is the matching submission count after acceptance, or the count
+        that caused rejection when `accepted` is False.
+        """
+        normalized_login = login.lower()
+        with self._txn() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM submissions WHERE delivery_id=?",
+                (delivery_id,),
+            ).fetchone()
+            if existing is not None:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS n FROM submissions WHERE login=? AND ts>=?",
+                    (normalized_login, since),
+                ).fetchone()
+                return SubmissionAdmission(
+                    accepted=True,
+                    duplicate=True,
+                    used=int(row["n"]) if row is not None else 0,
+                )
+
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM submissions WHERE login=? AND ts>=?",
+                (normalized_login, since),
+            ).fetchone()
+            used = int(row["n"]) if row is not None else 0
+            if cap is not None and used >= cap:
+                return SubmissionAdmission(accepted=False, duplicate=False, used=used)
+
+            conn.execute(
+                "INSERT INTO submissions (delivery_id, login, repo, ts) VALUES (?, ?, ?, ?)",
+                (delivery_id, normalized_login, repo, _utcnow()),
+            )
+            return SubmissionAdmission(accepted=True, duplicate=False, used=used + 1)
+
     def record_submission(
         self,
         *,

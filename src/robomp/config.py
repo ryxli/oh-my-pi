@@ -67,6 +67,10 @@ class Settings(BaseSettings):
     rate_limit_default: int = Field(3, alias="ROBOMP_RATE_LIMIT_DEFAULT")
     rate_limit_contributor: int = Field(10, alias="ROBOMP_RATE_LIMIT_CONTRIBUTOR")
     rate_limit_unlimited_raw: str = Field("", alias="ROBOMP_RATE_LIMIT_UNLIMITED")
+    # Logins (comma-separated, `@` prefix optional) whose `@bot_login`
+    # mentions are treated as authoritative directives. These accounts also
+    # bypass rate limiting regardless of `author_association`.
+    maintainer_logins_raw: str = Field("", alias="ROBOMP_MAINTAINER_LOGINS")
 
     @field_validator("bot_login", mode="after")
     @classmethod
@@ -120,6 +124,22 @@ class Settings(BaseSettings):
     @property
     def rate_limit_unlimited(self) -> frozenset[str]:
         items = [piece.strip().lstrip("@").lower() for piece in self.rate_limit_unlimited_raw.split(",")]
+        return frozenset(item for item in items if item)
+
+    @field_validator("maintainer_logins_raw", mode="before")
+    @classmethod
+    def _coerce_maintainers(cls, v: object) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v
+        if isinstance(v, (list, tuple)):
+            return ",".join(str(item) for item in v)
+        return str(v)
+
+    @property
+    def maintainer_logins(self) -> frozenset[str]:
+        items = [piece.strip().lstrip("@").lower() for piece in self.maintainer_logins_raw.split(",")]
         return frozenset(item for item in items if item)
 
     def allows(self, full_name: str) -> bool:

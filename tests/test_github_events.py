@@ -3,7 +3,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 
-from robomp.github_events import rate_limit_cap, route, verify_signature
+from robomp.github_events import (
+    extract_mention,
+    is_maintainer,
+    rate_limit_cap,
+    route,
+    verify_signature,
+)
 
 ALLOWLIST = frozenset({"octo/widget"})
 BOT = "robomp-bot"
@@ -130,6 +136,7 @@ def test_route_pr_conversation_uses_handle_pr_conversation() -> None:
         },
         allowlist=ALLOWLIST,
         bot_login=BOT,
+        resolve_issue_from_pr=lambda _r, _n: "octo/widget#42",
     )
     assert decision.should_queue
     assert decision.task == "handle_pr_conversation"
@@ -160,8 +167,8 @@ def test_route_pr_conversation_uses_resolver_for_inflight_key() -> None:
     assert decision.issue_key == "octo/widget#42"
 
 
-def test_route_pr_conversation_falls_back_when_resolver_misses() -> None:
-    """If the DB doesn't know the PR yet, fall back to a PR-scoped key."""
+def test_route_pr_conversation_skips_when_resolver_misses() -> None:
+    """Unknown PR comments are not actionable and must not count as submissions."""
 
     decision = route(
         "issue_comment",
@@ -175,8 +182,10 @@ def test_route_pr_conversation_falls_back_when_resolver_misses() -> None:
         bot_login=BOT,
         resolve_issue_from_pr=lambda _r, _n: None,
     )
-    assert decision.should_queue
-    assert decision.issue_key == "octo/widget#pr-9"
+    assert not decision.should_queue
+    assert decision.submitter is None
+    assert decision.issue_key is None
+    assert "not mapped" in decision.reason
 
 
 def test_route_review_only_for_bot_authored_pr() -> None:
@@ -210,6 +219,23 @@ def test_route_review_only_for_bot_authored_pr() -> None:
     assert not not_ours.should_queue
 
 
+def test_route_review_comment_skips_when_resolver_misses() -> None:
+    decision = route(
+        "pull_request_review_comment",
+        {
+            "action": "created",
+            "comment": {"user": {"login": "alice"}, "body": "nit"},
+            "pull_request": {"number": 9, "user": {"login": BOT}},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        resolve_issue_from_pr=lambda _r, _n: None,
+    )
+    assert not decision.should_queue
+    assert decision.submitter is None
+
+
 def test_route_pr_closed_only_when_merged_by_bot() -> None:
     payload = {
         "action": "closed",
@@ -217,12 +243,27 @@ def test_route_pr_closed_only_when_merged_by_bot() -> None:
         "repository": {"full_name": "octo/widget"},
     }
     decision = route(
-        "pull_request", payload, allowlist=ALLOWLIST, bot_login=BOT,
+        "pull_request",
+        payload,
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
         resolve_issue_from_pr=lambda _r, _n: "octo/widget#42",
     )
     assert decision.should_queue
     assert decision.task == "cleanup_workspace"
     assert decision.issue_key == "octo/widget#42"
+
+    fallback = route(
+        "pull_request",
+        payload,
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        resolve_issue_from_pr=lambda _r, _n: None,
+    )
+    assert fallback.should_queue
+    assert fallback.task == "cleanup_workspace"
+    assert fallback.issue_key == "octo/widget#pr-9"
+    assert fallback.submitter is None
 
     payload["pull_request"]["merged"] = False  # type: ignore[index]
     assert not route("pull_request", payload, allowlist=ALLOWLIST, bot_login=BOT).should_queue
@@ -240,6 +281,7 @@ def test_route_skips_pull_request_issues_event() -> None:
         bot_login=BOT,
     )
     assert not decision.should_queue
+
 
 def test_route_issue_opened_captures_submitter() -> None:
     decision = route(
@@ -288,7 +330,10 @@ def test_route_pr_merged_carries_no_submitter() -> None:
         "repository": {"full_name": "octo/widget"},
     }
     decision = route(
-        "pull_request", payload, allowlist=ALLOWLIST, bot_login=BOT,
+        "pull_request",
+        payload,
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
         resolve_issue_from_pr=lambda _r, _n: "octo/widget#42",
     )
     assert decision.should_queue
@@ -297,42 +342,240 @@ def test_route_pr_merged_carries_no_submitter() -> None:
 
 def test_rate_limit_cap_unlimited_allowlist_beats_association() -> None:
     # Even a NONE association is unlimited when login is in the explicit list.
-    assert rate_limit_cap(
-        "can1357", "NONE",
-        unlimited=frozenset({"can1357"}),
-        default=3, contributor=10,
-    ) is None
+    assert (
+        rate_limit_cap(
+            "can1357",
+            "NONE",
+            unlimited=frozenset({"can1357"}),
+            default=3,
+            contributor=10,
+        )
+        is None
+    )
 
 
 def test_rate_limit_cap_unlimited_is_case_insensitive() -> None:
-    assert rate_limit_cap(
-        "Can1357", None,
-        unlimited=frozenset({"can1357"}),
-        default=3, contributor=10,
-    ) is None
+    assert (
+        rate_limit_cap(
+            "Can1357",
+            None,
+            unlimited=frozenset({"can1357"}),
+            default=3,
+            contributor=10,
+        )
+        is None
+    )
 
 
 def test_rate_limit_cap_trusted_associations_bypass() -> None:
     for assoc in ("OWNER", "MEMBER", "COLLABORATOR"):
-        assert rate_limit_cap(
-            "stranger", assoc,
-            unlimited=frozenset(),
-            default=3, contributor=10,
-        ) is None, assoc
+        assert (
+            rate_limit_cap(
+                "stranger",
+                assoc,
+                unlimited=frozenset(),
+                default=3,
+                contributor=10,
+            )
+            is None
+        ), assoc
 
 
 def test_rate_limit_cap_contributor_tier() -> None:
-    assert rate_limit_cap(
-        "alice", "CONTRIBUTOR",
-        unlimited=frozenset(),
-        default=3, contributor=10,
-    ) == 10
+    assert (
+        rate_limit_cap(
+            "alice",
+            "CONTRIBUTOR",
+            unlimited=frozenset(),
+            default=3,
+            contributor=10,
+        )
+        == 10
+    )
 
 
 def test_rate_limit_cap_default_tier_for_unknown_and_first_timer() -> None:
     for assoc in (None, "NONE", "FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER"):
-        assert rate_limit_cap(
-            "alice", assoc,
-            unlimited=frozenset(),
-            default=3, contributor=10,
-        ) == 3, assoc
+        assert (
+            rate_limit_cap(
+                "alice",
+                assoc,
+                unlimited=frozenset(),
+                default=3,
+                contributor=10,
+            )
+            == 3
+        ), assoc
+
+
+# ---------- mention + directive ----------
+
+
+def test_extract_mention_returns_body_minus_mention() -> None:
+    assert extract_mention("hey @robomp-bot please look", "robomp-bot") == "hey please look"
+    assert extract_mention("@robomp-bot do X", "robomp-bot") == "do X"
+
+
+def test_extract_mention_returns_none_without_mention() -> None:
+    assert extract_mention("hello there", "robomp-bot") is None
+    assert extract_mention(None, "robomp-bot") is None
+    assert extract_mention("", "robomp-bot") is None
+
+
+def test_extract_mention_is_case_insensitive() -> None:
+    assert extract_mention("yo @ROBOMP-BOT", "robomp-bot") == "yo"
+
+
+def test_extract_mention_respects_hyphen_word_boundary() -> None:
+    # @robomp-bot-helper must NOT match @robomp-bot.
+    assert extract_mention("@robomp-bot-helper hi", "robomp-bot") is None
+
+
+def test_extract_mention_handles_multiple_occurrences() -> None:
+    assert extract_mention("@robomp-bot one, then @robomp-bot two", "robomp-bot") == "one, then two"
+
+
+def test_is_maintainer_recognizes_explicit_allowlist() -> None:
+    assert is_maintainer("can1357", None, maintainers=frozenset({"can1357"}))
+    assert is_maintainer("Can1357", "NONE", maintainers=frozenset({"can1357"}))
+
+
+def test_is_maintainer_recognizes_trusted_associations() -> None:
+    for assoc in ("OWNER", "MEMBER", "COLLABORATOR"):
+        assert is_maintainer("anyone", assoc, maintainers=frozenset()), assoc
+
+
+def test_is_maintainer_rejects_contributor_and_none() -> None:
+    assert not is_maintainer("alice", "CONTRIBUTOR", maintainers=frozenset())
+    assert not is_maintainer("alice", None, maintainers=frozenset())
+    assert is_maintainer(None, "OWNER", maintainers=frozenset())  # association still wins
+
+
+def test_route_directive_set_on_issue_comment_when_owner_mentions_bot() -> None:
+    decision = route(
+        "issue_comment",
+        {
+            "action": "created",
+            "comment": {
+                "user": {"login": "can1357"},
+                "author_association": "OWNER",
+                "body": "@robomp-bot please refactor X",
+            },
+            "issue": {"number": 9},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert decision.should_queue
+    assert decision.directive is True
+    assert decision.directive_body == "please refactor X"
+    assert decision.directive_author == "can1357"
+
+
+def test_route_directive_set_when_login_in_maintainers_list() -> None:
+    decision = route(
+        "issue_comment",
+        {
+            "action": "created",
+            "comment": {
+                "user": {"login": "can1357"},
+                # No author_association field.
+                "body": "@robomp-bot do it",
+            },
+            "issue": {"number": 9},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        maintainers=frozenset({"can1357"}),
+    )
+    assert decision.directive is True
+    assert decision.directive_body == "do it"
+    assert decision.directive_author == "can1357"
+
+
+def test_route_directive_unset_for_random_user_even_with_mention() -> None:
+    decision = route(
+        "issue_comment",
+        {
+            "action": "created",
+            "comment": {
+                "user": {"login": "stranger"},
+                "author_association": "NONE",
+                "body": "@robomp-bot please refactor X",
+            },
+            "issue": {"number": 9},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert decision.should_queue  # comment still routed normally
+    assert decision.directive is False
+    assert decision.directive_body is None
+
+
+def test_route_directive_unset_for_maintainer_without_mention() -> None:
+    decision = route(
+        "issue_comment",
+        {
+            "action": "created",
+            "comment": {
+                "user": {"login": "can1357"},
+                "author_association": "OWNER",
+                "body": "looks good to me",
+            },
+            "issue": {"number": 9},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert decision.directive is False
+
+
+def test_route_directive_set_on_pr_conversation() -> None:
+    decision = route(
+        "issue_comment",
+        {
+            "action": "created",
+            "comment": {
+                "user": {"login": "can1357"},
+                "author_association": "OWNER",
+                "body": "@robomp-bot change the indentation in foo.py",
+            },
+            "issue": {"number": 50, "pull_request": {"url": "x"}},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        resolve_issue_from_pr=lambda _r, _n: "octo/widget#42",
+    )
+    assert decision.should_queue
+    assert decision.task == "handle_pr_conversation"
+    assert decision.directive is True
+    assert decision.directive_body == "change the indentation in foo.py"
+
+
+def test_route_directive_set_on_review_comment() -> None:
+    decision = route(
+        "pull_request_review_comment",
+        {
+            "action": "created",
+            "comment": {
+                "user": {"login": "can1357"},
+                "author_association": "OWNER",
+                "body": "@robomp-bot use a generator here",
+            },
+            "pull_request": {"number": 50, "user": {"login": BOT}},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        resolve_issue_from_pr=lambda _r, _n: "octo/widget#42",
+    )
+    assert decision.should_queue
+    assert decision.task == "handle_review"
+    assert decision.directive is True
+    assert decision.directive_body == "use a generator here"

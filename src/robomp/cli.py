@@ -10,10 +10,10 @@ import click
 import uvicorn
 
 from robomp.config import Settings, get_settings
-from robomp.db import get_database
+from robomp.db import INACTIVE_EVENT_STATES, get_database
 from robomp.github_client import GitHubClient
 from robomp.logging_config import configure_logging
-from robomp.manual_triage import InvalidIssueRef, enqueue_manual_triage, parse_issue_ref
+from robomp.manual_triage import InvalidIssueRef, ManualTriageError, enqueue_manual_triage, parse_issue_ref
 from robomp.queue import WorkerPool
 from robomp.sandbox import SandboxManager
 from robomp.server import create_app
@@ -64,9 +64,16 @@ def triage(issue_ref: str) -> None:
     async def _go() -> None:
         github = GitHubClient(cfg.github_token.get_secret_value())
         db = get_database(cfg.sqlite_path)
-        delivery = await enqueue_manual_triage(
-            db=db, github=github, repo_full=repo_full, number=number,
-        )
+        try:
+            delivery = await enqueue_manual_triage(
+                db=db,
+                github=github,
+                repo_full=repo_full,
+                number=number,
+            )
+        except ManualTriageError as exc:
+            click.echo(f"refusing: {exc}", err=True)
+            sys.exit(2)
         sandbox = SandboxManager(cfg.workspace_root)
         pool = WorkerPool(settings=cfg, db=db, github=github, sandbox=sandbox)
         await pool.start()
@@ -93,10 +100,13 @@ def replay(delivery_id: str) -> None:
     configure_logging(cfg.log_dir)
     cfg.ensure_paths()
     db = get_database(cfg.sqlite_path)
-    if db.get_event(delivery_id) is None:
+    row = db.get_event(delivery_id)
+    if row is None:
         click.echo(f"unknown delivery: {delivery_id}", err=True)
         sys.exit(2)
-    db.requeue_event(delivery_id)
+    if not db.requeue_event(delivery_id, from_states=INACTIVE_EVENT_STATES):
+        click.echo(f"delivery {delivery_id} is {row.state}; only inactive events can be replayed", err=True)
+        sys.exit(2)
 
     async def _drain() -> None:
         github = GitHubClient(cfg.github_token.get_secret_value())

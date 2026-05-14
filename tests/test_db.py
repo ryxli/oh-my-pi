@@ -4,8 +4,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import pytest
-
 from robomp.db import Database, iso_seconds_ago, issue_key
 
 
@@ -57,6 +55,31 @@ def test_claim_next_event_singleton_under_contention(db: Database) -> None:
     assert all(db.get_event(f"d-{i}").state == "running" for i in range(5))
 
 
+def test_requeue_event_can_be_restricted_by_source_state(db: Database) -> None:
+    db.record_event(
+        delivery_id="done-event",
+        event_type="issues",
+        repo="octo/widget",
+        issue_key=issue_key("octo/widget", 1),
+        payload={},
+        state="done",
+    )
+    db.record_event(
+        delivery_id="running-event",
+        event_type="issues",
+        repo="octo/widget",
+        issue_key=issue_key("octo/widget", 2),
+        payload={},
+        state="running",
+    )
+
+    assert db.requeue_event("done-event", from_states=("done", "failed", "skipped"))
+    assert db.get_event("done-event").state == "queued"
+
+    assert not db.requeue_event("running-event", from_states=("done", "failed", "skipped"))
+    assert db.get_event("running-event").state == "running"
+
+
 def test_reset_stuck_running_recovers(db: Database) -> None:
     db.record_event(
         delivery_id="d1",
@@ -76,12 +99,19 @@ def test_reset_stuck_running_recovers(db: Database) -> None:
 def test_upsert_issue_round_trip(db: Database) -> None:
     key = issue_key("octo/widget", 7)
     row = db.upsert_issue(
-        key=key, repo="octo/widget", number=7, state="new",
+        key=key,
+        repo="octo/widget",
+        number=7,
+        state="new",
     )
     assert row.state == "new"
     row = db.upsert_issue(
-        key=key, repo="octo/widget", number=7, state="opened",
-        branch="farm/abcd1234/some-issue", session_dir="/tmp/s",
+        key=key,
+        repo="octo/widget",
+        number=7,
+        state="opened",
+        branch="farm/abcd1234/some-issue",
+        session_dir="/tmp/s",
         pr_number=42,
     )
     assert row.state == "opened"
@@ -138,7 +168,8 @@ def test_migration_adds_classification_to_existing_db(tmp_path: Path) -> None:
           'reproducing', '2026-01-01T00:00:00Z');
         """
     )
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     # Opening through our Database class should auto-migrate.
     database = Database(path)
     row = database.get_issue("octo/widget#1")
@@ -148,10 +179,78 @@ def test_migration_adds_classification_to_existing_db(tmp_path: Path) -> None:
     assert database.get_issue("octo/widget#1").classification == "bug"
     database.close()
 
+
 def test_record_submission_dedupes_by_delivery(db: Database) -> None:
     assert db.record_submission(delivery_id="d-1", login="Alice", repo="octo/widget")
     # Retry of the same delivery id is a no-op (idempotent webhook delivery).
     assert not db.record_submission(delivery_id="d-1", login="alice", repo="octo/widget")
+
+
+def test_admit_submission_dedupes_by_delivery_before_rate_limit(db: Database) -> None:
+    since = iso_seconds_ago(60)
+    first = db.admit_submission(
+        delivery_id="d-1",
+        login="Alice",
+        repo="octo/widget",
+        since=since,
+        cap=1,
+    )
+    assert first.accepted
+    assert not first.duplicate
+    assert first.used == 1
+
+    duplicate = db.admit_submission(
+        delivery_id="d-1",
+        login="alice",
+        repo="octo/widget",
+        since=since,
+        cap=1,
+    )
+    assert duplicate.accepted
+    assert duplicate.duplicate
+    assert duplicate.used == 1
+
+    rejected = db.admit_submission(
+        delivery_id="d-2",
+        login="ALICE",
+        repo="octo/widget",
+        since=since,
+        cap=1,
+    )
+    assert not rejected.accepted
+    assert not rejected.duplicate
+    assert rejected.used == 1
+    assert db.count_submissions_since("alice", since) == 1
+
+
+def test_admit_submission_enforces_cap_atomically_across_connections(tmp_path: Path) -> None:
+    path = tmp_path / "admission.sqlite"
+    barrier = threading.Barrier(2)
+
+    def admit(delivery_id: str) -> bool:
+        database = Database(path)
+        try:
+            barrier.wait()
+            return database.admit_submission(
+                delivery_id=delivery_id,
+                login="alice",
+                repo="octo/widget",
+                since=iso_seconds_ago(60),
+                cap=1,
+            ).accepted
+        finally:
+            database.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(admit, f"d-{i}") for i in range(2)]
+        accepted = [future.result() for future in futures]
+
+    verifier = Database(path)
+    try:
+        assert sorted(accepted) == [False, True]
+        assert verifier.count_submissions_since("alice", iso_seconds_ago(60)) == 1
+    finally:
+        verifier.close()
 
 
 def test_count_submissions_since_is_case_insensitive(db: Database) -> None:

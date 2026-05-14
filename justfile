@@ -148,6 +148,18 @@ test-file FILE *ARGS:
     pytest -x '{{FILE}}' {{ARGS}}
 
 [group('dev')]
+[doc('ruff check (no edits) + ruff format --check')]
+lint:
+    ruff check src tests
+    ruff format --check src tests
+
+[group('dev')]
+[doc('ruff check --fix + ruff format (apply both)')]
+fix:
+    ruff check --fix src tests
+    ruff format src tests
+
+[group('dev')]
 [doc('run robomp serve on the host (skips docker)')]
 serve:
     python -m robomp serve
