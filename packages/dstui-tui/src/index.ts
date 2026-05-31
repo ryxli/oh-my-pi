@@ -6,5 +6,6 @@
  * `mountDstuiOverlay` helper for the agent extension surface.
  */
 
+export * from "./bundled";
 export * from "./component";
 export * from "./overlay";

@@ -13,6 +13,10 @@ declare module "*.py" {
 	export default content;
 }
 
+declare module "*.dsl" {
+	const content: string;
+	export default content;
+}
 declare module "*.lark" {
 	const content: string;
 	export default content;

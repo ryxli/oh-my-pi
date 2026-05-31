@@ -11,3 +11,7 @@ All notable changes to this package are documented here.
   `Component`, with a helper that mounts a DSL module inside an
   `ExtensionUIContext.custom(...)` factory and resolves the settle
   event back to the host. Chunk 2 of #1564.
+- Bundled DSL components: `picker`, `confirm`, `progress`. Sources are
+  baked into the package and exposed via `BUNDLED_DSTUI_SOURCES`,
+  `getBundledSource(name)`, and convenience `mountPicker` /
+  `mountConfirm` / `mountProgress` helpers. Chunk 5 of #1564.

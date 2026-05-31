@@ -6,6 +6,8 @@
 - Added search support for virtual internal URLs (including `omp://` roots) by resolving and scanning in-memory internal resources as search targets alongside filesystem paths
 - Added expansion of virtual internal URL search targets so `search` can match multiple internal documents when given `omp://`
 - Added `/omfg <complaint>` slash command that drafts a TTSR rule from a complaint, validates it against the current conversation, saves it to project or `~/.omp/agent/rules`, and registers it live.
+- Added `dstui` tool — mounts a safe `pi-dstui` DSL component as an interactive TUI overlay. Gated behind `dstui.enabled` (default `false`) and `session.hasUI`. Supports inline source, named persisted modules via `@oh-my-pi/pi-dstui-store`, optional state persistence on settle, and the bundled `picker` / `confirm` / `progress` components from `@oh-my-pi/pi-dstui-tui`. ([#1564](https://github.com/can1357/oh-my-pi/issues/1564))
+- Added `dstui.enabled` setting (default `false`) gating the new `dstui` tool. ([#1564](https://github.com/can1357/oh-my-pi/issues/1564))
 
 ### Changed
 
