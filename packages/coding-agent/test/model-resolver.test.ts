@@ -3,12 +3,12 @@ import { type Api, Effort, type Model } from "@oh-my-pi/pi-ai";
 import {
 	expandRoleAlias,
 	findSlowModel,
+	type ModelLookupRegistry,
 	parseModelPattern,
 	parseModelString,
 	resolveAgentModelPatterns,
 	resolveCliModel,
 	resolveModelFromString,
-	type ModelLookupRegistry,
 	resolveModelOverride,
 	resolveModelRoleValue,
 	resolveModelScope,
@@ -575,11 +575,7 @@ describe("resolveAgentModelPatterns", () => {
 describe("findSlowModel", () => {
 	test("prefers Claude Opus 4.8 over older Opus aliases", async () => {
 		const model = await findSlowModel(
-			registryFor([
-				opusModel("claude-opus-4-7"),
-				opusModel("claude-opus-4-8"),
-				opusModel("claude-opus-4-6"),
-			]),
+			registryFor([opusModel("claude-opus-4-7"), opusModel("claude-opus-4-8"), opusModel("claude-opus-4-6")]),
 		);
 
 		expect(model?.id).toBe("claude-opus-4-8");
