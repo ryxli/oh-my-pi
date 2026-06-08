@@ -512,6 +512,8 @@ export class TUI extends Container {
 	// ConPTY hosts (`isConPTYHosted()`); other terminals do not exhibit the
 	// drift and would just see an unnecessary post-paint latency. See #2095.
 	static readonly #CONPTY_POST_FULL_PAINT_SETTLE_MS = 150;
+	static readonly #CONPTY_FRAME_TRUNCATE_THRESHOLD_BYTES = 512 * 1024;
+	static readonly #CONPTY_FRAME_RETAIN_BYTES = 64 * 1024;
 	#postFullPaintSettleUntilMs = 0;
 	#postFullPaintSettleTimer: RenderTimer | undefined;
 	#cursorRow = 0; // Logical cursor row (end of rendered content)
@@ -1788,6 +1790,56 @@ export class TUI extends Container {
 		return cursor;
 	}
 
+	#truncateLargeConptyFrame(
+		lines: string[],
+		width: number,
+		height: number,
+		cursorPos: { row: number; col: number } | null,
+	): { lines: string[]; cursorPos: { row: number; col: number } | null } {
+		if (!isConPTYHosted()) return { lines, cursorPos };
+
+		let totalBytes = 0;
+		let exceedsThreshold = false;
+		for (const line of lines) {
+			totalBytes += Buffer.byteLength(line, "utf8") + 8;
+			if (totalBytes > TUI.#CONPTY_FRAME_TRUNCATE_THRESHOLD_BYTES) {
+				exceedsThreshold = true;
+				break;
+			}
+		}
+		if (!exceedsThreshold) return { lines, cursorPos };
+
+		let retainedBytes = 0;
+		let retainedStart = lines.length;
+		while (
+			retainedStart > 0 &&
+			(retainedBytes < TUI.#CONPTY_FRAME_RETAIN_BYTES || lines.length - retainedStart < height)
+		) {
+			retainedStart -= 1;
+			retainedBytes += Buffer.byteLength(lines[retainedStart] ?? "", "utf8") + 8;
+		}
+		if (retainedStart <= 0) return { lines, cursorPos };
+
+		const marker = truncateToWidth(
+			`[${retainedStart} older lines hidden to keep Windows console resume responsive]`,
+			width,
+			Ellipsis.Omit,
+		);
+		const truncated = new Array<string>(lines.length - retainedStart + 1);
+		truncated[0] = marker;
+		for (let i = retainedStart; i < lines.length; i++) {
+			truncated[i - retainedStart + 1] = lines[i] ?? "";
+		}
+
+		if (cursorPos === null || cursorPos.row < retainedStart) {
+			return { lines: truncated, cursorPos: null };
+		}
+		return {
+			lines: truncated,
+			cursorPos: { row: cursorPos.row - retainedStart + 1, col: cursorPos.col },
+		};
+	}
+
 	#terminalLine(line: string): string {
 		if (TERMINAL.isImageLine(line)) return line;
 		return line + (line.includes("\x1b]8;") ? LINE_TERMINATOR : SEGMENT_RESET);
@@ -1855,8 +1907,11 @@ export class TUI extends Container {
 		this.#visibleOverlayComponentsThisRender = visibleOverlayComponents;
 		const overlayVisibilityReduced = this.#overlayVisibilityReduced(visibleOverlayComponents);
 		let lines = visibleOverlayComponents.length > 0 ? this.#compositeOverlays(baseLines, width, height) : baseLines;
-		const cursorPos = this.#extractCursorPosition(lines, height);
+		let cursorPos = this.#extractCursorPosition(lines, height);
 		lines = this.#prepareLines(lines, width, true);
+		const truncatedFrame = this.#truncateLargeConptyFrame(lines, width, height, cursorPos);
+		lines = truncatedFrame.lines;
+		cursorPos = truncatedFrame.cursorPos;
 
 		// 2. Capture transition + pre-render state before any emitter runs.
 		const prevViewportTop = this.#viewportTopRow;
@@ -2046,6 +2101,7 @@ export class TUI extends Container {
 				this.#clearNativeScrollbackDirty();
 				this.#extractCursorPosition(baseLines, height);
 				baseLines = this.#prepareLines(baseLines, width, false);
+				baseLines = this.#truncateLargeConptyFrame(baseLines, width, height, null).lines;
 				this.#emitFullPaint(baseLines, width, height, null, {
 					clearViewport: true,
 					clearScrollback: !isMultiplexerSession(),

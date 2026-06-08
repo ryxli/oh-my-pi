@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Windows ConPTY large-session resumes replaying megabyte-scale CJK transcripts as one synchronized full-paint frame. The renderer now truncates oversized ConPTY frames at logical line boundaries, keeps the recent tail visible, and inserts an `older lines hidden` marker instead of forcing legacy console hosts through the entire historical replay ([#2115](https://github.com/can1357/oh-my-pi/issues/2115)).
+
 ## [15.10.4] - 2026-06-08
 
 ### Fixed
