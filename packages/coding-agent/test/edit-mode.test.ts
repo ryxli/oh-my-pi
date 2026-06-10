@@ -40,6 +40,17 @@ describe("resolveEditMode", () => {
 		).toBe("hashline");
 	});
 
+	test("preserves edit.mode from lightweight settings without isConfigured", () => {
+		expect(
+			resolveEditMode({
+				settings: {
+					get: () => "patch",
+				},
+				getActiveModelString: () => "zhipu/glm-5.1",
+			}),
+		).toBe("patch");
+	});
+
 	test("keeps configured model variants above built-in model defaults", () => {
 		const settings = Settings.isolated({ "edit.modelVariants": { "glm-5.1": "patch" } });
 

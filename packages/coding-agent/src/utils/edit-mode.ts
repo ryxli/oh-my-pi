@@ -53,7 +53,7 @@ export function resolveEditMode(session: EditModeSessionLike): EditMode {
 	if (envMode) return envMode;
 
 	const settingsMode = normalizeEditMode(String(session.settings.get("edit.mode") ?? ""));
-	if (settingsMode && session.settings.isConfigured?.("edit.mode")) return settingsMode;
+	if (settingsMode && (session.settings.isConfigured?.("edit.mode") ?? true)) return settingsMode;
 
 	const defaultModelVariant = getDefaultEditVariantForModel(activeModel);
 	if (defaultModelVariant) return defaultModelVariant;
