@@ -129,6 +129,7 @@ describe("filterInitialToolsForDiscoveryAll", () => {
 		edit: "essential",
 		todo: "discoverable",
 		find: "discoverable",
+		task: "discoverable",
 	};
 	const base = {
 		loadModeOf: (name: string): BuiltinToolLoadMode | undefined => loadModes[name],
@@ -148,6 +149,17 @@ describe("filterInitialToolsForDiscoveryAll", () => {
 			forceActive: new Set(["todo"]),
 		});
 		expect(result).toEqual(["read", "todo"]);
+	});
+
+	it("keeps `task` when forceActive includes it (eager task delegation, #2534)", () => {
+		// `task.loadMode === "discoverable"`, so without forceActive it would be hidden
+		// under `tools.discoveryMode: "all"` and the system prompt's `# Eager Tasks`
+		// section (gated on `{{#has tools "task"}}`) would silently disappear.
+		const result = filterInitialToolsForDiscoveryAll(["read", "task", "find"], {
+			...base,
+			forceActive: new Set(["task"]),
+		});
+		expect(result).toEqual(["read", "task"]);
 	});
 
 	it("keeps explicitly requested and restored discoverable tools", () => {

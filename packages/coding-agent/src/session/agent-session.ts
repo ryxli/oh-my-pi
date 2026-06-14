@@ -187,6 +187,7 @@ import { containsWorkflow, WORKFLOW_NOTICE } from "../modes/workflow";
 import { createPlanReadMatcher } from "../plan-mode/plan-protection";
 import type { PlanModeState } from "../plan-mode/state";
 import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type: "text" };
+import eagerTaskPrompt from "../prompts/system/eager-task.md" with { type: "text" };
 import eagerTodoPrompt from "../prompts/system/eager-todo.md" with { type: "text" };
 import emptyStopRetryTemplate from "../prompts/system/empty-stop-retry.md" with { type: "text" };
 import ircAutoReplyTemplate from "../prompts/system/irc-autoreply.md" with { type: "text" };
@@ -441,6 +442,12 @@ export interface AgentSessionConfig {
 	asyncJobManager?: AsyncJobManager;
 	/** Agent identity (registry id like "Main" or "Alice") used for IRC routing. */
 	agentId?: string;
+	/**
+	 * Whether this session is the top-level agent or a delegated subagent.
+	 * Drives main-agent-only behaviors like the eager-task delegation prelude.
+	 * Defaults to `"main"` (back-compat for tests and embedders that omit it).
+	 */
+	agentKind?: "main" | "sub";
 	/**
 	 * Override the provider-facing session ID for all API requests from this session.
 	 * When absent, `sessionManager.getSessionId()` is used. Needed when benchmark or
@@ -994,6 +1001,9 @@ export class AgentSession {
 	#pendingIrcAsides: CustomMessage[] = [];
 	// Agent identity (registry id) used for IRC routing and job ownership.
 	#agentId: string | undefined;
+	// "main" for the top-level user session, "sub" for delegated subagents. Used
+	// to gate main-agent-only nudges (e.g. the eager-task delegation prelude).
+	readonly #agentKind: "main" | "sub";
 	#providerSessionId: string | undefined;
 	#freshProviderSessionId: string | undefined;
 	#isDisposed = false;
@@ -1297,6 +1307,7 @@ export class AgentSession {
 		this.#ttsrManager = config.ttsrManager;
 		this.#obfuscator = config.obfuscator;
 		this.#agentId = config.agentId;
+		this.#agentKind = config.agentKind ?? "main";
 		this.#providerSessionId = config.providerSessionId;
 		this.agent.setAssistantMessageEventInterceptor((message, assistantMessageEvent) => {
 			const event: AgentEvent = {
@@ -4605,10 +4616,12 @@ export class AgentSession {
 			return true;
 		}
 
-		// Skip eager todo prelude when the user has already queued a directive
+		// Skip eager preludes when the user has already queued a directive
 		const hasPendingUserDirective = this.#toolChoiceQueue.inspect().includes("user-force");
 		const eagerTodoPrelude =
 			!options?.synthetic && !hasPendingUserDirective ? this.#createEagerTodoPrelude(expandedText) : undefined;
+		const eagerTaskPrelude =
+			!options?.synthetic && !hasPendingUserDirective ? this.#createEagerTaskPrelude(expandedText) : undefined;
 		const normalizedImages = await this.#normalizeImagesForModel(options?.images);
 
 		const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
@@ -4628,10 +4641,13 @@ export class AgentSession {
 		}
 
 		try {
+			const prependMessages: AgentMessage[] = [];
+			if (eagerTaskPrelude) prependMessages.push(eagerTaskPrelude);
+			if (eagerTodoPrelude) prependMessages.push(eagerTodoPrelude.message);
 			await this.#promptWithMessage(message, expandedText, {
 				...options,
 				images: normalizedImages,
-				prependMessages: eagerTodoPrelude ? [eagerTodoPrelude.message] : undefined,
+				prependMessages: prependMessages.length > 0 ? prependMessages : undefined,
 				appendMessages: keywordNotices.length > 0 ? keywordNotices : undefined,
 			});
 		} finally {
@@ -7090,6 +7106,55 @@ export class AgentSession {
 				timestamp: Date.now(),
 			},
 			toolChoice: todoToolChoice,
+		};
+	}
+
+	/**
+	 * Build a hidden first-turn delegation reminder when `task.eager` is set on
+	 * the main agent. Unlike `#createEagerTodoPrelude`, this does NOT force a
+	 * `tool_choice` — delegation must follow design, so the model should still
+	 * be free to investigate or answer trivial requests in-process. The reminder
+	 * is the salience lever that the bare `# Eager Tasks` system-prompt section
+	 * lacked (#2534).
+	 */
+	#createEagerTaskPrelude(promptText: string): AgentMessage | undefined {
+		if (this.#agentKind !== "main") {
+			// Subagents are themselves the delegation; nudging them to fan out further
+			// would cascade `task` calls past what the user asked for.
+			return undefined;
+		}
+		const eagerTasksEnabled = this.settings.get("task.eager");
+		if (!eagerTasksEnabled) return undefined;
+
+		if (this.#planModeState?.enabled) return undefined;
+
+		// Only inject on the first user message of the conversation. Later turns are
+		// often clarifications or corrections — nudging delegation there fights the
+		// design the model already settled on.
+		const hasPriorUserMessage = this.agent.state.messages.some(m => m.role === "user");
+		if (hasPriorUserMessage) return undefined;
+
+		const trimmedPromptText = promptText.trimEnd();
+		if (trimmedPromptText.endsWith("?") || trimmedPromptText.endsWith("!")) {
+			return undefined;
+		}
+
+		// Mirror the eager-todo guard: under `tools.discoveryMode: "all"` the `task`
+		// tool is hidden from the active set unless `forceActive` keeps it (see
+		// sdk.ts). Without it active, the reminder cannot lead anywhere.
+		if (!this.getActiveToolNames().includes("task")) {
+			return undefined;
+		}
+
+		const eagerTaskReminder = prompt.render(eagerTaskPrompt);
+
+		return {
+			role: "custom",
+			customType: "eager-task-prelude",
+			content: eagerTaskReminder,
+			display: false,
+			attribution: "agent",
+			timestamp: Date.now(),
 		};
 	}
 	/**

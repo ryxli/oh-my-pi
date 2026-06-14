@@ -2082,7 +2082,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 
 		const repeatToolDescriptions = settings.get("repeatToolDescriptions");
-		const eagerTasks = settings.get("task.eager");
+		// Gate `eagerTasks` on the main agent only: subagents do not get a delegation
+		// nudge (it would encourage spawn cascades). The flag drives BOTH the prompt
+		// section AND the discovery-all `forceActive` entry below, so they cannot
+		// fall out of sync — the section silently disappearing because `task` is
+		// hidden under `tools.discoveryMode: "all"` was the original bug (#2534).
+		const eagerTasks = agentKind === "main" && settings.get("task.eager") && toolRegistry.has("task");
 		const intentField = $flag("PI_INTENT_TRACING", settings.get("tools.intentTracing")) ? INTENT_FIELD : undefined;
 		const rebuildSystemPrompt = async (
 			toolNames: string[],
@@ -2247,10 +2252,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (effectiveDiscoveryMode === "all") {
 			// Tools a forced tool_choice will target must stay active, or the named
 			// choice references a tool absent from the request (provider 400). Eager
-			// todos force a named `todo` choice on the first turn.
+			// todos force a named `todo` choice on the first turn. Eager tasks do not
+			// force a tool_choice (delegation must follow design), but the `task` tool
+			// is `loadMode: "discoverable"` — without forceActive it gets hidden here
+			// AND `{{#has tools "task"}}` then skips the `# Eager Tasks` prompt section
+			// silently, leaving `task.eager` a no-op (#2534).
 			const forceActive = new Set<string>();
 			if (settings.get("todo.eager") && settings.get("todo.enabled") && toolRegistry.has("todo")) {
 				forceActive.add("todo");
+			}
+			if (eagerTasks) {
+				forceActive.add("task");
 			}
 			initialToolNames = filterInitialToolsForDiscoveryAll(initialToolNames, {
 				loadModeOf: name => toolRegistry.get(name)?.loadMode,
@@ -2527,6 +2539,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			ttsrManager,
 			obfuscator,
 			agentId: resolvedAgentId,
+			agentKind,
 			providerSessionId: options.providerSessionId,
 			parentEvalSessionId: options.parentEvalSessionId,
 		});
