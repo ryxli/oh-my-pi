@@ -64,6 +64,17 @@ function refreshStatusLine(ctx: InteractiveModeContext): void {
 	ctx.ui.requestRender();
 }
 
+function shouldStoreSlashCommandHistory(ctx: InteractiveModeContext): boolean {
+	return ctx.settings === undefined || ctx.settings.get("tui.slashHistory") !== false;
+}
+
+function addSlashCommandToHistory(text: string, runtime: BuiltinSlashCommandRuntime): void {
+	const addToHistory = runtime.ctx.editor.addToHistory;
+	if (shouldStoreSlashCommandHistory(runtime.ctx) && typeof addToHistory === "function") {
+		addToHistory.call(runtime.ctx.editor, text);
+	}
+}
+
 /** `/fast status` label: "off", "on", or scope-qualified "on (… only)". */
 function formatFastModeStatus(session: AgentSession): string {
 	if (!session.isFastModeEnabled()) return "off";
@@ -254,11 +265,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		inlineHint: "[prompt]",
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
-			const hadArgs = !!command.args;
 			await runtime.ctx.handlePlanModeCommand(command.args || undefined);
-			if (hadArgs) {
-				runtime.ctx.editor.addToHistory(command.text);
-			}
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -284,11 +291,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		inlineHint: "[objective]",
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
-			const hadArgs = !!command.args;
 			await runtime.ctx.handleGoalModeCommand(command.args || undefined);
-			if (hadArgs) {
-				runtime.ctx.editor.addToHistory(command.text);
-			}
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -1194,7 +1197,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		allowArgs: true,
 		handle: handleMcpAcp,
 		handleTui: async (command, runtime) => {
-			runtime.ctx.editor.addToHistory(command.text);
 			runtime.ctx.editor.setText("");
 			await runtime.ctx.handleMCPCommand(command.text);
 		},
@@ -1217,7 +1219,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		allowArgs: true,
 		handle: handleSshAcp,
 		handleTui: async (command, runtime) => {
-			runtime.ctx.editor.addToHistory(command.text);
 			runtime.ctx.editor.setText("");
 			await runtime.ctx.handleSSHCommand(command.text);
 		},
@@ -2285,10 +2286,12 @@ export async function executeBuiltinSlashCommand(
 	if (runtime.ctx.collabGuest && !COLLAB_GUEST_ALLOWED_COMMANDS[command.name]) {
 		runtime.ctx.showStatus(`/${command.name} is host-only during a collab session`);
 		runtime.ctx.editor.setText("");
+		addSlashCommandToHistory(text, runtime);
 		return true;
 	}
 	if (command.handleTui) {
 		const result = await command.handleTui(parsed, runtime);
+		addSlashCommandToHistory(text, runtime);
 		if (result && typeof result === "object" && "prompt" in result) return result.prompt;
 		return true;
 	}
@@ -2318,6 +2321,7 @@ export async function executeBuiltinSlashCommand(
 		};
 		const result = await command.handle(parsed, adapted);
 		ctx.editor.setText("");
+		addSlashCommandToHistory(text, runtime);
 		if (result && typeof result === "object" && "prompt" in result) return result.prompt;
 		return true;
 	}

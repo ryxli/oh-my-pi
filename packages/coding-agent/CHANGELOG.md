@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed built-in slash commands skipping editor history; `/settings` and other built-ins now participate in up-arrow recall, with `tui.slashHistory: false` as an opt-out. ([#3148](https://github.com/can1357/oh-my-pi/issues/3148))
+
 ## [16.1.7] - 2026-06-20
 
 ### Fixed
