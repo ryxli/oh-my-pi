@@ -294,6 +294,87 @@ describe("ModelSelector role badge thinking display", () => {
 		expect(selected).toEqual(["xiaomi-token-plan-cn/mimo-v2.5-pro"]);
 	});
 
+	test("keeps the canonical row highlighted when the preferred variant shifts on refresh", async () => {
+		installTestTheme();
+		const settings = Settings.isolated({});
+		const primary = buildModel({
+			id: "mimo-v2.5-pro",
+			name: "MiMo-V2.5-Pro",
+			api: "openai-completions",
+			provider: "custom-a",
+			baseUrl: "https://a.example.com/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8192,
+		});
+		const fallback = buildModel({
+			id: "mimo-v2.5-pro",
+			name: "MiMo-V2.5-Pro",
+			api: "openai-completions",
+			provider: "custom-b",
+			baseUrl: "https://b.example.com/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8192,
+		});
+
+		let preferred = fallback;
+		let variants = [
+			{ canonicalId: "mimo-v2.5-pro", selector: "custom-b/mimo-v2.5-pro", model: fallback, source: "heuristic" },
+		];
+		const refreshGate = Promise.withResolvers<void>();
+
+		const modelRegistry = {
+			getAll: () => [preferred],
+			refresh: vi.fn(() => refreshGate.promise),
+			refreshProvider: vi.fn(async () => {}),
+			getError: () => undefined,
+			getAvailable: () => [preferred],
+			getDiscoverableProviders: () => [],
+			getCanonicalModelSelections: () => [
+				{
+					record: { id: "mimo-v2.5-pro", name: "MiMo-V2.5-Pro", variants },
+					model: preferred,
+				},
+			],
+		} as unknown as ModelRegistry;
+		const selected: Array<string | undefined> = [];
+		const ui = {
+			requestRender: vi.fn(),
+		} as unknown as TUI;
+
+		const selector = new ModelSelectorComponent(
+			ui,
+			undefined,
+			settings,
+			modelRegistry,
+			[],
+			(_model, _role, _thinkingLevel, modelSelector) => selected.push(modelSelector),
+			() => {},
+			{ temporaryOnly: true },
+		);
+
+		// Switch to the canonical tab and highlight the only canonical row, then
+		// let the offline refresh land a higher-ranked variant — the row's
+		// persisted selector flips from custom-b/... to custom-a/..., but the
+		// canonical record id is unchanged, so the highlight must survive.
+		selector.handleInput("\t");
+		preferred = primary;
+		variants = [
+			{ canonicalId: "mimo-v2.5-pro", selector: "custom-a/mimo-v2.5-pro", model: primary, source: "heuristic" },
+			{ canonicalId: "mimo-v2.5-pro", selector: "custom-b/mimo-v2.5-pro", model: fallback, source: "heuristic" },
+		];
+		refreshGate.resolve();
+		await Bun.sleep(0);
+
+		selector.handleInput("\n");
+		expect(selected).toEqual(["custom-a/mimo-v2.5-pro"]);
+	});
+
 	test("keeps the highlighted model when a background refresh reorders the list", async () => {
 		installTestTheme();
 		const settings = Settings.isolated({});

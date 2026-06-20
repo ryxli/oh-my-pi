@@ -99,6 +99,16 @@ interface CanonicalModelItem {
 	compactSearchText: string;
 }
 
+/**
+ * Stable identity for selection restore across registry refreshes.
+ * Canonical rows keep `record.id` because the chosen backing variant can shift
+ * between refreshes (different provider wins, different `provider/id`); their
+ * `selector` is only used as the persistable callback payload.
+ */
+function getRestoreKey(item: ModelItem | CanonicalModelItem): string {
+	return item.kind === "canonical" ? item.id : item.selector;
+}
+
 interface ScopedModelItem {
 	model: Model;
 	thinkingLevel?: string;
@@ -533,19 +543,24 @@ export class ModelSelectorComponent extends Container {
 	 * models must not yank the user's selection out from under a pending Enter.
 	 */
 	#syncFromRegistryState(): void {
-		const selectedKey = this.#getSelectedItem()?.selector;
+		const selectedKey = this.#getSelectedRestoreKey();
 		this.#loadModelsFromCurrentRegistryState();
 		this.#buildProviderTabs();
 		this.#updateTabBar();
 		this.#applyTabFilter();
 		if (selectedKey) {
 			const visibleItems = this.#getVisibleItems();
-			const restoredIndex = visibleItems.findIndex(item => item.selector === selectedKey);
+			const restoredIndex = visibleItems.findIndex(item => getRestoreKey(item) === selectedKey);
 			if (restoredIndex >= 0 && restoredIndex !== this.#selectedIndex) {
 				this.#selectedIndex = this.#coerceSelectedIndex(restoredIndex, visibleItems);
 				this.#updateList();
 			}
 		}
+	}
+
+	#getSelectedRestoreKey(): string | undefined {
+		const selected = this.#getSelectedItem();
+		return selected ? getRestoreKey(selected) : undefined;
 	}
 
 	#buildProviderTabs(): void {
