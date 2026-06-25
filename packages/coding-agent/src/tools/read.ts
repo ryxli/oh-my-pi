@@ -824,6 +824,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	readonly #autoResizeImages: boolean;
 	readonly #defaultLimit: number;
 	readonly #inspectImageEnabled: boolean;
+	readonly #bridgeBypassCounts = new Map<string, number>();
 
 	constructor(private readonly session: ToolSession) {
 		const displayMode = resolveFileDisplayMode(session);
@@ -1860,10 +1861,25 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		}
 	}
 
+	async #withBridgeBypassForPath<T>(absolutePath: string, run: () => Promise<T>): Promise<T> {
+		const current = this.#bridgeBypassCounts.get(absolutePath) ?? 0;
+		this.#bridgeBypassCounts.set(absolutePath, current + 1);
+		try {
+			return await run();
+		} finally {
+			if (current === 0) {
+				this.#bridgeBypassCounts.delete(absolutePath);
+			} else {
+				this.#bridgeBypassCounts.set(absolutePath, current);
+			}
+		}
+	}
+
 	#routeReadThroughBridge(
 		absolutePath: string,
 		options?: { line?: number; limit?: number },
 	): Promise<string> | undefined {
+		if (this.#bridgeBypassCounts.has(absolutePath)) return undefined;
 		const bridge = this.session.getClientBridge?.();
 		if (!bridge?.capabilities.readTextFile || !bridge.readTextFile) return undefined;
 		return bridge.readTextFile({ path: absolutePath, ...options });
@@ -2092,12 +2108,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					skills: this.session.skills,
 				});
 				if (localFile) {
-					return this.execute(
-						_toolCallId,
-						{ path: `${localFile.path}:${internalTarget.sel}` },
-						signal,
-						_onUpdate,
-						_toolContext,
+					return this.#withBridgeBypassForPath(localFile.path, () =>
+						this.execute(
+							_toolCallId,
+							{ path: `${localFile.path}:${internalTarget.sel}` },
+							signal,
+							_onUpdate,
+							_toolContext,
+						),
 					);
 				}
 			}
