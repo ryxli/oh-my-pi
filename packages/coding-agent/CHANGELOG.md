@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed plan mode hanging after advisor, IRC, or continuation turns by suppressing non-user wakes and enforcing a bounded `ask`/`resolve` decision at `agent_end`. ([#3910](https://github.com/can1357/oh-my-pi/issues/3910))
+
 ## [16.2.8] - 2026-06-30
 
 ### Added

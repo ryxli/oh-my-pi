@@ -1168,6 +1168,8 @@ function extractPermissionLocations(
 // AgentSession Class
 // ============================================================================
 
+const PLAN_MODE_TOOL_DECISION_MAX_RETRIES = 2;
+
 /** Entry returned by {@link AgentSession.clearQueue} / {@link AgentSession.popLastQueuedMessage}. */
 export type RestoredQueuedMessage = { text: string; images?: ImageContent[] };
 
@@ -1442,6 +1444,7 @@ export class AgentSession {
 	// Incoming IRC messages received while a turn was streaming; drained as
 	// non-interrupting asides at the next step boundary (see the aside provider).
 	#pendingIrcAsides: CustomMessage[] = [];
+	#planModeToolDecisionRetryCount = 0;
 	// Agent identity (registry id) used for IRC routing and job ownership.
 	#agentId: string | undefined;
 	#agentKind: "main" | "sub" = "main";
@@ -1671,6 +1674,10 @@ export class AgentSession {
 	#resumeStrandedIrcAsides(): void {
 		if (this.#isDisposed || this.isStreaming) return;
 		if (this.#pendingIrcAsides.length === 0) return;
+		if (this.#planModeState?.enabled) {
+			this.#flushPendingIrcAsides();
+			return;
+		}
 		if (this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages()) return;
 		const records = this.#pendingIrcAsides;
 		this.#pendingIrcAsides = [];
@@ -1685,6 +1692,13 @@ export class AgentSession {
 	 *  because #canAutoContinueForFollowUp suppresses follow-up auto-resume while a user interrupt is
 	 *  in effect, even though the wake left a provider-valid tail. */
 	#wakeForIrc(records: CustomMessage[]): void {
+		if (this.#planModeState?.enabled) {
+			for (const record of records) {
+				this.agent.emitExternalEvent({ type: "message_start", message: record });
+				this.agent.emitExternalEvent({ type: "message_end", message: record });
+			}
+			return;
+		}
 		// Park only a *blocked* follow-up (one a user interrupt is intentionally holding); an
 		// already-resumable follow-up can ride the wake turn normally without reordering.
 		const parkedFollowUps =
@@ -2282,6 +2296,25 @@ export class AgentSession {
 		// The implicit single ("default") advisor stamps no source name, so its
 		// agent-facing `<advisory>` bytes stay identical to the pre-multi-advisor path.
 		const source = advisor.slug ? advisor.name : undefined;
+		const notes: AdvisorNote[] = [{ note, severity, advisor: source }];
+		const content = formatAdvisorBatchContent(notes);
+		const details = { notes } satisfies AdvisorMessageDetails;
+		if (this.#planModeState?.enabled) {
+			if (this.agent.state.isStreaming) {
+				this.yieldQueue.enqueue("advisor", { note, severity, advisor: source });
+			} else {
+				this.#preserveAdvisorCard({
+					role: "custom",
+					customType: "advisor",
+					content,
+					display: true,
+					attribution: "agent",
+					details,
+					timestamp: Date.now(),
+				});
+			}
+			return;
+		}
 		const interrupting = isInterruptingSeverity(severity);
 		const channel = resolveAdvisorDeliveryChannel({
 			severity,
@@ -2297,9 +2330,6 @@ export class AgentSession {
 			this.yieldQueue.enqueue("advisor", { note, severity, advisor: source });
 			return;
 		}
-		const notes: AdvisorNote[] = [{ note, severity, advisor: source }];
-		const content = formatAdvisorBatchContent(notes);
-		const details = { notes } satisfies AdvisorMessageDetails;
 		if (channel === "preserve") {
 			this.#preserveAdvisorCard({
 				role: "custom",
@@ -3541,6 +3571,13 @@ export class AgentSession {
 				compactionResult.continuationScheduled ||
 				compactionResult.automaticContinuationBlocked
 			) {
+				await emitAgentEndNotification();
+				return;
+			}
+			if (this.#enforcePlanModeToolDecisionAtAgentEnd(msg)) {
+				maintenanceRoute("plan-mode-tool-decision-reminder", {
+					retry: this.#planModeToolDecisionRetryCount,
+				});
 				await emitAgentEndNotification();
 				return;
 			}
@@ -6297,6 +6334,7 @@ export class AgentSession {
 
 	setPlanModeState(state: PlanModeState | undefined): void {
 		this.#planModeState = state;
+		this.#planModeToolDecisionRetryCount = 0;
 		if (state?.enabled) {
 			this.#planReferenceSent = false;
 			this.#planReferencePath = state.planFilePath;
@@ -6722,6 +6760,7 @@ export class AgentSession {
 		// Agent-initiated synthetic prompts (auto-continue, plan, reminders) do not.
 		if (options?.userInitiated ?? !options?.synthetic) {
 			this.#advisorAutoResumeSuppressed = false;
+			this.#planModeToolDecisionRetryCount = 0;
 		}
 
 		// If streaming, queue via steer() or followUp() based on option
@@ -6791,9 +6830,6 @@ export class AgentSession {
 			// Clean up residual eager-todo directive if the prompt never consumed it
 			// (e.g., compaction aborted, validation failed).
 			this.#toolChoiceQueue.removeByLabel("eager-todo");
-		}
-		if (!options?.synthetic) {
-			await this.#enforcePlanModeToolDecision();
 		}
 		return true;
 	}
@@ -10047,41 +10083,67 @@ export class AgentSession {
 		this.#checkpointState = undefined;
 		this.#pendingRewindReport = undefined;
 	}
-	async #enforcePlanModeToolDecision(): Promise<void> {
+	#enforcePlanModeToolDecisionAtAgentEnd(assistantMessage: AssistantMessage): boolean {
 		if (!this.#planModeState?.enabled) {
-			return;
-		}
-		const assistantMessage = this.#findLastAssistantMessage();
-		if (!assistantMessage) {
-			return;
+			this.#planModeToolDecisionRetryCount = 0;
+			return false;
 		}
 		if (assistantMessage.stopReason === "error" || assistantMessage.stopReason === "aborted") {
-			return;
+			return false;
 		}
 
 		const calledRequiredTool = assistantMessage.content.some(
 			content => content.type === "toolCall" && (content.name === "ask" || content.name === "resolve"),
 		);
 		if (calledRequiredTool) {
-			return;
+			this.#planModeToolDecisionRetryCount = 0;
+			return false;
 		}
 		const hasRequiredTools = this.#toolRegistry.has("ask") && this.#toolRegistry.has("resolve");
 		if (!hasRequiredTools) {
 			logger.warn("Plan mode enforcement skipped because ask/resolve tools are unavailable", {
 				activeToolNames: this.agent.state.tools.map(tool => tool.name),
 			});
-			return;
+			return false;
+		}
+		if (this.#planModeToolDecisionRetryCount >= PLAN_MODE_TOOL_DECISION_MAX_RETRIES) {
+			if (this.#planModeToolDecisionRetryCount === PLAN_MODE_TOOL_DECISION_MAX_RETRIES) {
+				this.#planModeToolDecisionRetryCount++;
+				this.emitNotice(
+					"warning",
+					"Plan mode stopped without an ask/resolve decision after repeated reminders; waiting for your next instruction.",
+					"plan-mode",
+				);
+			}
+			return false;
 		}
 
 		const reminder = prompt.render(planModeToolDecisionReminderPrompt, {
 			askToolName: "ask",
 		});
-
-		await this.prompt(reminder, {
-			synthetic: true,
-			expandPromptTemplates: false,
-			toolChoice: "required",
-		});
+		this.#planModeToolDecisionRetryCount++;
+		const generation = this.#promptGeneration;
+		this.#schedulePostPromptTask(
+			async signal => {
+				if (signal.aborted || this.#isDisposed || this.#promptGeneration !== generation) return;
+				await this.#promptWithMessage(
+					{
+						role: "developer",
+						content: [{ type: "text", text: reminder }],
+						attribution: "agent",
+						timestamp: Date.now(),
+					},
+					reminder,
+					{
+						toolChoice: "required",
+						skipCompactionCheck: true,
+						skipPostPromptRecoveryWait: true,
+					},
+				);
+			},
+			{ generation },
+		);
+		return true;
 	}
 
 	/**
@@ -13080,6 +13142,11 @@ export class AgentSession {
 		if (this.isStreaming) {
 			this.#pendingIrcAsides.push(record);
 			if (autoReply) void this.#runIrcAutoReply(msg);
+			return "injected";
+		}
+		if (this.#planModeState?.enabled) {
+			this.agent.emitExternalEvent({ type: "message_start", message: record });
+			this.agent.emitExternalEvent({ type: "message_end", message: record });
 			return "injected";
 		}
 		// Idle: wake a real turn so the recipient responds (shared with the stranded-aside resume).
