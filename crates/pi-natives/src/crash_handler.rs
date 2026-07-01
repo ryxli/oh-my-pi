@@ -8,11 +8,11 @@
 //! Without these hooks, Bun receives only the bare
 //! `memory allocation of N bytes failed` line and aborts with no stack —
 //! see issue #2211 ("Windows crash: Rust allocator failure after tasklist.exe
-//! popup"). The cdylib builds with `panic = "unwind"`, so a panic in vendored
-//! uutils code unwinds to the shell boundary and is recovered as a failed
-//! command; such recoverable panics are logged to disk only, while fatal
-//! crashes (allocation failure, or panics with no active uutils scope) still
-//! get the stderr dump + process exit. Either way the record stays diagnosable.
+//! popup"). The cdylib builds with `panic = "unwind"`, so panic boundaries that
+//! recover the unwind (vendored uutils commands and `task::blocking`) mark
+//! their scopes recoverable. Those panics are logged to disk only, while fatal
+//! crashes still get the stderr dump + process exit. Either way the record
+//! stays diagnosable.
 //!
 //! Notes:
 //! - Backtraces are captured via [`Backtrace::force_capture`], so they work
@@ -27,6 +27,7 @@
 use std::{
 	alloc::Layout,
 	backtrace::Backtrace,
+	cell::Cell,
 	ffi::OsStr,
 	fmt::Write as _,
 	fs::{self, OpenOptions},
@@ -52,6 +53,10 @@ const APP_NAME: &str = "omp";
 
 static INSTALL: Once = Once::new();
 static ALLOC_HOOK_ACTIVE: AtomicBool = AtomicBool::new(false);
+thread_local! {
+	/// Borrow-free count of active recoverable panic boundaries on this thread.
+	static RECOVERABLE_PANIC_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
 
 /// Install the panic and allocation-error hooks. Idempotent.
 pub fn install() {
@@ -59,12 +64,11 @@ pub fn install() {
 		let prev_panic = std::panic::take_hook();
 		std::panic::set_hook(Box::new(move |info| {
 			let report = format_panic_report(info);
-			// A panic raised while a uutils scope is active is caught at the
-			// uutils boundary (pi-shell `run_uutil`): the command fails with a
-			// non-zero exit instead of crashing the host. Record it to the log
-			// for diagnosis, but keep the recovered panic out of the user-facing
-			// stderr crash dump and skip the default abort hook.
-			let recoverable = pi_uutils_ctx::is_active();
+			// Panics raised inside known recovery boundaries are caught before they
+			// escape native code. Record them to the log for diagnosis, but keep
+			// recovered panics out of the user-facing stderr crash dump and skip the
+			// default abort hook.
+			let recoverable = is_recoverable_panic();
 			persist(&report, CrashKind::Panic, !recoverable);
 			if !recoverable {
 				prev_panic(info);
@@ -85,6 +89,25 @@ pub fn install() {
 			process::abort();
 		});
 	});
+}
+/// Marks panics from `f` as recoverable for the native panic hook.
+pub(crate) fn recoverable_panic_scope<R>(f: impl FnOnce() -> R) -> R {
+	struct Guard;
+	impl Drop for Guard {
+		fn drop(&mut self) {
+			RECOVERABLE_PANIC_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+		}
+	}
+
+	RECOVERABLE_PANIC_DEPTH.with(|d| d.set(d.get() + 1));
+	let _guard = Guard;
+	f()
+}
+
+/// Whether the current panic is expected to be caught before escaping native
+/// code.
+pub(crate) fn is_recoverable_panic() -> bool {
+	pi_uutils_ctx::is_active() || RECOVERABLE_PANIC_DEPTH.with(|d| d.get() > 0)
 }
 
 #[derive(Clone, Copy)]
@@ -170,8 +193,8 @@ fn panic_payload(payload: &(dyn std::any::Any + Send)) -> String {
 
 fn persist(report: &str, kind: CrashKind, echo_stderr: bool) {
 	// Echo to stderr so the user sees something even when the file write fails
-	// (read-only home, missing $HOME, …). Suppressed for recoverable uutils
-	// panics, which surface as a failed command instead of a crash.
+	// (read-only home, missing $HOME, …). Suppressed for recoverable panics that
+	// surface as command failures or rejected promises instead of crashes.
 	if echo_stderr {
 		let _ = writeln!(std::io::stderr(), "{report}");
 	}

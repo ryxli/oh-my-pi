@@ -36,7 +36,7 @@ use std::{
 use napi::{Env, Error, Result, Status, Task, bindgen_prelude::*};
 use pi_shell::cancel as core_cancel;
 
-use crate::prof::profile_region;
+use crate::{crash_handler::recoverable_panic_scope, prof::profile_region};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Cancellation
@@ -193,7 +193,9 @@ where
 			.work
 			.take()
 			.ok_or_else(|| Error::from_reason("BlockingTask: work already consumed"))?;
-		match catch_unwind(AssertUnwindSafe(|| work(self.cancel_token.clone()))) {
+		match recoverable_panic_scope(|| {
+			catch_unwind(AssertUnwindSafe(|| work(self.cancel_token.clone())))
+		}) {
 			Ok(result) => result,
 			Err(payload) => Err(panic_error(self.tag, payload)),
 		}
@@ -292,7 +294,10 @@ mod tests {
 		let mut task = Blocking::<String> {
 			tag:          "panic_test",
 			cancel_token: CancelToken::default(),
-			work:         Some(Box::new(|_| -> Result<String> { panic!("native boom") })),
+			work:         Some(Box::new(|_| -> Result<String> {
+				assert!(crate::crash_handler::is_recoverable_panic());
+				panic!("native boom")
+			})),
 		};
 
 		let err = Task::compute(&mut task).expect_err("panic should become a napi error");
@@ -300,5 +305,6 @@ mod tests {
 		assert_eq!(err.status, Status::GenericFailure);
 		assert!(err.reason.contains("panic_test"));
 		assert!(err.reason.contains("native boom"));
+		assert!(!crate::crash_handler::is_recoverable_panic());
 	}
 }
