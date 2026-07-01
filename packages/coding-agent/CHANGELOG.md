@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed live agent-progress tree rendered below `eval` cells duplicating/overlapping rows in the TUI under heavy concurrent subagent fan-out ([#4004](https://github.com/can1357/oh-my-pi/issues/4004)).
+
 ## [16.2.12] - 2026-07-01
 
 ### Breaking Changes

@@ -775,4 +775,19 @@ export const evalToolRenderer = {
 	// below the first cell. Expanded output is top-anchored enough for the
 	// transcript to commit its settled prefix.
 	provisionalPendingPreview: "collapsed",
+	// `renderAgentProgressEvents` (see `renderResult` above) mutates the live
+	// agent-progress tree on nearly every tick — it inserts/removes each
+	// subagent's `currentTool` row as tool calls start/stop and ticks the
+	// status icon/stats/duration in place — while `options.isPartial` stays
+	// `true` for the whole eval cell (progress ticks never carry an `async`
+	// completed/failed state). Without this opt-out, the stable-prefix ratchet
+	// in `deriveLiveCommitState` promotes still-mutating agent rows into
+	// native scrollback (a "slow ticker"), and the renderer's committed-prefix
+	// resync then re-shows the frame tail under its "duplication, never loss"
+	// contract — producing the overlapping/duplicated progress rows the user
+	// reported. Same bug class as the SSH renderer opt-out
+	// ([#3177](https://github.com/can1357/oh-my-pi/issues/3177),
+	// [#3714](https://github.com/can1357/oh-my-pi/issues/3714),
+	// [#4004](https://github.com/can1357/oh-my-pi/issues/4004)).
+	provisionalPartialResult: true,
 };
