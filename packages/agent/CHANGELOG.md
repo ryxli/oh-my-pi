@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed branch summarization silently dropping every tool result before serialization, so facts learned only from `read`/`grep`/`bash` observations disappeared from abandoned-branch summaries. `getMessageFromEntry()` now keeps `toolResult` entries; downstream `serializeConversation()` already truncates each and drops entries flagged `useless` ([#4025](https://github.com/can1357/oh-my-pi/issues/4025)).
+
 ## [16.2.4] - 2026-06-28
 
 ### Changed

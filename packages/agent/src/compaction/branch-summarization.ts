@@ -164,12 +164,17 @@ export function collectEntriesForBranchSummary(
 /**
  * Extract AgentMessage from a session entry.
  * Similar to getMessageFromEntry in compaction.ts but also handles compaction entries.
+ *
+ * Tool-result messages are kept: the assistant's tool call captures the
+ * request, but the observation from `read`/`grep`/`bash`/etc. lives in the
+ * result. `serializeConversation` already truncates each result to
+ * `TOOL_RESULT_MAX_CHARS` and drops entries flagged `useless`, so passing
+ * them through preserves the actual facts the abandoned branch learned
+ * without ballooning the summarizer prompt.
  */
 function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 	switch (entry.type) {
 		case "message":
-			// Skip tool results - context is in assistant's tool call
-			if (entry.message.role === "toolResult") return undefined;
 			return entry.message;
 
 		case "custom_message":
