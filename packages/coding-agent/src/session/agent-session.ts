@@ -98,6 +98,7 @@ import type {
 	TextContent,
 	ToolCall,
 	ToolChoice,
+	ToolResultMessage,
 	Usage,
 	UsageReport,
 } from "@oh-my-pi/pi-ai";
@@ -1858,7 +1859,9 @@ export class AgentSession {
 					message: context.message,
 					toolResults: context.toolResults,
 				});
-				if (detection) this.#maybeInjectToolCallLoopRedirect(messages, detection);
+				if (detection) {
+					await this.#injectToolCallLoopRedirect(messages, detection, context.message, context.toolResults);
+				}
 			}
 			this.#advisorPrimaryTurnsCompleted++;
 			if (this.#advisors.length > 0) {
@@ -4330,12 +4333,22 @@ export class AgentSession {
 		return this.#toolCallLoopGuard;
 	}
 
-	#maybeInjectToolCallLoopRedirect(messages: AgentMessage[], detection: RepeatedToolCallDetection): void {
+	async #injectToolCallLoopRedirect(
+		messages: AgentMessage[],
+		detection: RepeatedToolCallDetection,
+		assistantMessage: AssistantMessage,
+		toolResults: readonly ToolResultMessage[],
+	): Promise<void> {
+		// Do NOT interpolate `resultSummary` or `argumentsSummary` here — tool
+		// output and model-generated arguments are untrusted, and prompt.render
+		// runs Handlebars with `noEscape: true`, so a repeated tool result could
+		// smuggle developer-role instructions across the framing (issue #3971
+		// review by @chatgpt-codex-connector). Only the sanitized tool name and
+		// count reach the model; the raw summaries stay in `details` for logs.
+		const safeToolName = detection.toolName.replace(/[^A-Za-z0-9_.-]/g, "?");
 		const content = prompt.render(toolCallLoopRedirectTemplate, {
-			tool_name: detection.toolName,
+			tool_name: safeToolName,
 			count: detection.count,
-			arguments_summary: detection.argumentsSummary,
-			result_summary: detection.resultSummary || "(no text result)",
 		});
 		const details = {
 			toolName: detection.toolName,
@@ -4347,6 +4360,17 @@ export class AgentSession {
 			toolName: detection.toolName,
 			count: detection.count,
 		});
+		// The turn's assistant + toolResult message_end handlers race their
+		// persistence writes through the tail chain in
+		// `#createMessageEndPersistenceSlot`. Wait for those slots so the
+		// redirect entry lands AFTER the assistant/toolResult entries in the
+		// branch — otherwise a resumed session can replay a developer message
+		// between a tool call and its required tool_result and break provider
+		// tool-call pairing (issue #3971 review by @chatgpt-codex-connector).
+		await this.#waitForSessionMessagePersistence(assistantMessage);
+		for (const result of toolResults) {
+			await this.#waitForSessionMessagePersistence(result);
+		}
 		const redirectMessage: CustomMessage = {
 			role: "custom",
 			customType: TOOL_CALL_LOOP_REDIRECT_TYPE,

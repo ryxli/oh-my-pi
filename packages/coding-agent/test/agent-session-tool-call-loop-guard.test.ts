@@ -109,13 +109,20 @@ describe("AgentSession tool-call loop guard", () => {
 		await session.waitForIdle();
 
 		expect(contexts).toHaveLength(6);
-		expect(JSON.stringify(contexts[5]!.messages)).toContain("tool_call_loop_detected");
-		expect(JSON.stringify(contexts[5]!.messages)).toContain("1263 passed, 4 skipped");
 		const redirects = session.agent.state.messages.filter(
 			(message): message is CustomMessage =>
 				message.role === "custom" && message.customType === "tool-call-loop-redirect",
 		);
 		expect(redirects).toHaveLength(1);
 		expect(redirects[0]!.display).toBe(false);
+		const redirectContent = String(redirects[0]!.content);
+		expect(redirectContent).toContain("tool_call_loop_detected");
+		// The raw tool result must NEVER be interpolated into the developer-role
+		// redirect (untrusted tool output could smuggle instructions across the
+		// system-interrupt framing — see the review on PR #3981).
+		expect(redirectContent).not.toContain("1263 passed, 4 skipped");
+		// The raw result summary is retained in `details` for post-mortem logs,
+		// but stays out of the model-visible `content`.
+		expect(redirects[0]!.details).toMatchObject({ resultSummary: "1263 passed, 4 skipped" });
 	});
 });
