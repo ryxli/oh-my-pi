@@ -87,4 +87,22 @@ describe("legacy Pi extension source graph", () => {
 		await Bun.write(child, `export const value = 2;\n`);
 		expect(await loaded.loadChild()).toBe(2);
 	});
+
+	it("re-reads dynamic imports edited during startup evaluation", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "legacy-pi-startup-dynamic-import-test-"));
+		tempDirs.push(root);
+		const entry = path.join(root, "entry.ts");
+		const child = path.join(root, "child.ts");
+		await Bun.write(
+			entry,
+			`await Bun.write(${JSON.stringify(child)}, "export const value = 2;\\n");\nconst mod = await import("./child");\nexport const loaded = (mod as { value: number }).value;\n`,
+		);
+		await Bun.write(child, `export const value = 1;\n`);
+
+		const loaded = await loadLegacyPiModule(entry);
+		if (!isLoadedFixtureModule(loaded)) {
+			throw new Error("Legacy Pi fixture did not export a numeric loaded value");
+		}
+		expect(loaded.loaded).toBe(2);
+	});
 });

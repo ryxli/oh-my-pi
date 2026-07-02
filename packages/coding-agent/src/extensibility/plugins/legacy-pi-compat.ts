@@ -882,8 +882,10 @@ function escapeRegExp(value: string): string {
 
 // Match source modules in an extension graph (relative imports and package
 // `imports` aliases such as `#src/*`). Bare third-party dependencies remain
-// native Bun resolutions.
-const EXTENSION_GRAPH_SPECIFIER_REGEX = /(?:from\s+|import\s+|import\s*\(\s*)["']((?:\.\.?\/|#)[^"']+)["']/g;
+// native Bun resolutions. Capture the import introducer so graph collection can
+// distinguish modules loaded during startup's static import phase from modules
+// that may not be read by Bun until a later `import()` call.
+const EXTENSION_GRAPH_SPECIFIER_REGEX = /(from\s+|import\s*\(\s*|import\s+)["']((?:\.\.?\/|#)[^"']+)["']/g;
 
 // Extension entry realpaths that already have a load-time rewrite hook
 // installed. Each `Bun.plugin()` registration is process-global and permanent,
@@ -908,47 +910,71 @@ async function realpathOrSelf(p: string): Promise<string> {
 	}
 }
 
+interface ExtensionModuleGraph {
+	modules: Set<string>;
+	startupSources: Map<string, string>;
+}
+
+interface ExtensionGraphQueueItem {
+	file: string;
+	cacheStartupSource: boolean;
+}
+
 /**
- * Walk the extension's relative-import graph starting at `entryRealPath`,
- * returning each reachable source module's realpath and already-read source.
- * Only relative specifiers (`./`, `../`) are followed — bare and absolute
- * imports are left to Bun's native resolver — so the map is exactly the
- * extension's own source, wherever it physically lives (a `../src` sibling,
- * a symlinked sub-tree, …). This mirrors the module set the old temp-dir mirror
- * tracked, minus the copy.
+ * Walk the extension's relative-import graph starting at `entryRealPath`.
+ * The returned `modules` set scopes the rewrite hook to every own-source module,
+ * including dynamic `import()` targets. `startupSources` only includes modules
+ * reached through static imports, because dynamic-import targets can be created
+ * or edited before their actual load time and must then fall through to disk.
  */
-async function collectExtensionModules(entryRealPath: string): Promise<Map<string, string>> {
-	const modules = new Map<string, string>();
-	const queue = [entryRealPath];
+async function collectExtensionModules(entryRealPath: string): Promise<ExtensionModuleGraph> {
+	const moduleSources = new Map<string, string>();
+	const startupSources = new Map<string, string>();
+	const processedStates = new Set<string>();
+	const queue: ExtensionGraphQueueItem[] = [{ file: entryRealPath, cacheStartupSource: true }];
 	while (queue.length > 0) {
-		const file = queue.pop();
-		if (!file || modules.has(file)) {
+		const item = queue.pop();
+		if (!item) {
 			continue;
 		}
-		let source: string;
-		try {
-			source = await Bun.file(file).text();
-		} catch {
+		const stateKey = `${item.cacheStartupSource ? "startup" : "lazy"}:${item.file}`;
+		if (processedStates.has(stateKey)) {
 			continue;
 		}
-		modules.set(file, source);
-		const dir = path.dirname(file);
+		processedStates.add(stateKey);
+		let source = moduleSources.get(item.file);
+		if (source === undefined) {
+			try {
+				source = await Bun.file(item.file).text();
+			} catch {
+				continue;
+			}
+			moduleSources.set(item.file, source);
+		}
+		if (item.cacheStartupSource) {
+			startupSources.set(item.file, source);
+		}
+		const dir = path.dirname(item.file);
 		for (const match of source.matchAll(EXTENSION_GRAPH_SPECIFIER_REGEX)) {
-			const specifier = match[1];
-			if (!specifier) continue;
+			const importIntroducer = match[1];
+			const specifier = match[2];
+			if (!importIntroducer || !specifier) continue;
 			try {
 				const resolved = specifier.startsWith("#")
-					? await resolvePackageImportSpecifier(specifier, file)
+					? await resolvePackageImportSpecifier(specifier, item.file)
 					: await realpathOrSelf(Bun.resolveSync(specifier, dir));
-				if (resolved && !modules.has(resolved)) {
-					queue.push(resolved);
+				if (resolved) {
+					queue.push({
+						file: resolved,
+						cacheStartupSource: item.cacheStartupSource && !/^import\s*\(/.test(importIntroducer),
+					});
 				}
 			} catch {
 				// Unresolvable relative import (e.g. a type-only path); skip it.
 			}
 		}
 	}
-	return modules;
+	return { modules: new Set(moduleSources.keys()), startupSources };
 }
 
 /**
@@ -967,10 +993,10 @@ async function ensureExtensionGraphHook(entryRealPath: string): Promise<Map<stri
 		// repeat loads. Return `null` so the caller skips the extra reads.
 		return null;
 	}
-	const moduleSources = await collectExtensionModules(entryRealPath);
+	const graph = await collectExtensionModules(entryRealPath);
 	hookedExtensionEntries.add(entryRealPath);
 
-	const alternation = [...moduleSources.keys()].map(escapeRegExp).join("|");
+	const alternation = [...graph.modules].map(escapeRegExp).join("|");
 	const filter = new RegExp(`^(?:${alternation})$`);
 	Bun.plugin({
 		name: `omp:legacy-pi-ext:${Bun.hash(entryRealPath).toString(36)}`,
@@ -989,7 +1015,7 @@ async function ensureExtensionGraphHook(entryRealPath: string): Promise<Map<stri
 			});
 		},
 	});
-	return moduleSources;
+	return graph.startupSources;
 }
 
 /**
