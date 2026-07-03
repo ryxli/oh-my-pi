@@ -32,6 +32,8 @@ import { sshToolRenderer } from "./ssh";
 import { todoToolRenderer } from "./todo";
 import { writeToolRenderer } from "./write";
 
+export type FirstResultViewportRepaint = boolean | ((args: unknown, options: RenderResultOptions) => boolean);
+
 export type ToolRenderer = {
 	renderCall: (args: unknown, options: RenderResultOptions, theme: Theme) => Component;
 	renderResult: (
@@ -75,12 +77,11 @@ export type ToolRenderer = {
 	 */
 	animatedPartialResult?: boolean | ((args: unknown) => boolean);
 	/**
-	 * Whether replacing a streamed pending placeholder with the first result
-	 * requires a full viewport repaint. Use for merged renderers whose pending
-	 * streamed args may have committed placeholder rows that the result render
-	 * re-anchors instead of preserving.
+	 * Whether replacing a pending call render with the first result requires a
+	 * full viewport repaint. Use for merged renderers whose pending rows can be
+	 * re-anchored instead of preserved by the result render.
 	 */
-	forceFirstResultViewportRepaint?: boolean;
+	forceFirstResultViewportRepaint?: FirstResultViewportRepaint;
 	/**
 	 * Whether settling a provisional partial result into the final render requires
 	 * a full viewport repaint. Use when the result renderer changes chrome or

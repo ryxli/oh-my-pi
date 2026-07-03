@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed streamed `write` tool previews leaving stale pending rows above the first partial-result frame in the TUI ([#4477](https://github.com/can1357/oh-my-pi/issues/4477)).
+
 ## [16.3.4] - 2026-07-03
 
 ### Fixed

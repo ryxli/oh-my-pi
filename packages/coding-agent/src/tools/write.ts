@@ -985,6 +985,12 @@ function countLines(text: string): number {
 	return text.split("\n").length;
 }
 
+function writeContentOf(args: unknown): string {
+	if (args == null || typeof args !== "object" || !("content" in args)) return "";
+	const content = args.content;
+	return typeof content === "string" ? content : "";
+}
+
 function formatLineCountSuffix(lineCount: number, uiTheme: Theme): string {
 	if (lineCount <= 0) return "";
 	return uiTheme.fg("dim", ` · ${lineCount} line${lineCount === 1 ? "" : "s"}`);
@@ -1209,4 +1215,6 @@ export const writeToolRenderer = {
 		});
 	},
 	mergeCallAndResult: true,
+	forceFirstResultViewportRepaint: (args: unknown, options: RenderResultOptions) =>
+		!options.expanded && countLines(writeContentOf(args)) > WRITE_STREAMING_PREVIEW_LINES,
 };
