@@ -28,7 +28,7 @@ import { ToolAbortError } from "./tool-errors";
 // Storage layer
 // ────────────────────────────────────────────────────────────────────────────
 
-export type CacheKind = "issue" | "pr" | "pr-diff";
+export type CacheKind = "issue" | "pr" | "pr-lean" | "pr-diff";
 
 const DEFAULT_CACHE_AUTH_KEY = "default";
 
@@ -106,14 +106,14 @@ export function openDb(): Database | null {
 		// than running an in-place ALTER dance.
 		const userVersion = (db.prepare("PRAGMA user_version").get() as { user_version?: number } | undefined)
 			?.user_version;
-		if (userVersion !== undefined && userVersion < 3) {
+		if (userVersion !== undefined && userVersion < 4) {
 			db.run("DROP TABLE IF EXISTS github_view_cache");
 		}
 		db.run(`
 			CREATE TABLE IF NOT EXISTS github_view_cache (
 				auth_key        TEXT    NOT NULL,
 				repo             TEXT    NOT NULL,
-				kind             TEXT    NOT NULL CHECK (kind IN ('issue','pr','pr-diff')),
+				kind             TEXT    NOT NULL CHECK (kind IN ('issue','pr','pr-lean','pr-diff')),
 				number           INTEGER NOT NULL,
 				include_comments INTEGER NOT NULL,
 				fetched_at       INTEGER NOT NULL,
@@ -123,7 +123,7 @@ export function openDb(): Database | null {
 				PRIMARY KEY (auth_key, repo, kind, number, include_comments)
 			);
 			CREATE INDEX IF NOT EXISTS idx_github_view_cache_fetched ON github_view_cache(fetched_at);
-			PRAGMA user_version = 3;
+			PRAGMA user_version = 4;
 		`);
 		protectDbFiles(dbPath);
 		cachedDb = db;
