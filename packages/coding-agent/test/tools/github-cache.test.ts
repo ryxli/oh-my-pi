@@ -6,6 +6,7 @@
  * `git.github.json` / `git.github.text` mocks between cases.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -270,6 +271,74 @@ describe("github-cache db layer", () => {
 		// remains.
 		expect(after?.rendered).toBe("refreshed-content");
 		expect(after?.fetchedAt).not.toBe(fourteenDaysAgo);
+	});
+
+	it("putCached and getCached round-trip for kind pr-lean without CHECK violation", () => {
+		// Regression: the table CHECK constraint must include 'pr-lean'
+		// or SQLite will silently drop the write (caught via putCached catching the error).
+		const payload = { number: 55, title: "Lean PR", reviews: [], files: [] };
+		putCached({
+			repo: TEST_REPO,
+			kind: "pr-lean",
+			number: 55,
+			includeComments: false,
+			payload,
+			rendered: "pr-lean-rendered",
+			fetchedAt: 5000,
+		});
+		const got = getCached(TEST_REPO, "pr-lean", 55, false);
+		expect(got).not.toBeNull();
+		expect(got?.rendered).toBe("pr-lean-rendered");
+		expect(got?.fetchedAt).toBe(5000);
+		const db = openDb();
+		const rows = db
+			?.prepare("SELECT COUNT(*) AS c FROM github_view_cache WHERE kind = 'pr-lean'")
+			.all() as Array<{ c: number }>;
+		expect(rows?.[0].c).toBe(1);
+	});
+
+	it("migrates a user_version 3 DB with CHECK limited to issue/pr/pr-diff so pr-lean can be cached", () => {
+		// Pre-create a DB at the configured path with the old v3 schema.
+		// openDb() detects version < 4 and drops + recreates the table with the
+		// current CHECK that includes 'pr-lean'.
+		const dbPath = process.env.OMP_GITHUB_CACHE_DB!;
+		const old = new Database(dbPath);
+		old.run(`
+			CREATE TABLE github_view_cache (
+				auth_key         TEXT    NOT NULL,
+				repo             TEXT    NOT NULL,
+				kind             TEXT    NOT NULL CHECK (kind IN ('issue','pr','pr-diff')),
+				number           INTEGER NOT NULL,
+				include_comments INTEGER NOT NULL,
+				fetched_at       INTEGER NOT NULL,
+				payload          TEXT    NOT NULL,
+				rendered         TEXT    NOT NULL,
+				source_url       TEXT,
+				PRIMARY KEY (auth_key, repo, kind, number, include_comments)
+			)
+		`);
+		old.run("PRAGMA user_version = 3");
+		old.close();
+
+		// putCached triggers openDb() which sees user_version 3, drops the old table,
+		// and recreates it with CHECK (kind IN ('issue','pr','pr-lean','pr-diff')).
+		putCached({
+			repo: TEST_REPO,
+			kind: "pr-lean",
+			number: 77,
+			includeComments: false,
+			payload: { number: 77 },
+			rendered: "post-migration-lean",
+			fetchedAt: 9000,
+		});
+
+		const got = getCached(TEST_REPO, "pr-lean", 77, false);
+		expect(got).not.toBeNull();
+		expect(got?.rendered).toBe("post-migration-lean");
+		// Confirm the schema was stamped with the current user_version.
+		const db = openDb();
+		const ver = db?.prepare("PRAGMA user_version").get() as { user_version: number } | undefined;
+		expect(ver?.user_version).toBe(4);
 	});
 });
 
