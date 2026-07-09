@@ -442,6 +442,30 @@ export class TranscriptContainer
 		this.#stableRowsFloor = Math.min(stableFloorBefore, stableRows, row);
 		return lines;
 	}
+
+	/**
+	 * Map a container-local row index (from the most recent render) to the child
+	 * block that owns it and that block's own row offset within its stripped
+	 * contribution. Returns `null` when the row falls in an inter-block separator
+	 * row or outside the rendered range.
+	 *
+	 * Safe to call synchronously from an input handler: reads only the segment
+	 * ledger written by the last `render()` call and never partially updated.
+	 */
+	hitTestRow(containerLocalRow: number): { child: Component; childLocalRow: number } | null {
+		const segments = this.#segments;
+		for (let i = 0; i < segments.length; i++) {
+			const seg = segments[i]!;
+			if (containerLocalRow < seg.startRow) break; // segments are ordered; past this child
+			const end = seg.startRow + seg.rowCount;
+			if (containerLocalRow >= end) continue;
+			// The separator (1 blank row before the block) is not part of child content.
+			const childLocalRow = containerLocalRow - seg.startRow - seg.sep;
+			if (childLocalRow < 0) return null; // click landed in the separator
+			return { child: seg.component, childLocalRow };
+		}
+		return null;
+	}
 }
 
 /**

@@ -21,6 +21,7 @@ import type {
 	LoaderMessageColorFn,
 	NativeScrollbackLiveRegion,
 	OverlayHandle,
+	SgrMouseEvent,
 	SlashCommand,
 } from "@oh-my-pi/pi-tui";
 import {
@@ -29,6 +30,7 @@ import {
 	Loader,
 	Markdown,
 	ProcessTerminal,
+	routeSgrMouseInput,
 	Spacer,
 	setTerminalTextSizing,
 	setTuiTight,
@@ -118,6 +120,7 @@ import { formatPhaseDisplayName, todoMatchesAnyDescription } from "../tools/todo
 import { ToolError } from "../tools/tool-errors";
 import { vocalizer } from "../tts/vocalizer";
 import { renderTreeList } from "../tui/tree-list";
+import { copyToClipboard } from "../utils/clipboard";
 import type { EventBus } from "../utils/event-bus";
 import { getEditorCommand, openInEditor } from "../utils/external-editor";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../utils/session-color";
@@ -596,6 +599,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#voicePreviousShowHardwareCursor: boolean | null = null;
 	#voicePreviousUseTerminalCursor: boolean | null = null;
 	#resizeHandler?: () => void;
+	#clickTrackingCleanup: (() => void) | undefined;
 	#observerRegistry: SessionObserverRegistry;
 	#eventBus?: EventBus;
 	#eventBusUnsubscribers: Array<() => void> = [];
@@ -940,6 +944,18 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Start the UI. Cold `omp` launch opts into clearing on the first paint so
 		// the initial welcome frame does not append over the previous run's scrollback.
 		this.ui.start({ clearScrollback: options.clearInitialTerminalHistory === true });
+		// Enable click-only mouse tracking for transcript copy-on-click.
+		// The tracking disposer is stored for explicit cleanup in stop(); the
+		// input listener is registered in #eventBusUnsubscribers so it follows
+		// the same teardown path as all other TUI listeners.
+		this.#clickTrackingCleanup = this.ui.enableClickTracking();
+		this.#eventBusUnsubscribers.push(
+			this.ui.addInputListener(data => {
+				if (!data.startsWith("\x1b[<")) return undefined;
+				routeSgrMouseInput(data, event => this.#handleTranscriptClick(event));
+				return { consume: true };
+			}),
+		);
 		pushTerminalTitle();
 		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
 		this.updateEditorBorderColor();
@@ -3417,6 +3433,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Clear the process-global consent handler so it doesn't outlive this
 		// InteractiveMode instance (e.g. test harnesses, headless re-init).
 		setAutoQaConsentHandler(null, null);
+		if (this.#clickTrackingCleanup) {
+			this.#clickTrackingCleanup();
+			this.#clickTrackingCleanup = undefined;
+		}
 		if (this.isInitialized) {
 			this.ui.stop();
 			this.isInitialized = false;
@@ -3573,6 +3593,40 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	showWarning(message: string): void {
 		this.#uiHelpers.showWarning(message);
+	}
+
+	/**
+	 * Handle a left-button SGR mouse click on the main screen. When the click
+	 * lands on a child block inside `chatContainer`, extract the block's visible
+	 * (ANSI-stripped, outer-blank-trimmed) text, copy it to the clipboard, and
+	 * show a brief status message. Returns true when the event was consumed.
+	 */
+	#handleTranscriptClick(event: SgrMouseEvent): boolean {
+		if (!event.leftClick) return false;
+		const hit = this.ui.hitTestScreenRow(event.row);
+		if (!hit || hit.component !== this.chatContainer) return false;
+		const blockHit = this.chatContainer.hitTestRow(hit.localRow);
+		if (!blockHit) return false;
+		const { child } = blockHit;
+		const width = this.ui.terminal.columns;
+		const rawLines = child.render(width);
+		const plainLines = rawLines.map(l =>
+			l.replace(/\x1b(?:\[[^@-~]*[@-~]|\][^\x07]*\x07|_[^\x07]*\x07|[^[_]])/g, ""),
+		);
+		let start = 0;
+		while (start < plainLines.length && !plainLines[start]!.trim()) start++;
+		let end = plainLines.length - 1;
+		while (end >= start && !plainLines[end]!.trim()) end--;
+		if (start > end) return true; // block is visually empty, consume and ignore
+		const text = plainLines.slice(start, end + 1).join("\n");
+		void copyToClipboard(text)
+			.then(() => {
+				this.showStatus("Copied block to clipboard");
+			})
+			.catch((err: unknown) => {
+				this.showError(`Copy failed: ${err instanceof Error ? err.message : String(err)}`);
+			});
+		return true;
 	}
 
 	#handleLspStartupEvent(event: LspStartupEvent): void {

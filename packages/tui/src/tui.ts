@@ -83,6 +83,12 @@ const CURSOR_END_NO_SYNC = "";
 // coordinates so columns/rows past 223 are reported.
 const MOUSE_TRACKING_ON = "\x1b[?1000h\x1b[?1003h\x1b[?1006h";
 const MOUSE_TRACKING_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1000l";
+// Click-only mouse tracking for the main chat screen: button events (1000h) +
+// SGR extended coordinates (1006h), but NO motion tracking (1003h). This lets
+// the user click transcript blocks to copy them while keeping native terminal
+// text selection available and avoiding any-motion overhead on the hot path.
+const MOUSE_CLICK_TRACKING_ON = "\x1b[?1000h\x1b[?1006h";
+const MOUSE_CLICK_TRACKING_OFF = "\x1b[?1006l\x1b[?1000l";
 const ALT_SCREEN_ENTER = "\x1b[?1049h";
 const ALT_SCREEN_EXIT = "\x1b[?1049l";
 
@@ -1035,6 +1041,11 @@ export class TUI extends Container {
 	// pushing wrapped fragments into native scrollback.
 	#resizeAltActive = false;
 	#stopped = false;
+	// True while click-only mouse tracking is active for the main screen.
+	// Distinct from the fullscreen-overlay MOUSE_TRACKING_ON path (which also
+	// includes motion). Disabled on stop() so the terminal's native selection
+	// is restored cleanly.
+	#clickTrackingActive = false;
 	// Always-on event-loop lag probe. The high default threshold keeps it quiet;
 	// it only logs `ui.loop-blocked` (with the current loop phase) when a frame
 	// budget is genuinely starved. Armed in start(), disarmed in stop().
@@ -1523,6 +1534,49 @@ export class TUI extends Container {
 		this.#inputListeners.delete(listener);
 	}
 
+	/**
+	 * Enable button-click SGR mouse reporting on the main (non-alt) screen.
+	 * Activates `?1000h` (button events) + `?1006h` (SGR extended coordinates)
+	 * but NOT `?1003h` (any-motion), so the terminal's native text-selection
+	 * drag is unaffected. No-op when already active. Returns a disposer that
+	 * disables tracking; callers should hold it and call it on teardown.
+	 */
+	enableClickTracking(): () => void {
+		if (!this.#clickTrackingActive) {
+			this.#clickTrackingActive = true;
+			this.terminal.write(MOUSE_CLICK_TRACKING_ON);
+		}
+		return () => this.disableClickTracking();
+	}
+
+	/** Disable button-click tracking enabled by {@link enableClickTracking}. No-op when not active. */
+	disableClickTracking(): void {
+		if (!this.#clickTrackingActive) return;
+		this.#clickTrackingActive = false;
+		this.terminal.write(MOUSE_CLICK_TRACKING_OFF);
+	}
+
+	/**
+	 * Map a 0-based terminal screen row (from an SGR mouse event) to the root
+	 * child component that occupies it and the component-local row index within
+	 * that child's last rendered output. Returns `null` when the row is above the
+	 * current window, or when no segment covers it (e.g. a blank trailing row).
+	 *
+	 * Safe to call from an input listener: reads only the ledger fields that the
+	 * render loop writes atomically and never partially updates.
+	 */
+	hitTestScreenRow(screenRow: number): { component: Component; localRow: number } | null {
+		const frameRow = this.#windowTopRow + screenRow;
+		const segments = this.#frameSegments;
+		for (let i = 0; i < segments.length; i++) {
+			const seg = segments[i]!;
+			if (frameRow >= seg.start && frameRow < seg.start + seg.rowCount) {
+				return { component: seg.component, localRow: frameRow - seg.start };
+			}
+		}
+		return null;
+	}
+
 	#querySixelSupport(): void {
 		if (TERMINAL.imageProtocol) return;
 		if (process.platform !== "win32") return;
@@ -1675,6 +1729,9 @@ export class TUI extends Container {
 	stop(): void {
 		// Leave the alt buffer first so the teardown cursor math below runs against
 		// the restored normal screen (which #previousLines still describes).
+		if (this.#clickTrackingActive) {
+			this.disableClickTracking();
+		}
 		if (this.#resizeAltActive) {
 			this.terminal.write(this.#leaveResizeAltSequence());
 		}
