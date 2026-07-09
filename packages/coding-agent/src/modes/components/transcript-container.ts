@@ -159,6 +159,18 @@ export class TranscriptContainer
 	// consumes the report and re-bases the baseline). Out-of-band renders
 	// between engine frames lower it; they can never inflate it.
 	#stableRowsFloor = 0;
+	// --- Copied indicator ---
+	// Component currently flashing a "copied" marker; null while idle.
+	#copiedComponent: Component | null = null;
+	// The indicator string appended to the block's last line (e.g. "  ✓").
+	#copiedIndicator = "";
+	// Timer that clears the indicator; undefined while idle.
+	#copiedClearTimer: NodeJS.Timeout | undefined;
+	// Overlay from the previous render: the line index that was modified and
+	// its original clean content.  Used to re-derive the clean baseline when
+	// the block is stably reused (so the previous-frame overlay stays in
+	// #lines without being double-applied).
+	#prevOverlay: { idx: number; clean: string } | null = null;
 	override invalidate(): void {
 		// Theme/global invalidation: retire every diff snapshot so stale styling
 		// is not diffed against the recolored render.
@@ -169,6 +181,40 @@ export class TranscriptContainer
 	override clear(): void {
 		this.#generation++;
 		super.clear();
+	}
+
+	/**
+	 * Mark `component` as "just copied" so the next render appends a brief
+	 * inline indicator to its last visible row.  Cancels any in-flight
+	 * indicator (rapid re-click on the same or a different block); the
+	 * `requestRender` callback is invoked when the indicator auto-clears so
+	 * the host can schedule the repaint.  The host is responsible for calling
+	 * `requestRender()` immediately after `markCopied()` to trigger the first
+	 * paint with the indicator.
+	 */
+	markCopied(component: Component, indicator: string, clearAfterMs: number, requestRender: () => void): void {
+		if (this.#copiedClearTimer !== undefined) {
+			clearTimeout(this.#copiedClearTimer);
+			this.#copiedClearTimer = undefined;
+		}
+		this.#copiedComponent = component;
+		this.#copiedIndicator = indicator;
+		// Force a full re-render so the first frame with the indicator is not
+		// incorrectly considered stable (the indicator modifies #lines after the
+		// loop's stable-prefix accounting, so without invalidate() the TUI would
+		// skip re-emitting the modified line and the indicator would not appear).
+		this.invalidate();
+		this.#copiedClearTimer = setTimeout(() => {
+			this.#copiedComponent = null;
+			this.#copiedIndicator = "";
+			this.#copiedClearTimer = undefined;
+			// Reset overlay tracking before invalidate so the post-loop step does
+			// not attempt to restore a stale clean line over a fresh re-render.
+			this.#prevOverlay = null;
+			this.invalidate();
+			requestRender();
+		}, clearAfterMs);
+		this.#copiedClearTimer.unref?.();
 	}
 
 	setNativeScrollbackCommittedRows(rows: number): void {
@@ -315,6 +361,10 @@ export class TranscriptContainer
 		// Frame row cursor: rows emitted (reused or pushed) so far.
 		let row = 0;
 		let stableRows = 0;
+		// Track whether the copied block was stably reused this frame (no new
+		// lines pushed).  Used in the post-loop overlay step to choose the right
+		// clean-line baseline without double-applying the indicator.
+		let copiedSegmentWasStable = false;
 		for (let i = 0; i < count; i++) {
 			const child = this.children[i]!;
 
@@ -410,6 +460,9 @@ export class TranscriptContainer
 
 			const rowCount = sep + contribution.length;
 			const stable = chainStable && reusable && previous.startRow === row && previous.sep === sep;
+			if (this.#copiedComponent !== null && child === this.#copiedComponent) {
+				copiedSegmentWasStable = stable;
+			}
 			if (stable) {
 				stableRows = row + rowCount;
 			} else {
@@ -440,6 +493,34 @@ export class TranscriptContainer
 		if (lines.length !== row) lines.length = row;
 		this.#segments = segments;
 		this.#stableRowsFloor = Math.min(stableFloorBefore, stableRows, row);
+		// Post-loop: apply a brief "copied" indicator to the last visible row of
+		// the marked block.  Must run after stable-prefix accounting is complete
+		// so #stableRowsFloor is not influenced by our in-place mutation of
+		// #lines.  The indicator is an ANSI-styled suffix appended to the
+		// block's last contribution row.
+		//
+		// Double-overlay prevention: when the block is stably reused the
+		// previous-frame overlay is still in #lines[idx].  We use the stored
+		// clean baseline (#prevOverlay.clean) so the indicator is applied only
+		// once per frame.  On the first frame (no #prevOverlay) or when the
+		// block was freshly re-rendered, #lines[idx] already holds clean content
+		// and we use it directly.
+		if (this.#copiedComponent !== null) {
+			for (let k = 0; k < segments.length; k++) {
+				const seg = segments[k]!;
+				if (seg.component !== this.#copiedComponent || seg.rowCount === 0) continue;
+				const idx = seg.startRow + seg.rowCount - 1;
+				if (idx < lines.length) {
+					const clean =
+						copiedSegmentWasStable && this.#prevOverlay !== null && this.#prevOverlay.idx === idx
+							? this.#prevOverlay.clean
+							: lines[idx]!;
+					lines[idx] = clean + this.#copiedIndicator;
+					this.#prevOverlay = { idx, clean };
+				}
+				break;
+			}
+		}
 		return lines;
 	}
 

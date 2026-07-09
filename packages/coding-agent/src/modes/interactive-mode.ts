@@ -349,6 +349,9 @@ class AnchoredLiveContainer extends Container implements NativeScrollbackLiveReg
  *  before it auto-clears, mirroring the todo HUD's auto-clear timer. */
 const MODEL_CYCLE_TRACK_CLEAR_MS = 4000;
 
+/** How long the per-block "copied" flash indicator lingers (ms). */
+const COPIED_FLASH_MS = 1200;
+
 const SUBAGENT_HUD_VISIBLE_LIMIT = 8;
 const SUBAGENT_OBSERVER_UI_COALESCE_MS = 100;
 
@@ -400,6 +403,11 @@ export function renderSubagentHudLines(sessions: ObservableSession[], columns: n
 		rows.push(theme.fg("dim", `… ${hiddenCount} more running — open Agent Hub for full list`));
 	}
 	return ["", theme.bold(theme.fg("accent", "Subagents")), ...rows.map(line => ` ${line}`)];
+}
+
+/** Build the ANSI-styled indicator appended to the last line of a copied block. */
+function buildCopiedIndicator(): string {
+	return `  ${theme.styledSymbol("status.success", "success")}`;
 }
 
 export class InteractiveMode implements InteractiveModeContext {
@@ -3599,7 +3607,12 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * Handle a left-button SGR mouse click on the main screen. When the click
 	 * lands on a child block inside `chatContainer`, extract the block's visible
 	 * (ANSI-stripped, outer-blank-trimmed) text, copy it to the clipboard, and
-	 * show a brief status message. Returns true when the event was consumed.
+	 * flash a brief block-local "copied" indicator on the last row of the
+	 * clicked block. Returns true when the event was consumed.
+	 *
+	 * Rapid re-clicks on the same or a different block cancel the previous
+	 * indicator timer; no timers or status messages pile up.  Clicks on
+	 * separator rows or outside the transcript are silently ignored.
 	 */
 	#handleTranscriptClick(event: SgrMouseEvent): boolean {
 		if (!event.leftClick) return false;
@@ -3617,11 +3630,17 @@ export class InteractiveMode implements InteractiveModeContext {
 		while (start < plainLines.length && !plainLines[start]!.trim()) start++;
 		let end = plainLines.length - 1;
 		while (end >= start && !plainLines[end]!.trim()) end--;
-		if (start > end) return true; // block is visually empty, consume and ignore
+		if (start > end) return true; // block is visually empty - consume and ignore
 		const text = plainLines.slice(start, end + 1).join("\n");
 		void copyToClipboard(text)
 			.then(() => {
-				this.showStatus("Copied block to clipboard");
+				// Block-local indicator: flash a small checkmark on the last row of
+				// the clicked block.  Rapid re-clicks refresh the same indicator
+				// without stacking timers or appending global status messages.
+				this.chatContainer.markCopied(child, buildCopiedIndicator(), COPIED_FLASH_MS, () =>
+					this.ui.requestRender(),
+				);
+				this.ui.requestRender();
 			})
 			.catch((err: unknown) => {
 				this.showError(`Copy failed: ${err instanceof Error ? err.message : String(err)}`);

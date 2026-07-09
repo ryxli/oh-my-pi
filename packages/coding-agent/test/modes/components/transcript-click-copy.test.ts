@@ -455,3 +455,173 @@ describe("full click-copy chain (hit-test -> extract)", () => {
 		}
 	});
 });
+
+// ---------------------------------------------------------------------------
+// markCopied: indicator lifecycle and rapid-click behaviour
+// ---------------------------------------------------------------------------
+
+const INDICATOR = " [ok]";
+
+describe("markCopied indicator lifecycle", () => {
+	it("appends indicator to the last row of the marked block after render", () => {
+		const container = new TranscriptContainer();
+		const block = new FixedBlock(["line0", "line1"]);
+		container.addChild(block);
+		container.render(80);
+
+		container.markCopied(block, INDICATOR, 5000, () => {});
+		const lines = container.render(80);
+		// block is first child: rows 0-1 (no separator), indicator on last row
+		expect(lines[1]).toBe(`line1${INDICATOR}`);
+		// first row is untouched
+		expect(lines[0]).toBe("line0");
+	});
+
+	it("applies indicator to a single-row block", () => {
+		const container = new TranscriptContainer();
+		const block = new FixedBlock(["only"]);
+		container.addChild(block);
+		container.render(80);
+		container.markCopied(block, INDICATOR, 5000, () => {});
+		const lines = container.render(80);
+		expect(lines[0]).toBe(`only${INDICATOR}`);
+	});
+
+	it("does NOT double-apply indicator on successive stable frames", () => {
+		const container = new TranscriptContainer();
+		const block = new FixedBlock(["text"]);
+		container.addChild(block);
+		container.render(80);
+		container.markCopied(block, INDICATOR, 5000, () => {});
+
+		// frame 1: invalidate forces fresh render, indicator applied
+		container.render(80);
+		// frame 2: block is now stably reused; indicator must not double up
+		const lines = container.render(80);
+		expect(lines[0]).toBe(`text${INDICATOR}`);
+	});
+
+	it("indicator only lands on the last row of a multi-row block", () => {
+		const container = new TranscriptContainer();
+		const block = new FixedBlock(["a", "b", "c"]);
+		container.addChild(block);
+		container.render(80);
+		container.markCopied(block, INDICATOR, 5000, () => {});
+		const lines = container.render(80);
+		expect(lines[0]).toBe("a");
+		expect(lines[1]).toBe("b");
+		expect(lines[2]).toBe(`c${INDICATOR}`);
+	});
+
+	it("indicator clears after the timer fires", async () => {
+		const container = new TranscriptContainer();
+		const block = new FixedBlock(["content"]);
+		container.addChild(block);
+		container.render(80);
+
+		let clearFired = false;
+		container.markCopied(block, INDICATOR, 20, () => {
+			clearFired = true;
+		});
+		container.render(80);
+
+		await new Promise<void>(r => setTimeout(r, 40));
+		expect(clearFired).toBe(true);
+
+		// After clear, the container re-renders without the indicator
+		const lines = container.render(80);
+		expect(lines[0]).toBe("content");
+	});
+
+	it("indicator on second block (separator between blocks)", () => {
+		const container = new TranscriptContainer();
+		const b0 = new FixedBlock(["first"]);
+		const b1 = new FixedBlock(["second"]);
+		container.addChild(b0);
+		container.addChild(b1);
+		container.render(80);
+		container.markCopied(b1, INDICATOR, 5000, () => {});
+		const lines = container.render(80);
+		// layout: row 0 = "first", row 1 = separator, row 2 = "second"
+		expect(lines[0]).toBe("first"); // untouched
+		expect(lines[1]).toBe(""); // separator
+		expect(lines[2]).toBe(`second${INDICATOR}`);
+	});
+
+	it("empty block is skipped by the indicator (no rowCount)", () => {
+		const container = new TranscriptContainer();
+		const empty = new EmptyBlock();
+		const block = new FixedBlock(["visible"]);
+		container.addChild(empty);
+		container.addChild(block);
+		container.render(80);
+
+		// markCopied on the empty block: seg.rowCount === 0 so no overlay applied
+		container.markCopied(empty, INDICATOR, 5000, () => {});
+		const lines = container.render(80);
+		expect(lines[0]).toBe("visible"); // no indicator on the wrong block
+	});
+});
+
+describe("markCopied rapid-click behaviour", () => {
+	it("rapid click same block refreshes indicator without stacking timers", async () => {
+		const container = new TranscriptContainer();
+		const block = new FixedBlock(["msg"]);
+		container.addChild(block);
+		container.render(80);
+
+		let clearCount = 0;
+		// first click: 20 ms timer
+		container.markCopied(block, INDICATOR, 20, () => {
+			clearCount++;
+		});
+		container.render(80);
+		// second click before first timer fires: replaces it
+		container.markCopied(block, INDICATOR, 20, () => {
+			clearCount++;
+		});
+		const lines = container.render(80);
+		expect(lines[0]).toBe(`msg${INDICATOR}`);
+
+		// wait for second timer to fire
+		await new Promise<void>(r => setTimeout(r, 40));
+		// only one clear callback fires (the second timer; the first was cancelled)
+		expect(clearCount).toBe(1);
+	});
+
+	it("rapid click different block moves indicator to new block", () => {
+		const container = new TranscriptContainer();
+		const b0 = new FixedBlock(["alpha"]);
+		const b1 = new FixedBlock(["beta"]);
+		container.addChild(b0);
+		container.addChild(b1);
+		container.render(80);
+
+		container.markCopied(b0, INDICATOR, 5000, () => {});
+		container.render(80); // b0 gets indicator
+
+		// switch to b1
+		container.markCopied(b1, INDICATOR, 5000, () => {});
+		const lines = container.render(80);
+		// row 0 = "alpha", row 1 = sep, row 2 = "beta"
+		expect(lines[0]).toBe("alpha"); // indicator moved away from b0
+		expect(lines[2]).toBe(`beta${INDICATOR}`);
+	});
+
+	it("separator click (null hit) produces no indicator", () => {
+		const container = new TranscriptContainer();
+		container.addChild(new FixedBlock(["first"]));
+		container.addChild(new FixedBlock(["second"]));
+		container.render(80);
+
+		// A null hit from hitTestRow means markCopied is never called in the
+		// click handler; verify the separator row returns null.
+		const sepHit = container.hitTestRow(1);
+		expect(sepHit).toBeNull();
+
+		// With no markCopied call, no indicator appears on any render.
+		const lines = container.render(80);
+		expect(lines[0]).toBe("first");
+		expect(lines[2]).toBe("second");
+	});
+});
