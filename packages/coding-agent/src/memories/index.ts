@@ -115,6 +115,10 @@ interface ConsolidationOutputSchema {
 	skills: ConsolidationSkillSchema[];
 }
 
+const STARTUP_MEMORY_HEADER = "# Startup memory";
+const STARTUP_MEMORY_VERSION = "Version: 1";
+const DURABLE_SUMMARY_SECTIONS = ["Durable invariants", "Source pointers"] as const;
+
 /**
  * Start the background memory startup pipeline.
  *
@@ -153,7 +157,6 @@ interface MemoryInstructionSession {
 
 interface MemoryToolDeveloperInstructionsSnapshot {
 	summary: string;
-	learned: string;
 }
 
 interface CachedMemoryToolDeveloperInstructions {
@@ -186,13 +189,12 @@ async function readMemoryToolDeveloperInstructionsSnapshot(
 
 	let summary = "";
 	try {
-		summary = (await Bun.file(path.join(memoryRoot, "memory_summary.md")).text()).trim();
+		const rawSummary = await Bun.file(path.join(memoryRoot, "memory_summary.md")).text();
+		summary = normalizeDurableStartupSummary(rawSummary) ?? "";
 	} catch {
-		// Missing or unreadable summary — injection is best-effort; fall through
-		// so any captured lessons still surface on their own.
+		// Missing or unreadable summary - injection is best-effort.
 	}
-	const learned = await readLearnedLessons(memoryRoot);
-	return { summary, learned };
+	return { summary };
 }
 
 function renderMemoryToolDeveloperInstructionsSnapshot(
@@ -201,26 +203,13 @@ function renderMemoryToolDeveloperInstructionsSnapshot(
 ): string | undefined {
 	if (!snapshot) return undefined;
 	const cfg = loadMemoryConfig(settings);
-	if (!cfg.enabled) return undefined;
-	if (!snapshot.summary && !snapshot.learned) return undefined;
+	if (!cfg.enabled || !snapshot.summary) return undefined;
 
-	const summaryOut = snapshot.summary
-		? truncateByApproxTokens(snapshot.summary, cfg.summaryInjectionTokenLimit).trim()
-		: "";
-	// Lessons share ONE injection budget with the summary so the combined block
-	// stays within `summaryInjectionTokenLimit` (~4 chars/token, matching
-	// truncateByApproxTokens). With no summary, lessons get the whole budget.
-	// Clamp to 0: truncateByApproxTokens appends a marker, so a truncated summary
-	// can exceed `limit * 4` chars and drive the remainder negative — when the
-	// summary already fills the budget, lessons are simply dropped.
-	const learnedBudget = Math.max(0, cfg.summaryInjectionTokenLimit - Math.ceil(summaryOut.length / 4));
-	const learnedOut =
-		snapshot.learned && learnedBudget > 0 ? truncateByApproxTokens(snapshot.learned, learnedBudget).trim() : "";
-	if (!summaryOut && !learnedOut) return undefined;
+	const summaryOut = truncateByApproxTokens(snapshot.summary, cfg.summaryInjectionTokenLimit).trim();
+	if (!summaryOut) return undefined;
 
 	return prompt.render(readPathTemplate, {
 		memory_summary: summaryOut,
-		learned: learnedOut,
 	});
 }
 
@@ -246,11 +235,6 @@ export function clearMemoryToolDeveloperInstructionsCache(session: MemoryInstruc
 
 /**
  * Refresh the active session's consolidated-memory snapshot after startup maintenance.
- *
- * Startup may finish after the first prompt build and write `memory_summary.md`;
- * the active session should see that summary. It must not reread `learned.md`,
- * because a `learn` call racing with startup belongs to the next session's
- * memory prompt, not the active prompt-cache prefix.
  */
 export async function refreshMemoryToolDeveloperInstructionsCacheAfterStartup(
 	session: MemoryInstructionSession,
@@ -258,13 +242,8 @@ export async function refreshMemoryToolDeveloperInstructionsCacheAfterStartup(
 	settings: Settings,
 ): Promise<void> {
 	const sessionFile = getMemoryInstructionSessionFile(session);
-	const cached = memoryToolDeveloperInstructionsBySession.get(session);
 	const current = await readMemoryToolDeveloperInstructionsSnapshot(agentDir, settings);
-	const root = getMemoryInstructionRoot(agentDir, settings);
-	const baseline = memoryToolDeveloperInstructionsByRoot.get(root);
-	const cachedLearned = cached && cached.sessionFile === sessionFile ? cached.snapshot?.learned : undefined;
-	const learned = cachedLearned ?? baseline?.learned ?? "";
-	const snapshot = current ? { summary: current.summary, learned } : undefined;
+	const snapshot = current ? { summary: current.summary } : undefined;
 	cacheMemoryToolDeveloperInstructions(session, sessionFile, snapshot, settings);
 }
 
@@ -485,11 +464,36 @@ async function runPhase2(options: {
 
 		const claim = claimResult.claim;
 		const outputs = listStage1OutputsForGlobal(db, config.maxRawMemoriesForGlobal, cwd);
+		const learnedLessons = await readLearnedLessons(memoryRoot);
 		const newWatermark = computeCompletionWatermark(claim.inputWatermark, outputs);
 
-		await syncPhase2Artifacts(memoryRoot, outputs);
-		if (outputs.length === 0) {
+		let artifactBackup = await snapshotMemoryArtifacts(memoryRoot);
+		try {
+			if (outputs.length > 0 || !learnedLessons) await syncPhase2Artifacts(memoryRoot, outputs);
+		} catch (error) {
+			const stillOwned = heartbeatGlobalJob(db, {
+				ownershipToken: claim.ownershipToken,
+				leaseSeconds: config.phase2LeaseSeconds,
+				nowSec: unixNow(),
+				cwd,
+			});
+			if (stillOwned) await restoreMemoryArtifactSnapshot(memoryRoot, artifactBackup);
+			else await discardMemoryArtifactSnapshot(artifactBackup);
+			artifactBackup = undefined;
+			markPhase2FailureWithFallback(db, {
+				claim,
+				retryDelaySeconds: config.phase2RetryDelaySeconds,
+				reason: String(error),
+				memoryRoot,
+				cwd,
+				error,
+			});
+			return;
+		}
+		if (outputs.length === 0 && !learnedLessons) {
 			await cleanupConsolidatedArtifacts(memoryRoot);
+			await discardMemoryArtifactSnapshot(artifactBackup);
+			artifactBackup = undefined;
 			const marked = markGlobalPhase2Succeeded(db, {
 				ownershipToken: claim.ownershipToken,
 				newWatermark,
@@ -508,6 +512,15 @@ async function runPhase2(options: {
 			fallbackRole: "smol",
 		});
 		if (!phase2Model) {
+			const stillOwned = heartbeatGlobalJob(db, {
+				ownershipToken: claim.ownershipToken,
+				leaseSeconds: config.phase2LeaseSeconds,
+				nowSec: unixNow(),
+				cwd,
+			});
+			if (stillOwned) await restoreMemoryArtifactSnapshot(memoryRoot, artifactBackup);
+			else await discardMemoryArtifactSnapshot(artifactBackup);
+			artifactBackup = undefined;
 			markPhase2FailureWithFallback(db, {
 				claim,
 				retryDelaySeconds: config.phase2RetryDelaySeconds,
@@ -519,6 +532,15 @@ async function runPhase2(options: {
 		}
 		const phase2ApiKey = await modelRegistry.getApiKey(phase2Model, session.sessionId);
 		if (!phase2ApiKey) {
+			const stillOwned = heartbeatGlobalJob(db, {
+				ownershipToken: claim.ownershipToken,
+				leaseSeconds: config.phase2LeaseSeconds,
+				nowSec: unixNow(),
+				cwd,
+			});
+			if (stillOwned) await restoreMemoryArtifactSnapshot(memoryRoot, artifactBackup);
+			else await discardMemoryArtifactSnapshot(artifactBackup);
+			artifactBackup = undefined;
 			markPhase2FailureWithFallback(db, {
 				claim,
 				retryDelaySeconds: config.phase2RetryDelaySeconds,
@@ -528,7 +550,7 @@ async function runPhase2(options: {
 			});
 			return;
 		}
-
+		let artifactsApplied = false;
 		let heartbeatLostOwnership = false;
 		const heartbeat = setInterval(() => {
 			const ok = heartbeatGlobalJob(db, {
@@ -550,7 +572,11 @@ async function runPhase2(options: {
 				apiKey: modelRegistry.resolver(phase2Model, session.sessionId),
 				metadata: session.agent?.metadataForProvider(phase2Model.provider),
 			});
+			if (heartbeatLostOwnership) {
+				throw new Error("Phase2 lease ownership lost before completion");
+			}
 			await applyConsolidation(memoryRoot, consolidated);
+			artifactsApplied = true;
 			if (heartbeatLostOwnership) {
 				throw new Error("Phase2 lease ownership lost before completion");
 			}
@@ -563,7 +589,18 @@ async function runPhase2(options: {
 			if (!marked) {
 				throw new Error("Phase2 could not mark success: ownership lost");
 			}
+			await discardMemoryArtifactSnapshot(artifactBackup);
+			artifactBackup = undefined;
 		} catch (error) {
+			const stillOwned = heartbeatGlobalJob(db, {
+				ownershipToken: claim.ownershipToken,
+				leaseSeconds: config.phase2LeaseSeconds,
+				nowSec: unixNow(),
+				cwd,
+			});
+			if (!artifactsApplied && stillOwned) await restoreMemoryArtifactSnapshot(memoryRoot, artifactBackup);
+			else await discardMemoryArtifactSnapshot(artifactBackup);
+			artifactBackup = undefined;
 			markPhase2FailureWithFallback(db, {
 				claim,
 				retryDelaySeconds: config.phase2RetryDelaySeconds,
@@ -781,6 +818,55 @@ async function runStage1Job(options: {
 	}
 }
 
+interface MemoryArtifactSnapshot {
+	directory: string;
+	existed: boolean;
+}
+
+async function snapshotMemoryArtifacts(memoryRoot: string): Promise<MemoryArtifactSnapshot> {
+	await fs.mkdir(path.dirname(memoryRoot), { recursive: true });
+	const directory = await fs.mkdtemp(path.join(path.dirname(memoryRoot), ".memory-phase2-"));
+	try {
+		await fs.stat(memoryRoot);
+	} catch {
+		return { directory, existed: false };
+	}
+	const backupRoot = path.join(directory, "root");
+	await fs.mkdir(backupRoot, { recursive: true });
+	for (const entry of await fs.readdir(memoryRoot)) {
+		if (entry === LEARNED_LESSONS_FILE) continue;
+		await fs.cp(path.join(memoryRoot, entry), path.join(backupRoot, entry), { recursive: true });
+	}
+	return { directory, existed: true };
+}
+
+async function restoreMemoryArtifactSnapshot(
+	memoryRoot: string,
+	snapshot: MemoryArtifactSnapshot | undefined,
+): Promise<void> {
+	if (!snapshot) return;
+	await fs.mkdir(memoryRoot, { recursive: true });
+	for (const entry of await fs.readdir(memoryRoot)) {
+		if (entry === LEARNED_LESSONS_FILE) continue;
+		await fs.rm(path.join(memoryRoot, entry), { recursive: true, force: true });
+	}
+	if (snapshot.existed) {
+		for (const entry of await fs.readdir(path.join(snapshot.directory, "root"))) {
+			await fs.cp(
+				path.join(snapshot.directory, "root", entry),
+				path.join(memoryRoot, entry),
+				{ recursive: true },
+			);
+		}
+	}
+	await fs.rm(snapshot.directory, { recursive: true, force: true });
+}
+
+async function discardMemoryArtifactSnapshot(snapshot: MemoryArtifactSnapshot | undefined): Promise<void> {
+	if (!snapshot) return;
+
+	await fs.rm(snapshot.directory, { recursive: true, force: true });
+}
 async function syncPhase2Artifacts(memoryRoot: string, outputs: Stage1OutputRow[]): Promise<void> {
 	const summariesDir = path.join(memoryRoot, "rollout_summaries");
 	await fs.mkdir(summariesDir, { recursive: true });
@@ -860,11 +946,15 @@ async function runConsolidationModel(options: {
 	}>;
 }> {
 	const { memoryRoot, model, apiKey } = options;
-	const rawMemories = await Bun.file(path.join(memoryRoot, "raw_memories.md")).text();
+	const rawMemories = await Bun.file(path.join(memoryRoot, "raw_memories.md"))
+		.text()
+		.catch(() => "No raw memories yet.");
 	const rolloutSummaries = await readRolloutSummaries(memoryRoot);
+	const learnedLessons = await readLearnedLessons(memoryRoot);
 	const input = prompt.render(consolidationTemplate, {
 		raw_memories: truncateByApproxTokens(rawMemories, 20_000),
 		rollout_summaries: truncateByApproxTokens(rolloutSummaries, 12_000),
+		learned_lessons: truncateByApproxTokens(learnedLessons || "No captured lessons yet.", 8_000),
 	});
 
 	const response = await completeSimple(
@@ -893,7 +983,7 @@ async function runConsolidationModel(options: {
 	const schemaOutput = parseConsolidationOutputSchema(parsed);
 	if (!schemaOutput) throw new Error("phase2 JSON schema validation failure");
 	const memoryMd = redactSecrets(schemaOutput.memory_md).trim();
-	const memorySummary = redactSecrets(schemaOutput.memory_summary).trim();
+	const memorySummary = normalizeDurableStartupSummary(schemaOutput.memory_summary);
 	const skills = schemaOutput.skills
 		.map(item => {
 			const name = sanitizeSkillName(item.name.trim());
@@ -1054,6 +1144,33 @@ function parseStage1OutputSchema(value: Record<string, unknown>): Stage1OutputSc
 		rollout_slug: value.rollout_slug,
 		raw_memory: value.raw_memory,
 	};
+}
+
+const VOLATILE_SUMMARY_CONTENT_RE =
+	/(?:\b(?:live|current|active|pending|status|todo|task|work[- ]queue|pane|pull\s+request|pr\s*#?\d+|branch|commit|worktree|blocked|working|idle|done)\b|https?:\/\/\S+\/(?:pull|issues?)\/\d+)/i;
+
+function normalizeDurableStartupSummary(input: string): string | undefined {
+	const summary = redactSecrets(input).trim();
+	if (!summary || VOLATILE_SUMMARY_CONTENT_RE.test(summary)) return undefined;
+
+	const body = summary.replace(/^#\s+Startup memory\s*\n(?:Version:\s*1\s*\n)?/i, "").trim();
+	const headings = [...body.matchAll(/^#{1,6}\s+(.+?)\s*$/gm)];
+	if (
+		headings.length !== DURABLE_SUMMARY_SECTIONS.length ||
+		headings[0]?.[1] !== DURABLE_SUMMARY_SECTIONS[0] ||
+		headings[1]?.[1] !== DURABLE_SUMMARY_SECTIONS[1] ||
+		headings[0]?.index !== 0
+	) {
+		return undefined;
+	}
+	for (let index = 0; index < headings.length; index += 1) {
+		const heading = headings[index];
+		const sectionStart = (heading.index ?? 0) + heading[0].length;
+		const sectionEnd = headings[index + 1]?.index ?? body.length;
+		if (body.slice(sectionStart, sectionEnd).trim() === "") return undefined;
+	}
+
+	return `${STARTUP_MEMORY_HEADER}\n${STARTUP_MEMORY_VERSION}\n\n${body}\n`;
 }
 
 function parseConsolidationOutputSchema(value: Record<string, unknown>): ConsolidationOutputSchema | undefined {
@@ -1317,6 +1434,7 @@ export async function saveLearnedLesson(
 	const context = input.context ? normalizeLearnedText(input.context, MAX_LEARNED_CONTEXT_CHARS) : "";
 	const line = context ? `- ${content} _(context: ${context})_` : `- ${content}`;
 	const filePath = path.join(getMemoryRoot(agentDir, cwd), LEARNED_LESSONS_FILE);
+	await fs.mkdir(path.dirname(filePath), { recursive: true });
 
 	// Serialize the read-modify-write per file: parallel `learn` calls (sibling
 	// subagents, or two shared tool calls in one turn) share the project memory

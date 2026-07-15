@@ -195,6 +195,9 @@ describe("memories runtime", () => {
 			{ type: "message", message: { role: "user", content: "summarize this rollout" } },
 		];
 		await fs.writeFile(rolloutPath, `${rolloutRows.map(row => JSON.stringify(row)).join("\n")}\n`);
+		const memoryRoot = getMemoryRoot(fx.agentDir, fx.session.sessionManager.getCwd());
+		await fs.mkdir(memoryRoot, { recursive: true });
+		await fs.writeFile(path.join(memoryRoot, "learned.md"), "- captured for consolidation\n");
 
 		const completeSpy = vi
 			.spyOn(ai, "completeSimple")
@@ -219,7 +222,8 @@ describe("memories runtime", () => {
 						type: "text",
 						text: JSON.stringify({
 							memory_md: "# Memory\n\nConsolidated body",
-							memory_summary: "Consolidated summary",
+							memory_summary:
+								"## Durable invariants\n- Consolidated summary\n\n## Source pointers\n- rollout thread",
 							skills: [{ name: "deploy-playbook", content: "# Deploy\nUse blue/green." }],
 						}),
 					},
@@ -234,13 +238,12 @@ describe("memories runtime", () => {
 			taskDepth: 0,
 		});
 
-		const memoryRoot = getMemoryRoot(fx.agentDir, fx.session.sessionManager.getCwd());
 		await settle(fx.whenSettled, "phase1->phase2 pipeline");
 		expect((await fs.readFile(path.join(memoryRoot, "MEMORY.md"), "utf8")).trim()).toBe(
 			"# Memory\n\nConsolidated body",
 		);
 		expect((await fs.readFile(path.join(memoryRoot, "memory_summary.md"), "utf8")).trim()).toBe(
-			"Consolidated summary",
+			"# Startup memory\nVersion: 1\n\n## Durable invariants\n- Consolidated summary\n\n## Source pointers\n- rollout thread",
 		);
 		expect((await fs.readFile(path.join(memoryRoot, "skills", "deploy-playbook", "SKILL.md"), "utf8")).trim()).toBe(
 			"# Deploy\nUse blue/green.",
@@ -250,6 +253,127 @@ describe("memories runtime", () => {
 		expect(ai.completeSimple).toHaveBeenCalledTimes(2);
 		const phase2Prompt = completeSpy.mock.calls[1]?.[1];
 		expect(phase2Prompt?.systemPrompt?.[0]).toContain("memory-stage-two consolidator");
+		expect(JSON.stringify(phase2Prompt)).toContain("captured for consolidation");
+	});
+	test("rejects a non-durable summary without touching prior artifacts", async () => {
+		const fx = await createFixture();
+		const memoryRoot = getMemoryRoot(fx.agentDir, fx.session.sessionManager.getCwd());
+		await fs.mkdir(path.join(memoryRoot, "skills", "legacy"), { recursive: true });
+		await fs.writeFile(path.join(memoryRoot, "MEMORY.md"), "prior memory");
+		await fs.writeFile(
+			path.join(memoryRoot, "memory_summary.md"),
+			"# Startup memory\nVersion: 1\n\n## Durable invariants\n- prior invariant\n\n## Source pointers\n- prior source",
+		);
+		await fs.writeFile(path.join(memoryRoot, "skills", "legacy", "SKILL.md"), "prior skill");
+		await fs.writeFile(path.join(memoryRoot, "raw_memories.md"), "prior raw");
+		await fs.mkdir(path.join(memoryRoot, "rollout_summaries"), { recursive: true });
+		await fs.writeFile(path.join(memoryRoot, "rollout_summaries", "prior.md"), "prior rollout");
+		await fs.writeFile(path.join(memoryRoot, "learned.md"), "- prior lesson\n");
+
+		const db = memoryStorage.openMemoryDb(getAgentDbPath(fx.agentDir));
+		memoryStorage.upsertThreads(db, [
+			{
+				id: "thread-new",
+				updatedAt: 200,
+				rolloutPath: "/tmp/new.jsonl",
+				cwd: fx.session.sessionManager.getCwd(),
+				sourceKind: "cli",
+			},
+		]);
+		db.prepare(
+			"INSERT INTO stage1_outputs (thread_id, source_updated_at, raw_memory, rollout_summary, rollout_slug, generated_at) VALUES (?, ?, ?, ?, ?, ?)",
+		).run("thread-new", 200, "new raw", "new rollout", "new", 200);
+		memoryStorage.enqueueGlobalWatermark(db, 200, fx.session.sessionManager.getCwd(), {
+			forceDirtyWhenNotAdvanced: true,
+		});
+		memoryStorage.closeMemoryDb(db);
+
+		const invalidResponse = {
+			stopReason: "end_turn",
+			content: [
+				{
+					type: "text",
+					text: JSON.stringify({
+						memory_md: "new memory",
+						memory_summary: "## Durable invariants\n- missing source section",
+						skills: [{ name: "new", content: "new skill" }],
+					}),
+				},
+			],
+		} as never;
+		vi.spyOn(ai, "completeSimple").mockImplementation(async () => {
+			await fs.appendFile(path.join(memoryRoot, "learned.md"), "- appended during rollback\n");
+			return invalidResponse;
+		});
+
+		startMemoryStartupTask({
+			session: fx.session,
+			settings: fx.settings,
+			modelRegistry: fx.modelRegistry,
+			agentDir: fx.agentDir,
+			taskDepth: 0,
+		});
+		await settle(fx.whenSettled, "invalid phase2 output");
+
+		expect(await fs.readFile(path.join(memoryRoot, "MEMORY.md"), "utf8")).toBe("prior memory");
+		expect(await fs.readFile(path.join(memoryRoot, "memory_summary.md"), "utf8")).toContain("prior invariant");
+		expect(await fs.readFile(path.join(memoryRoot, "skills", "legacy", "SKILL.md"), "utf8")).toBe("prior skill");
+		expect(await fs.readFile(path.join(memoryRoot, "raw_memories.md"), "utf8")).toBe("prior raw");
+		expect(await fs.readFile(path.join(memoryRoot, "rollout_summaries", "prior.md"), "utf8")).toBe("prior rollout");
+		expect(await fs.readFile(path.join(memoryRoot, "learned.md"), "utf8")).toBe(
+			"- prior lesson\n- appended during rollback\n",
+		);
+	});
+	test("runs phase2 from learned lessons without deleting prior artifacts", async () => {
+		const fx = await createFixture();
+		const memoryRoot = getMemoryRoot(fx.agentDir, fx.session.sessionManager.getCwd());
+		await fs.mkdir(path.join(memoryRoot, "skills", "legacy"), { recursive: true });
+		await fs.writeFile(path.join(memoryRoot, "learned.md"), "- Durable lesson from learn\n");
+		await fs.writeFile(path.join(memoryRoot, "raw_memories.md"), "prior raw");
+		await fs.mkdir(path.join(memoryRoot, "rollout_summaries"), { recursive: true });
+		await fs.writeFile(path.join(memoryRoot, "rollout_summaries", "prior.md"), "prior rollout");
+		await fs.writeFile(path.join(memoryRoot, "MEMORY.md"), "prior memory");
+		await fs.writeFile(
+			path.join(memoryRoot, "memory_summary.md"),
+			"# Startup memory\nVersion: 1\n\n## Durable invariants\n- prior invariant\n\n## Source pointers\n- prior source",
+		);
+		await fs.writeFile(path.join(memoryRoot, "skills", "legacy", "SKILL.md"), "prior skill");
+
+		const db = memoryStorage.openMemoryDb(getAgentDbPath(fx.agentDir));
+		memoryStorage.enqueueGlobalWatermark(db, 200, fx.session.sessionManager.getCwd(), {
+			forceDirtyWhenNotAdvanced: true,
+		});
+		memoryStorage.closeMemoryDb(db);
+
+		const completeSpy = vi.spyOn(ai, "completeSimple").mockResolvedValue({
+			stopReason: "end_turn",
+			content: [
+				{
+					type: "text",
+					text: JSON.stringify({
+						memory_md: "lesson memory",
+						memory_summary: "## Durable invariants\n- learned invariant\n\n## Source pointers\n- learned lesson",
+						skills: [],
+					}),
+				},
+			],
+		} as never);
+
+		startMemoryStartupTask({
+			session: fx.session,
+			settings: fx.settings,
+			modelRegistry: fx.modelRegistry,
+			agentDir: fx.agentDir,
+			taskDepth: 0,
+		});
+		await settle(fx.whenSettled, "lessons-only phase2");
+
+		expect(await fs.readFile(path.join(memoryRoot, "MEMORY.md"), "utf8")).toBe("lesson memory\n");
+		expect(await fs.readFile(path.join(memoryRoot, "memory_summary.md"), "utf8")).toContain("learned invariant");
+		expect(await fs.readFile(path.join(memoryRoot, "raw_memories.md"), "utf8")).toBe("prior raw");
+		expect(await fs.readFile(path.join(memoryRoot, "rollout_summaries", "prior.md"), "utf8")).toBe("prior rollout");
+		expect(await Bun.file(path.join(memoryRoot, "skills", "legacy", "SKILL.md")).exists()).toBe(false);
+		expect(JSON.stringify(completeSpy.mock.calls[0]?.[1])).toContain("Durable lesson from learn");
 	});
 
 	test("clamps stage1 and phase2 reasoning effort against the model's supported range", async () => {
@@ -298,7 +422,7 @@ describe("memories runtime", () => {
 						type: "text",
 						text: JSON.stringify({
 							memory_md: "# Memory\n\nBody",
-							memory_summary: "Summary",
+							memory_summary: "## Durable invariants\n- Summary\n\n## Source pointers\n- rollout thread",
 							skills: [],
 						}),
 					},
@@ -333,7 +457,7 @@ describe("memories runtime", () => {
 					type: "text",
 					text: JSON.stringify({
 						memory_md: "# Memory\n\nMerged",
-						memory_summary: "Merged summary",
+						memory_summary: "## Durable invariants\n- Merged summary\n\n## Source pointers\n- rollout thread",
 						skills: [{ name: "ops", content: "# Ops\nRunbook" }],
 					}),
 				},
@@ -459,7 +583,7 @@ describe("buildMemoryToolDeveloperInstructions", () => {
 		await fs.mkdir(memoryRoot, { recursive: true });
 		await fs.writeFile(
 			path.join(memoryRoot, "memory_summary.md"),
-			`${"A".repeat(120)}\n${"B".repeat(120)}\n${"C".repeat(120)}`,
+			`## Durable invariants\n${"A".repeat(120)}\n## Source pointers\n${"B".repeat(120)}\n${"C".repeat(120)}`,
 		);
 
 		const payload = await buildMemoryToolDeveloperInstructions(agentDir, settings);
@@ -467,5 +591,48 @@ describe("buildMemoryToolDeveloperInstructions", () => {
 		expect(payload).toContain("memory://root/memory_summary.md");
 		expect(payload).not.toContain(memoryRoot);
 		expect(payload).toContain("...[truncated]...");
+	});
+	test("accepts only sectioned durable summaries and normalizes the startup marker", async () => {
+		const agentDir = await makeTempDir("memories-runtime-durable-summary");
+		const settings = Settings.isolated({ "memory.backend": "local" });
+		const memoryRoot = getMemoryRoot(agentDir, settings.getCwd());
+		await fs.mkdir(memoryRoot, { recursive: true });
+
+		await fs.writeFile(path.join(memoryRoot, "memory_summary.md"), "legacy summary");
+		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings)).toBeUndefined();
+
+		await fs.writeFile(
+			path.join(memoryRoot, "memory_summary.md"),
+			"## Durable invariants\n- durable\n\n## Source pointers\n- source\n\n## Current status\n- volatile",
+		);
+		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings)).toBeUndefined();
+
+		await fs.writeFile(
+			path.join(memoryRoot, "memory_summary.md"),
+			"preamble\n## Durable invariants\n- durable\n\n## Source pointers\n- source",
+		);
+		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings)).toBeUndefined();
+
+		await fs.writeFile(
+			path.join(memoryRoot, "memory_summary.md"),
+			"## Durable invariants\n- live PR #123 in pane 4\n\n## Source pointers\n- source",
+		);
+		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings)).toBeUndefined();
+
+		await fs.writeFile(
+			path.join(memoryRoot, "memory_summary.md"),
+			"## Durable invariants\n### Branch details\n- worktree branch\n\n## Source pointers\n- source",
+		);
+		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings)).toBeUndefined();
+
+		await fs.writeFile(
+			path.join(memoryRoot, "memory_summary.md"),
+			"## Durable invariants\n- durable\n\n## Source pointers\n- source",
+		);
+		const instructions = await buildMemoryToolDeveloperInstructions(agentDir, settings);
+		expect(instructions).toContain("# Startup memory");
+		expect(instructions).toContain("Version: 1");
+		expect(instructions).toContain("## Durable invariants");
+		expect(instructions).toContain("## Source pointers");
 	});
 });
