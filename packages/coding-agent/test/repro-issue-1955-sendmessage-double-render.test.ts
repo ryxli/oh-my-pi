@@ -81,6 +81,10 @@ function createHarness(): Harness {
 	const sessionMock = {
 		isStreaming: false,
 		extensionRunner: fakeRunner,
+		getAsyncJobControl: () => ({
+			inspect: () => null,
+			cancel: () => ({ cancelled: false, reason: "not-found" }),
+		}),
 		/**
 		 * Mirror `AgentSession.sendCustomMessage` non-streaming
 		 * `deliverAs: "nextTurn"` / no-trigger path: persist the message as a

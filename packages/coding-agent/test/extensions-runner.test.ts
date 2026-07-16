@@ -1030,6 +1030,7 @@ describe("ExtensionRunner", () => {
 					getContextUsage: () => undefined,
 					compact: async () => {},
 					getSystemPrompt: () => [],
+					asyncJobs: { inspect: () => null, cancel: () => ({ cancelled: false, reason: "not-found" }) },
 				},
 			);
 
@@ -1094,6 +1095,7 @@ describe("ExtensionRunner", () => {
 					getContextUsage: () => undefined,
 					compact: async () => {},
 					getSystemPrompt: () => [],
+					asyncJobs: { inspect: () => null, cancel: () => ({ cancelled: false, reason: "not-found" }) },
 				},
 			);
 
@@ -1150,6 +1152,7 @@ describe("ExtensionRunner", () => {
 					getContextUsage: () => undefined,
 					compact: async () => {},
 					getSystemPrompt: () => [],
+					asyncJobs: { inspect: () => null, cancel: () => ({ cancelled: false, reason: "not-found" }) },
 				},
 				undefined,
 				{
@@ -1817,6 +1820,7 @@ describe("ExtensionRunner", () => {
 					getContextUsage: () => undefined,
 					compact: async () => {},
 					getSystemPrompt: () => [],
+					asyncJobs: { inspect: () => null, cancel: () => ({ cancelled: false, reason: "not-found" }) },
 				},
 			);
 

@@ -228,7 +228,13 @@ import type {
 	TurnStartEvent,
 } from "../extensibility/extensions";
 import { createExtensionModelQuery } from "../extensibility/extensions/model-api";
-import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
+import type {
+	CompactOptions,
+	ContextUsage,
+	ExtensionAsyncJobCancelResult,
+	ExtensionAsyncJobControl,
+	ExtensionAsyncJobInfo,
+} from "../extensibility/extensions/types";
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { RecoveredRetryError } from "../extensibility/shared-events";
@@ -672,6 +678,21 @@ export interface AsyncJobSnapshot {
 	running: AsyncJobSnapshotItem[];
 	recent: AsyncJobSnapshotItem[];
 	delivery: AsyncJobDeliveryState;
+}
+
+/**
+ * Map an internal {@link AsyncJob} to the immutable public snapshot handed to
+ * extensions. Drops the abort controller, promise, and result/error text; keeps
+ * only stable non-secret fields. `agentId` mirrors the job's owner id.
+ */
+function toExtensionAsyncJobInfo(job: AsyncJob): ExtensionAsyncJobInfo {
+	return {
+		id: job.id,
+		type: job.type,
+		status: job.status,
+		startTime: job.startTime,
+		agentId: job.ownerId,
+	};
 }
 
 export type { ShakeMode, ShakeResult };
@@ -3129,6 +3150,59 @@ export class AgentSession {
 		}));
 		const delivery = manager.getDeliveryState(ownerFilter);
 		return { running, recent, delivery };
+	}
+
+	/**
+	 * Owner-scoped async-job control handed to extensions via `ctx.asyncJobs`.
+	 * Every operation is restricted to jobs registered by *this* session's
+	 * agent id, so an extension can never inspect or cancel another parent
+	 * session's jobs. This is the single seam every extension-init surface
+	 * (print/RPC, interactive, ACP) wires through — none reach into the
+	 * `AsyncJobManager` directly.
+	 */
+	getAsyncJobControl(): ExtensionAsyncJobControl {
+		return {
+			inspect: jobId => this.#inspectOwnedAsyncJob(jobId),
+			cancel: jobId => this.#cancelOwnedAsyncJob(jobId),
+		};
+	}
+
+	/**
+	 * Resolve a job by id only when it is reachable *and* owned by this session.
+	 * Returns undefined for an unknown id, a manager-less/anonymous session, or
+	 * a job owned by another session — the last case is deliberately
+	 * indistinguishable from "unknown" so ownership can't be probed.
+	 */
+	#ownedAsyncJob(jobId: string): AsyncJob | undefined {
+		const manager = this.#asyncJobManager;
+		if (!manager || !this.#agentId) return undefined;
+		const job = manager.getJob(jobId);
+		if (!job || job.ownerId !== this.#agentId) return undefined;
+		return job;
+	}
+
+	#inspectOwnedAsyncJob(jobId: string): ExtensionAsyncJobInfo | null {
+		const job = this.#ownedAsyncJob(jobId);
+		return job ? toExtensionAsyncJobInfo(job) : null;
+	}
+
+	/**
+	 * Atomically cancel one owned job. The owner check and `manager.cancel`
+	 * run synchronously with no interleaving await, and `manager.cancel`
+	 * re-verifies ownership + running state, so cancellation is exact. Preserves
+	 * the manager's semantics: the job's abort signal fires and its late
+	 * completion delivery is suppressed (the run wrapper sees `status ===
+	 * "cancelled"` and skips `#enqueueDelivery`).
+	 */
+	#cancelOwnedAsyncJob(jobId: string): ExtensionAsyncJobCancelResult {
+		const manager = this.#asyncJobManager;
+		const job = this.#ownedAsyncJob(jobId);
+		if (!manager || !job) return { cancelled: false, reason: "not-found" };
+		const info = toExtensionAsyncJobInfo(job);
+		if (!manager.cancel(jobId, { ownerId: this.#agentId })) {
+			return { cancelled: false, reason: "not-running", job: info };
+		}
+		return { cancelled: true, job: { ...info, status: "cancelled" } };
 	}
 
 	/**
@@ -7915,6 +7989,7 @@ export class AgentSession {
 				await this.reload();
 			},
 			getSystemPrompt: () => this.systemPrompt,
+			asyncJobs: this.getAsyncJobControl(),
 		};
 	}
 
