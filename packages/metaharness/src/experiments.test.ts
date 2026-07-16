@@ -36,6 +36,7 @@ function runRow(overrides: Partial<RunRow>): RunRow {
 		note: "",
 		status: "running",
 		pid: null,
+		launchToken: null,
 		exitCode: null,
 		createdAt: Date.now(),
 		finishedAt: null,
@@ -77,7 +78,6 @@ describe("experiment lifecycle metadata", () => {
 		const store = new RunStore(jobsDir);
 		try {
 			store.setExperimentMeta("persisted", { goal: "bounded", maxRuns: 4, maxArms: 2 });
-			store.closeExperiment("persisted", "operator", 1_700_000_000_000);
 			store.setExperimentGoal("legacy", "old");
 			store.setExperimentMeta("empty", { goal: "waiting", maxRuns: 9, maxArms: 3 });
 			for (const jobName of ["persisted-arm", "legacy-arm"]) {
@@ -90,6 +90,8 @@ describe("experiment lifecycle metadata", () => {
 					pid: process.pid,
 				});
 			}
+			store.markExit("persisted-arm", 0);
+			store.closeExperiment("persisted", "operator", 1_700_000_000_000);
 
 			const summaries = buildExperiments(store);
 			expect(summaries.find(s => s.id === "persisted")).toMatchObject({
@@ -307,5 +309,29 @@ describe("re-run merging", () => {
 		]);
 		const byTask = Object.fromEntries(merged.map(t => [t.task, t.name]));
 		expect(byTask).toEqual({ a: "a__2", b: "b__2", c: "c__1" });
+	});
+});
+
+describe("experiment admission limits", () => {
+	it("counts canonical arms separately from every grouped run", () => {
+		const jobsDir = mkdtempSync(join(tmpdir(), "metaharness-admission-"));
+		const store = new RunStore(jobsDir);
+		try {
+			store.setExperimentMeta("exp", { maxRuns: 2, maxArms: 1 });
+			store.registerLaunch({
+				benchmark: "harbor",
+				jobName: "exp-base",
+				dataset: "d",
+				agent: "omp",
+				models: ["m"],
+				pid: process.pid,
+			});
+			expect(() => store.admitExperimentLaunch({ jobName: "exp-base-fix" })).not.toThrow();
+			expect(() => store.admitExperimentLaunch({ jobName: "exp-other" })).toThrow(/maxArms limit reached/);
+			expect(() => store.admitExperimentLaunch({ jobName: "exp-base-backfill" })).toThrow(/maxRuns limit reached/);
+		} finally {
+			store.close();
+			rmSync(jobsDir, { recursive: true, force: true });
+		}
 	});
 });
