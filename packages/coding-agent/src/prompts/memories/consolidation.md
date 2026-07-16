@@ -4,7 +4,9 @@ Input corpus (raw memories):
 {{raw_memories}}
 Input corpus (rollout summaries):
 {{rollout_summaries}}
-Produce strict JSON only with this schema — you NEVER include any other output:
+Input archive (captured lessons):
+{{learned_lessons}}
+Produce strict JSON only with this schema - you NEVER include any other output:
 {
   "memory_md": "string",
   "memory_summary": "string",
@@ -20,7 +22,8 @@ Produce strict JSON only with this schema — you NEVER include any other output
 }
 Requirements:
 - memory_md: long-term memory document.
-- memory_summary: prompt-time memory guidance.
+- memory_summary: startup-eligible durable guidance. It MUST contain non-empty `## Durable invariants` and `## Source pointers` sections. Do not include volatile status sections such as current status, active work, next steps, TODOs, or pending work.
+- Do not include live pull requests, pane references, task/work queue text, or transient status in either startup section.
 - skills: reusable playbooks. Empty array allowed.
 - skill.name maps to skills/<name>/.
 - skill.content maps to skills/<name>/SKILL.md.
