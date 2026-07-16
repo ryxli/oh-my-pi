@@ -61,11 +61,25 @@ export interface ExperimentDetail {
 	matrix: Record<string, Record<string, { status: string; reward: number | null }>>;
 }
 
+/** Translate persisted closure fields into the public closure projection. */
+function closureOf(meta: {
+	closure?: { verdict: string; closedAt: number } | null;
+	closureVerdict?: string | null;
+	closedAt?: number | null;
+}): { verdict: string; closedAt: number } | null {
+	if ("closureVerdict" in meta || "closedAt" in meta) {
+		if (meta.closureVerdict == null && meta.closedAt == null) return null;
+		return { verdict: meta.closureVerdict ?? "", closedAt: meta.closedAt ?? 0 };
+	}
+	return meta.closure ?? null;
+}
+
 /** Experiment id = first `-`-delimited token of the job name. */
 export function experimentOf(jobName: string): string {
 	const dash = jobName.indexOf("-");
 	return dash > 0 ? jobName.slice(0, dash) : jobName;
 }
+
 
 /** Arm label = job name minus the experiment prefix (falls back to the full name). */
 export function armOf(jobName: string): string {
@@ -214,7 +228,7 @@ export function buildExperiments(store: RunStore): ExperimentSummary[] {
 			goal: meta?.goal ?? "",
 			maxRuns: meta?.maxRuns ?? null,
 			maxArms: meta?.maxArms ?? null,
-			closure: meta?.closure ?? null,
+			closure: meta ? closureOf(meta) : null,
 			arms: runs.length,
 			runningArms: runs.filter(r => r.status === "running").length,
 			datasets: [...new Set(runs.map(r => r.dataset).filter(Boolean))],
@@ -237,7 +251,7 @@ export function buildExperiments(store: RunStore): ExperimentSummary[] {
 			goal: meta.goal,
 			maxRuns: meta.maxRuns ?? null,
 			maxArms: meta.maxArms ?? null,
-			closure: meta.closure ?? null,
+			closure: closureOf(meta),
 			arms: 0,
 			runningArms: 0,
 			datasets: [],
@@ -301,7 +315,7 @@ export function experimentDetail(store: RunStore, id: string): ExperimentDetail 
 					goal: meta.goal,
 					maxRuns: meta.maxRuns ?? null,
 					maxArms: meta.maxArms ?? null,
-					closure: meta.closure ?? null,
+					closure: closureOf(meta),
 					arms: [],
 					tasks: [],
 					matrix: {},
@@ -400,7 +414,7 @@ export function experimentDetail(store: RunStore, id: string): ExperimentDetail 
 		goal: meta?.goal ?? "",
 		maxRuns: meta?.maxRuns ?? null,
 		maxArms: meta?.maxArms ?? null,
-		closure: meta?.closure ?? null,
+		closure: meta ? closureOf(meta) : null,
 		arms,
 		tasks: [...tasks].sort(),
 		matrix,

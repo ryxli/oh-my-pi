@@ -76,6 +76,7 @@ export interface AddArmRequest {
 interface ManagedChild {
 	proc: Subprocess;
 	jobName: string;
+	launchToken: string;
 	cancelled: boolean;
 }
 
@@ -355,7 +356,9 @@ export class ManagerServer {
 					if (!this.deleteRun(jobName)) return Response.json({ error: "run not found" }, { status: 404 });
 					return Response.json({ jobName, deleted: true });
 				}
-				const run = this.#store.syncRun(jobName);
+				const currentRun = this.#store.getRun(jobName);
+				if (!currentRun) return Response.json({ error: "run not found" }, { status: 404 });
+				const run = this.#store.syncRun(jobName, currentRun.launchToken);
 				if (!run) return Response.json({ error: "run not found" }, { status: 404 });
 				return Response.json({ run, traces: this.#store.listTraces(jobName) });
 			}
@@ -414,14 +417,19 @@ export class ManagerServer {
 		if (this.#children.has(jobName) || this.#store.getRun(jobName)?.status === "running") {
 			throw new Error(`run ${jobName} is already running`);
 		}
-		this.#store.admitExperimentLaunch({
+		const admissionToken = this.#store.admitExperimentLaunch({
 			jobName,
 			goal: request.goal,
 			maxRuns: request.maxRuns,
 			maxArms: request.maxArms,
 		});
+		const jobDir = path.join(this.jobsDir, jobName);
+		const hadJobDir = fs.existsSync(jobDir);
+		const managerFile = path.join(jobDir, "manager.json");
+		const hadManagerFile = fs.existsSync(managerFile);
+		const logFile = path.join(this.jobsDir, "_manager", "logs", `${jobName}.log`);
+		const hadLogFile = fs.existsSync(logFile);
 		try {
-			const jobDir = path.join(this.jobsDir, jobName);
 			fs.mkdirSync(jobDir, { recursive: true });
 
 		let argv: string[];
@@ -455,10 +463,35 @@ export class ManagerServer {
 			config: { ...request },
 			role: request.role,
 			note: request.note,
-		});
+		}, admissionToken);
 		return { jobName, pid };
 		} catch (err) {
-			this.#store.releaseExperimentLaunch(jobName);
+			const ownsReservation = this.#store.hasExperimentLaunch(jobName, admissionToken);
+			let releaseReservation = true;
+			if (ownsReservation && this.#store.getRun(jobName) === null) {
+				if (!hadManagerFile) {
+					try {
+						fs.rmSync(managerFile, { force: true });
+					} catch {}
+				}
+				if (!hadLogFile) {
+					try {
+						fs.rmSync(logFile, { force: true });
+					} catch {}
+				}
+				if (!hadJobDir) {
+					try {
+						fs.rmSync(jobDir, { recursive: true, force: true });
+					} catch {}
+				} else {
+					try {
+						releaseReservation = fs.readdirSync(jobDir).length === 0;
+					} catch {
+						releaseReservation = false;
+					}
+				}
+			}
+			if (releaseReservation) this.#store.releaseExperimentLaunch(jobName, admissionToken);
 			throw err;
 		}
 	}
@@ -486,7 +519,9 @@ export class ManagerServer {
 		if (this.#runLive(run)) {
 			throw new Error(`run ${jobName} is already running`);
 		}
-		if (run.status === "running") this.#store.markExit(jobName, null, true);
+		if (run.status === "running" && !this.#store.markExit(jobName, null, true, run.launchToken)) {
+			throw new Error(`run ${jobName} changed during resume`);
+		}
 		const jobDir = path.join(this.jobsDir, jobName);
 		if (!fs.existsSync(path.join(jobDir, "config.json"))) {
 			throw new Error(`${jobName} has no harbor config.json to resume from`);
@@ -509,44 +544,84 @@ export class ManagerServer {
 			config: run.config,
 			role: run.role,
 			note: run.note,
-		});
+		}, undefined, run.launchToken);
 		return { jobName, pid };
 	}
 
-	/** Spawn a detached runner child, wire its exit back into the store, and register the run. */
-	#spawnRunner(argv: string[], cwd: string, record: Omit<LaunchRecord, "pid">): number {
+	/** Reserve a launch before spawning, then wire its exact token to exit/sync callbacks. */
+	#spawnRunner(
+		argv: string[],
+		cwd: string,
+		record: Omit<LaunchRecord, "pid">,
+		admissionToken?: string,
+		expectedLaunchToken?: string | null,
+	): number {
 		const jobName = record.jobName;
+		let launchToken = "";
 		const logDir = path.join(this.jobsDir, "_manager", "logs");
-		fs.mkdirSync(logDir, { recursive: true });
-		const logFile = fs.openSync(path.join(logDir, `${jobName}.log`), "w");
-		const proc = Bun.spawn(argv, {
-			cwd,
-			stdout: logFile,
-			stderr: logFile,
-			env: { ...process.env },
-			// Own process group: a manager restart (Ctrl+C / --hot dev cycle) must
-			// not deliver terminal signals to runners — that killed live runs.
-			detached: true,
-		});
-		const child: ManagedChild = { proc, jobName, cancelled: false };
-		this.#children.set(jobName, child);
-		proc.exited.then(exitCode => {
-			try {
-				fs.closeSync(logFile);
-			} catch {}
-			// A retired instance (--hot reload) must not touch the closed store;
-			// the successor's pid sweep reconciles this run from disk instead.
-			if (this.#stopped) return;
-			this.#store.markExit(jobName, exitCode, child.cancelled);
-			// Final sync AFTER the terminal state: the ticker only revisits
-			// running rows, so the last-2s trial results would otherwise be lost.
-			this.#store.syncRun(jobName);
-			this.#children.delete(jobName);
+		let logFile: number | null = null;
+		let childSpawned = false;
+		try {
+			fs.mkdirSync(logDir, { recursive: true });
+			launchToken = this.#store.reserveLaunch(record, admissionToken, expectedLaunchToken);
+			const openedLogFile = fs.openSync(path.join(logDir, `${jobName}.log`), "w");
+			logFile = openedLogFile;
+			const proc = Bun.spawn(argv, {
+				cwd,
+				stdout: openedLogFile,
+				stderr: openedLogFile,
+				env: { ...process.env },
+				// Own process group: a manager restart (Ctrl+C / --hot dev cycle) must
+				// not deliver terminal signals to runners - that killed live runs.
+				detached: true,
+			});
+			childSpawned = true;
+			if (expectedLaunchToken !== undefined) this.#store.discardExpectedLaunchSnapshot(launchToken);
+			if (!this.#store.bindLaunchPid(jobName, launchToken, proc.pid)) {
+				try {
+					proc.kill("SIGTERM");
+				} catch {}
+				throw new Error(`launch ${jobName} reservation disappeared`);
+			}
+			const child: ManagedChild = { proc, jobName, launchToken, cancelled: false };
+			this.#children.set(jobName, child);
+			proc.exited.then(exitCode => {
+				try {
+					if (logFile !== null) fs.closeSync(logFile);
+				} catch {}
+				// A retired instance (--hot reload) must not touch the closed store;
+				// the successor's pid sweep reconciles this run from disk instead.
+				if (this.#stopped) return;
+				const terminal = this.#store.markExit(jobName, exitCode, child.cancelled, launchToken);
+				if (!terminal) {
+					if (this.#children.get(jobName) === child) this.#children.delete(jobName);
+					return;
+				}
+				// Final sync AFTER the terminal state: the ticker only revisits
+				// running rows, so the last-2s trial results would otherwise be lost.
+				this.#store.syncRun(jobName, launchToken);
+				if (this.#children.get(jobName) === child) this.#children.delete(jobName);
+				this.#tick();
+			});
 			this.#tick();
-		});
-		this.#store.registerLaunch({ ...record, pid: proc.pid });
-		this.#tick();
-		return proc.pid;
+			return proc.pid;
+		} catch (err) {
+			try {
+				if (logFile !== null) fs.closeSync(logFile);
+			} catch {}
+			if (launchToken !== "") {
+				if (expectedLaunchToken !== undefined && !childSpawned) {
+					if (!this.#store.restoreExpectedLaunch(jobName, launchToken)) {
+						this.#store.syncRun(jobName, launchToken);
+					}
+				} else {
+					const rolledBack =
+						admissionToken !== undefined && this.#store.rollbackLaunch(jobName, launchToken, admissionToken);
+					if (!rolledBack) this.#store.markExit(jobName, null, false, launchToken);
+				}
+			}
+			throw err;
+		}
 	}
 
 	/** Liveness check that survives manager restarts: managed child, or a running row with a live pid. */
@@ -613,7 +688,10 @@ export class ManagerServer {
 		if (verdict !== undefined && scopeEdit) {
 			throw new Error("cannot change goal or limits while closing an experiment");
 		}
-		if (verdict !== undefined) this.#store.closeExperiment(id, verdict);
+		if (verdict !== undefined) {
+			const closed = this.#store.closeExperiment(id, verdict);
+			if (!closed) throw new Error(`experiment ${id} is already closed or has running arms`);
+		}
 		if (scopeEdit) {
 			this.#store.setExperimentMeta(id, {
 				goal: update.goal,
@@ -707,7 +785,7 @@ export class ManagerServer {
 					process.kill(pid, "SIGKILL");
 				} catch {}
 			}, 5000);
-			this.#store.markExit(jobName, null, true);
+			this.#store.markExit(jobName, null, true, run.launchToken);
 			return { jobName, cancelled: true };
 		}
 		return { jobName, cancelled: false };

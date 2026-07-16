@@ -235,7 +235,209 @@ describe("RunStore", () => {
 		expect(finished?.status).toBe("complete");
 		expect(finished?.finishedAt).toBe(Date.parse("2026-07-12T11:00:00"));
 	});
+
+	it("keeps admitted launches token-owned after closure", () => {
+		const store = new RunStore(makeJobsDir());
+		cleanups.push(() => store.close());
+		const launch = {
+			benchmark: "harbor" as const,
+			jobName: "exp-arm",
+			dataset: "test-dataset@1.0",
+			agent: "omp",
+			models: ["m"],
+		};
+
+		const staleToken = store.reserveLaunch(launch);
+		const currentToken = store.reserveLaunch(launch);
+		expect(store.getRun("exp-arm")).toMatchObject({ status: "running", pid: null, launchToken: currentToken });
+		expect(() => store.reserveLaunch(launch, undefined, staleToken)).toThrow(/token changed/);
+		expect(store.closeExperiment("exp", "admitted launch may finish")).toBe(true);
+		expect(() => store.reserveLaunch({ ...launch, jobName: "exp-later" })).toThrow(/closed/);
+		expect(store.bindLaunchPid("exp-arm", currentToken, 101)).toBe(true);
+		expect(store.syncRun("exp-arm", staleToken)).toMatchObject({ pid: 101, status: "running", nTotal: 0, done: 0 });
+		expect(store.markExit("exp-arm", 1, false, staleToken)).toBe(false);
+		expect(store.markExit("exp-arm", 0, false, currentToken)).toBe(true);
+	});
+
+	it("does not let a captured null token mutate a replacement row", () => {
+		const jobsDir = makeJobsDir();
+		writeFixtureJob(jobsDir, "legacy-arm");
+		const store = new RunStore(jobsDir);
+		cleanups.push(() => store.close());
+		expect(store.discover()).toBe(1);
+		const launch = {
+			benchmark: "harbor" as const,
+			jobName: "legacy-arm",
+			dataset: "test-dataset@1.0",
+			agent: "omp",
+			models: ["m"],
+		};
+		expect(() => store.reserveLaunch(launch, undefined, "stale-token")).toThrow(/token changed/);
+		expect(store.listTraces("legacy-arm")).toHaveLength(3);
+		const currentToken = store.reserveLaunch(launch);
+
+		expect(store.syncRun("legacy-arm", null)).toMatchObject({
+			launchToken: currentToken,
+			status: "running",
+			nTotal: 3,
+		});
+	});
+
+	it("restores a missing promoted row only while the reservation slot is free", () => {
+		const store = new RunStore(makeJobsDir());
+		cleanups.push(() => store.close());
+		const launch = {
+			benchmark: "harbor" as const,
+			jobName: "exp-arm",
+			dataset: "test-dataset@1.0",
+			agent: "omp",
+			models: ["m"],
+		};
+		const token = store.admitExperimentLaunch({ jobName: launch.jobName, maxRuns: 1 });
+		store.reserveLaunch(launch, token);
+		expect(store.deleteRun(launch.jobName)).toBe(true);
+		expect(store.rollbackLaunch(launch.jobName, token, token)).toBe(true);
+		expect(store.hasExperimentLaunch(launch.jobName, token)).toBe(true);
+		store.releaseExperimentLaunch(launch.jobName, token);
+
+		const secondToken = store.admitExperimentLaunch({ jobName: launch.jobName, maxRuns: 1 });
+		store.reserveLaunch(launch, secondToken);
+		expect(store.deleteRun(launch.jobName)).toBe(true);
+		const replacementToken = store.admitExperimentLaunch({ jobName: launch.jobName, maxRuns: 1 });
+		expect(store.rollbackLaunch(launch.jobName, secondToken, secondToken)).toBe(false);
+		expect(store.hasExperimentLaunch(launch.jobName, replacementToken)).toBe(true);
+	});
+
+	it("cancels a tokenless run with a NULL ownership predicate", () => {
+		const jobsDir = makeJobsDir();
+		const dbPath = path.join(jobsDir, "_manager", "cancel.sqlite");
+		writeFixtureJob(jobsDir, "legacy-cancel");
+		const manager = new ManagerServer(jobsDir, dbPath);
+		cleanups.push(() => manager.store.close());
+		expect(manager.store.discover()).toBe(1);
+		const db = new Database(dbPath);
+		db.query("UPDATE runs SET pid = ? WHERE job_name = ? AND launch_token IS NULL").run(999999999, "legacy-cancel");
+		db.close();
+
+		expect(manager.cancel("legacy-cancel")).toEqual({ jobName: "legacy-cancel", cancelled: true });
+		expect(manager.store.getRun("legacy-cancel")).toMatchObject({ status: "cancelled", launchToken: null });
+	});
+	it("does not let legacy registration claim a grouped reservation", () => {
+		const store = new RunStore(makeJobsDir());
+		cleanups.push(() => store.close());
+		const launch = {
+			benchmark: "harbor" as const,
+			jobName: "exp-arm",
+			dataset: "test-dataset@1.0",
+			agent: "omp",
+			models: ["m"],
+		};
+		const token = store.admitExperimentLaunch({ jobName: launch.jobName, maxRuns: 1 });
+
+		expect(() => store.registerLaunch({ ...launch, pid: process.pid })).toThrow(/already reserved/);
+		expect(store.getRun(launch.jobName)).toBeNull();
+		expect(() => store.reserveLaunch(launch, "not-the-owner")).toThrow(/reservation disappeared/);
+		expect(() => store.reserveLaunch(launch, token)).not.toThrow();
+	});
+
+	it("does not create a reservation when token promotion cannot claim it", () => {
+		const store = new RunStore(makeJobsDir());
+		cleanups.push(() => store.close());
+		const launch = {
+			benchmark: "harbor" as const,
+			jobName: "fresh-arm",
+			dataset: "test-dataset@1.0",
+			agent: "omp",
+			models: ["m"],
+		};
+
+		expect(() => store.reserveLaunch(launch, "missing-token")).toThrow(/reservation disappeared/);
+		expect(() => store.admitExperimentLaunch({ jobName: launch.jobName, maxRuns: 1 })).not.toThrow();
+		store.releaseExperimentLaunch(launch.jobName);
+
+		store.setExperimentMeta("closed", {});
+		expect(store.closeExperiment("closed", "closed before launch")).toBe(true);
+		expect(() => store.reserveLaunch({ ...launch, jobName: "closed-arm" }, "missing-token")).toThrow(/closed/);
+		store.deleteExperimentMeta("closed");
+		expect(() => store.admitExperimentLaunch({ jobName: "closed-arm", maxRuns: 1 })).not.toThrow();
+	});
+
+	it("restores a token-owned reservation after filesystem setup fails", () => {
+		const jobsDir = makeJobsDir();
+		const store = new RunStore(jobsDir);
+		cleanups.push(() => store.close());
+		const launch = {
+			benchmark: "harbor" as const,
+			jobName: "exp-arm",
+			dataset: "test-dataset@1.0",
+			agent: "omp",
+			models: ["m"],
+		};
+		const token = store.admitExperimentLaunch({ jobName: launch.jobName, maxRuns: 1 });
+		const jobPath = path.join(jobsDir, launch.jobName);
+		fs.writeFileSync(jobPath, "not a job directory");
+
+		expect(() => store.reserveLaunch(launch, token)).toThrow();
+		expect(store.getRun(launch.jobName)).toBeNull();
+
+		fs.rmSync(jobPath);
+		expect(() => store.reserveLaunch(launch, token)).not.toThrow();
+	});
+
+	it("rejects grouped admission over an existing run before mutation", () => {
+		const store = new RunStore(makeJobsDir());
+		cleanups.push(() => store.close());
+		const launch = {
+			benchmark: "harbor" as const,
+			jobName: "exp-arm",
+			dataset: "test-dataset@1.0",
+			agent: "omp",
+			models: ["m"],
+		};
+		store.registerLaunch({ ...launch, pid: 1 });
+		store.markExit(launch.jobName, 0);
+		store.setExperimentMeta("exp", { maxRuns: 3 });
+
+		expect(() => store.admitExperimentLaunch({ jobName: launch.jobName, maxRuns: 3 })).toThrow(/already exists/);
+		expect(store.getRun(launch.jobName)).toMatchObject({ status: "complete", pid: null });
+		expect(() => store.admitExperimentLaunch({ jobName: "exp-next" })).not.toThrow();
+	});
+
+	it("allows the admitted owner to promote after experiment closure", () => {
+		const store = new RunStore(makeJobsDir());
+		cleanups.push(() => store.close());
+		const launch = {
+			benchmark: "harbor" as const,
+			jobName: "exp-arm",
+			dataset: "test-dataset@1.0",
+			agent: "omp",
+			models: ["m"],
+		};
+		const token = store.admitExperimentLaunch({ jobName: launch.jobName, maxRuns: 1 });
+		expect(store.closeExperiment("exp", "admitted launch")).toBe(true);
+		expect(() => store.reserveLaunch(launch, token)).not.toThrow();
+		expect(store.bindLaunchPid(launch.jobName, token, 101)).toBe(true);
+		expect(store.markExit(launch.jobName, 0, false, token)).toBe(true);
+	});
+	it("does not close a bound live launch", () => {
+		const store = new RunStore(makeJobsDir());
+		cleanups.push(() => store.close());
+		const token = store.reserveLaunch({
+			benchmark: "harbor",
+			jobName: "exp-arm",
+			dataset: "test-dataset@1.0",
+			agent: "omp",
+			models: ["m"],
+		});
+
+		expect(store.bindLaunchPid("exp-arm", token, 101)).toBe(true);
+		expect(store.closeExperiment("exp", "must wait")).toBe(false);
+		expect(store.markExit("exp-arm", 0, false, token)).toBe(true);
+		expect(store.closeExperiment("exp", "finished")).toBe(true);
+	});
+
 });
+
 
 describe("RunStore grouped launch admission", () => {
 	it("rejects duplicate reservations and counts other reservations toward limits", () => {
@@ -268,6 +470,11 @@ describe("RunStore grouped launch admission", () => {
 		first.admitExperimentLaunch({ jobName: "exp-orphan", maxRuns: 1 });
 		fs.mkdirSync(path.join(jobsDir, "exp-orphan"));
 		first.close();
+		const staleDb = new Database(dbPath);
+		staleDb
+			.query("UPDATE experiment_launches SET created_at = ? WHERE job_name = ?")
+			.run(Date.now() - 60 * 60 * 1000, "exp-orphan");
+		staleDb.close();
 
 		const restarted = new RunStore(jobsDir, dbPath);
 		cleanups.push(() => restarted.close());
@@ -275,6 +482,69 @@ describe("RunStore grouped launch admission", () => {
 		expect(restarted.getRun("exp-orphan")).toBeNull();
 		expect(() => restarted.admitExperimentLaunch({ jobName: "exp-next" })).not.toThrow();
 	});
+
+	it("retains a stale reservation while its nonempty directory remains", () => {
+		const jobsDir = makeJobsDir();
+		const dbPath = path.join(jobsDir, "experiment.sqlite");
+		const first = new RunStore(jobsDir, dbPath);
+		first.admitExperimentLaunch({ jobName: "exp-orphan", maxRuns: 1 });
+		const jobDir = path.join(jobsDir, "exp-orphan");
+		fs.mkdirSync(jobDir);
+		fs.writeFileSync(path.join(jobDir, "historical.json"), "{}");
+		const staleDb = new Database(dbPath);
+		staleDb
+			.query("UPDATE experiment_launches SET created_at = ? WHERE job_name = ?")
+			.run(Date.now() - 60 * 60 * 1000, "exp-orphan");
+		staleDb.close();
+
+		const restarted = new RunStore(jobsDir, dbPath);
+		cleanups.push(() => restarted.close());
+		expect(restarted.discover()).toBe(0);
+		expect(restarted.getRun("exp-orphan")).toBeNull();
+		expect(() => restarted.admitExperimentLaunch({ jobName: "exp-next" })).toThrow(/maxRuns limit reached/);
+	});
+	it("preserves a fresh in-flight reservation across manager restart", () => {
+		const jobsDir = makeJobsDir();
+		const dbPath = path.join(jobsDir, "experiment.sqlite");
+		const first = new ManagerServer(jobsDir, dbPath);
+		const token = first.store.admitExperimentLaunch({ jobName: "exp-arm", maxRuns: 1 });
+		const second = new ManagerServer(jobsDir, dbPath);
+		cleanups.push(() => first.store.close(), () => second.store.close());
+
+		expect(token).toEqual(expect.any(String));
+		expect(() => second.store.admitExperimentLaunch({ jobName: "exp-arm" })).toThrow(/already reserved/);
+		expect(() => second.store.admitExperimentLaunch({ jobName: "exp-other" })).toThrow(/maxRuns limit reached/);
+	});
+
+	it("skips a nonempty reserved directory during ManagerServer discovery", () => {
+		const jobsDir = makeJobsDir();
+		const dbPath = path.join(jobsDir, "experiment.sqlite");
+		const first = new ManagerServer(jobsDir, dbPath);
+		const token = first.store.admitExperimentLaunch({ jobName: "exp-arm", maxRuns: 1 });
+		const jobDir = path.join(jobsDir, "exp-arm");
+		fs.mkdirSync(jobDir, { recursive: true });
+		fs.writeFileSync(path.join(jobDir, "orphan"), "pending");
+
+		const second = new ManagerServer(jobsDir, dbPath);
+		second.start(0);
+		cleanups.push(() => first.store.close(), () => void second.stop());
+
+		expect(second.store.getRun("exp-arm")).toBeNull();
+		expect(() => second.store.admitExperimentLaunch({ jobName: "exp-other" })).toThrow(/maxRuns limit reached/);
+		expect(() =>
+			first.store.reserveLaunch(
+				{
+					benchmark: "harbor",
+					jobName: "exp-arm",
+					dataset: "test-dataset@1.0",
+					agent: "omp",
+					models: ["m"],
+				},
+				token,
+			),
+		).not.toThrow();
+	});
+
 });
 
 describe("ManagerServer API", () => {
@@ -540,6 +810,106 @@ describe("ManagerServer API", () => {
 	});
 });
 
+describe("ManagerServer launch rollback", () => {
+	it("rolls back an admitted launch after post-reserve setup failure", () => {
+		const jobsDir = makeJobsDir();
+		const dbPath = path.join(jobsDir, "_manager", "rollback.sqlite");
+		const manager = new ManagerServer(jobsDir, dbPath);
+		const logDir = path.join(jobsDir, "_manager", "logs");
+		fs.writeFileSync(logDir, "not a directory");
+
+		expect(() =>
+			manager.launch({
+				benchmark: "harbor",
+				jobName: "exp-failed",
+				model: "m/x",
+				maxRuns: 1,
+			}),
+		).toThrow();
+		expect(manager.store.getRun("exp-failed")).toBeNull();
+
+		fs.rmSync(logDir);
+		const restarted = new ManagerServer(jobsDir, dbPath);
+		restarted.start(0);
+		cleanups.push(() => manager.store.close(), () => void restarted.stop());
+		expect(restarted.store.getRun("exp-failed")).toBeNull();
+		expect(() => restarted.store.admitExperimentLaunch({ jobName: "exp-retry", maxRuns: 1 })).not.toThrow();
+	});
+
+	it("preserves a prior run and traces when resume log setup is blocked", () => {
+		const jobsDir = makeJobsDir();
+		const jobName = "legacy-retry";
+		writeFixtureJob(jobsDir, jobName);
+		const resultPath = path.join(jobsDir, jobName, "result.json");
+		const result = JSON.parse(fs.readFileSync(resultPath, "utf8")) as Record<string, unknown>;
+		result.finished_at = "2026-07-12T12:00:00";
+		fs.writeFileSync(resultPath, JSON.stringify(result));
+		const dbPath = path.join(jobsDir, "_manager", "prior.sqlite");
+		const manager = new ManagerServer(jobsDir, dbPath);
+		cleanups.push(() => manager.store.close());
+		expect(manager.store.discover()).toBe(1);
+		const before = manager.store.getRun(jobName);
+		const traces = manager.store.listTraces(jobName);
+		const logDir = path.join(jobsDir, "_manager", "logs");
+		fs.writeFileSync(logDir, "not a directory");
+
+		expect(() => manager.resume(jobName)).toThrow(/EEXIST|ENOTDIR|not a directory/);
+		expect(manager.store.getRun(jobName)).toEqual(before);
+		expect(manager.store.listTraces(jobName)).toEqual(traces);
+		fs.rmSync(logDir);
+	});
+
+	it("restores a prior run and traces after resume spawn failure", () => {
+		const jobsDir = makeJobsDir();
+		const jobName = "legacy-spawn-failure";
+		writeFixtureJob(jobsDir, jobName);
+		const resultPath = path.join(jobsDir, jobName, "result.json");
+		const result = JSON.parse(fs.readFileSync(resultPath, "utf8")) as Record<string, unknown>;
+		result.finished_at = "2026-07-12T12:00:00";
+		fs.writeFileSync(resultPath, JSON.stringify(result));
+		const dbPath = path.join(jobsDir, "_manager", "spawn-failure.sqlite");
+		const manager = new ManagerServer(jobsDir, dbPath);
+		cleanups.push(() => manager.store.close());
+		expect(manager.store.discover()).toBe(1);
+		const before = manager.store.getRun(jobName);
+		const traces = manager.store.listTraces(jobName);
+		const bunRuntime = Bun as unknown as { spawn: typeof Bun.spawn };
+		const originalSpawn = bunRuntime.spawn;
+		bunRuntime.spawn = (() => {
+			throw new Error("synthetic spawn failure");
+		}) as typeof originalSpawn;
+		try {
+			expect(() => manager.resume(jobName)).toThrow("synthetic spawn failure");
+		} finally {
+			bunRuntime.spawn = originalSpawn;
+		}
+		expect(before?.launchToken).toBeNull();
+		expect(manager.store.getRun(jobName)).toEqual(before);
+		expect(manager.store.listTraces(jobName)).toEqual(traces);
+	});
+	it("restores a prior run and traces after resume log open failure", () => {
+		const jobsDir = makeJobsDir();
+		const jobName = "legacy-log-open-failure";
+		writeFixtureJob(jobsDir, jobName);
+		const resultPath = path.join(jobsDir, jobName, "result.json");
+		const result = JSON.parse(fs.readFileSync(resultPath, "utf8")) as Record<string, unknown>;
+		result.finished_at = "2026-07-12T12:00:00";
+		fs.writeFileSync(resultPath, JSON.stringify(result));
+		const dbPath = path.join(jobsDir, "_manager", "log-open-failure.sqlite");
+		const manager = new ManagerServer(jobsDir, dbPath);
+		cleanups.push(() => manager.store.close());
+		expect(manager.store.discover()).toBe(1);
+		const before = manager.store.getRun(jobName);
+		const traces = manager.store.listTraces(jobName);
+		const logPath = path.join(jobsDir, "_manager", "logs", `${jobName}.log`);
+		fs.mkdirSync(logPath, { recursive: true });
+		expect(() => manager.resume(jobName)).toThrow(/EISDIR|is a directory/);
+		expect(manager.store.getRun(jobName)).toEqual(before);
+		expect(manager.store.listTraces(jobName)).toEqual(traces);
+	});
+
+});
+
 describe("resolveArmLaunch", () => {
 	it("inherits dataset + exact task sample + scale from a sibling arm", () => {
 		const store = new RunStore(makeJobsDir());
@@ -680,6 +1050,13 @@ describe("experiment lifecycle gates", () => {
 		});
 		expect(maxArm.status).toBe(400);
 		expect((await maxArm.json()).error).toMatch(/maxArms/);
+
+		const blankClose = await fetch(`${boundedBase}/api/experiments/exp`, {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ closure: { verdict: " \t" } }),
+		});
+		expect(blankClose.status).toBe(400);
 
 		const closed = await fetch(`${boundedBase}/api/experiments/exp`, {
 			method: "PUT",
