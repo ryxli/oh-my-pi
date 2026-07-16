@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -163,6 +164,40 @@ describe("RunStore", () => {
 		expect(treat?.role).toBe("variant");
 		expect(treat?.note).toBe("prewalk flash v2");
 	});
+	it("persists experiment limits and closure across a fresh store", () => {
+		const jobsDir = makeJobsDir();
+		const dbPath = path.join(jobsDir, "experiment.sqlite");
+		const store = new RunStore(jobsDir, dbPath);
+		store.setExperimentGoal("legacy", "existing goal");
+		expect(store.getExperimentMeta("legacy")).toEqual({
+			id: "legacy",
+			goal: "existing goal",
+			updatedAt: expect.any(Number),
+			maxRuns: null,
+			maxArms: null,
+			closure: null,
+		});
+
+		store.setExperimentMeta("bounded", { goal: "measure it", maxRuns: 3, maxArms: 2 });
+		store.closeExperiment("bounded", "measured: treatment wins", 1_752_000_000_000);
+		expect(store.getExperimentMeta("bounded")?.closure).toEqual({
+			verdict: "measured: treatment wins",
+			closedAt: 1_752_000_000_000,
+		});
+		store.close();
+
+		const reopened = new RunStore(jobsDir, dbPath);
+		cleanups.push(() => reopened.close());
+		expect(reopened.getExperimentMeta("bounded")).toEqual({
+			id: "bounded",
+			goal: "measure it",
+			updatedAt: expect.any(Number),
+			maxRuns: 3,
+			maxArms: 2,
+			closure: { verdict: "measured: treatment wins", closedAt: 1_752_000_000_000 },
+		});
+	});
+
 
 	it("releases a dead runner's pid without failing a possibly-live orphan", () => {
 		const jobsDir = makeJobsDir();
@@ -199,6 +234,46 @@ describe("RunStore", () => {
 		const finished = store.getRun("job-b");
 		expect(finished?.status).toBe("complete");
 		expect(finished?.finishedAt).toBe(Date.parse("2026-07-12T11:00:00"));
+	});
+});
+
+describe("RunStore grouped launch admission", () => {
+	it("rejects duplicate reservations and counts other reservations toward limits", () => {
+		const jobsDir = makeJobsDir();
+		const dbPath = path.join(jobsDir, "experiment.sqlite");
+		const first = new RunStore(jobsDir, dbPath);
+		const second = new RunStore(jobsDir, dbPath);
+		cleanups.push(() => first.close(), () => second.close());
+
+		first.admitExperimentLaunch({ jobName: "exp-first", maxRuns: 1 });
+		expect(() => second.admitExperimentLaunch({ jobName: "exp-first" })).toThrow(/already reserved/);
+		expect(() => second.admitExperimentLaunch({ jobName: "exp-second" })).toThrow(/maxRuns limit reached/);
+	});
+
+	it("preserves non-null pre-registered limits on the initial launch", () => {
+		const jobsDir = makeJobsDir();
+		const store = new RunStore(jobsDir);
+		cleanups.push(() => store.close());
+
+		store.setExperimentMeta("exp", { goal: "compare arms", maxRuns: 3, maxArms: 2 });
+		store.admitExperimentLaunch({ jobName: "exp-first", maxRuns: 1, maxArms: 1 });
+
+		expect(store.getExperimentMeta("exp")).toMatchObject({ maxRuns: 3, maxArms: 2 });
+	});
+
+	it("cleans up an empty reserved job directory across restart", () => {
+		const jobsDir = makeJobsDir();
+		const dbPath = path.join(jobsDir, "experiment.sqlite");
+		const first = new RunStore(jobsDir, dbPath);
+		first.admitExperimentLaunch({ jobName: "exp-orphan", maxRuns: 1 });
+		fs.mkdirSync(path.join(jobsDir, "exp-orphan"));
+		first.close();
+
+		const restarted = new RunStore(jobsDir, dbPath);
+		cleanups.push(() => restarted.close());
+		expect(restarted.discover()).toBe(0);
+		expect(restarted.getRun("exp-orphan")).toBeNull();
+		expect(() => restarted.admitExperimentLaunch({ jobName: "exp-next" })).not.toThrow();
 	});
 });
 
@@ -549,3 +624,162 @@ describe("resolveArmLaunch", () => {
 		expect(() => resolveArmLaunch(store, "ghost", { arm: "x", model: "m/y" })).toThrow(/no runs to inherit/);
 	});
 });
+
+describe("experiment lifecycle gates", () => {
+	it("enforces limits and durable closure across fresh ManagerServer instances", async () => {
+		const jobsDir = makeJobsDir();
+		const dbPath = path.join(jobsDir, "_manager", "lifecycle.sqlite");
+		const first = new ManagerServer(jobsDir, dbPath);
+		first.store.registerLaunch({
+			benchmark: "harbor",
+			jobName: "exp-base",
+			dataset: "terminal-bench@2.0",
+			agent: "omp",
+			models: ["m/x"],
+			pid: process.pid,
+			config: { include: ["task-1"] },
+		});
+		first.store.markExit("exp-base", 0);
+		first.store.setExperimentMeta("exp", { goal: "measure", maxRuns: 5, maxArms: 1 });
+		const firstServer = first.start(0);
+		const firstBase = `http://localhost:${firstServer.port}`;
+
+		const lowerLimit = await fetch(`${firstBase}/api/runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ benchmark: "harbor", jobName: "exp-drive", model: "m/x", maxRuns: 1 }),
+		});
+		expect(lowerLimit.status).toBe(400);
+
+		const genericArm = await fetch(`${firstBase}/api/runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ benchmark: "harbor", jobName: "exp-extra", model: "m/x" }),
+		});
+		expect(genericArm.status).toBe(400);
+		expect((await genericArm.json()).error).toMatch(/maxArms/);
+
+		first.store.setExperimentMeta("exp", { maxRuns: 1, maxArms: null });
+		const maxRun = await fetch(`${firstBase}/api/runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ benchmark: "harbor", jobName: "exp-drive", model: "m/x" }),
+		});
+		expect(maxRun.status).toBe(400);
+		expect((await maxRun.json()).error).toMatch(/maxRuns/);
+		first.store.setExperimentMeta("exp", { maxRuns: 5, maxArms: 1 });
+		await first.stop();
+
+		const bounded = new ManagerServer(jobsDir, dbPath);
+		const boundedServer = bounded.start(0);
+		const boundedBase = `http://localhost:${boundedServer.port}`;
+		const maxArm = await fetch(`${boundedBase}/api/experiments/exp/arms`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ arm: "next", model: "m/y" }),
+		});
+		expect(maxArm.status).toBe(400);
+		expect((await maxArm.json()).error).toMatch(/maxArms/);
+
+		const closed = await fetch(`${boundedBase}/api/experiments/exp`, {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ closure: { verdict: "measured: baseline wins" } }),
+		});
+		expect(closed.status).toBe(200);
+		await bounded.stop();
+
+		const second = new ManagerServer(jobsDir, dbPath);
+		cleanups.push(() => {
+			void second.stop();
+		});
+		const server = second.start(0);
+		const base = `http://localhost:${server.port}`;
+		const detail = (await (await fetch(`${base}/api/experiments/exp`)).json()) as {
+			goal: string;
+			maxRuns: number | null;
+			maxArms: number | null;
+			closure: { verdict: string; closedAt: number } | null;
+		};
+		expect(detail).toMatchObject({
+			goal: "measure",
+			maxRuns: 5,
+			maxArms: 1,
+			closure: { verdict: "measured: baseline wins" },
+		});
+		const failedClose = await fetch(`${base}/api/experiments/exp`, {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ closure: { verdict: "second verdict" }, runs: { "exp-base": { note: "must not apply" } } }),
+		});
+		expect(failedClose.status).toBe(400);
+		const unchangedRun = (await (await fetch(`${base}/api/runs/exp-base`)).json()) as { run: { note: string } };
+		expect(unchangedRun.run.note).toBe("");
+		const runsOnly = await fetch(`${base}/api/experiments/exp`, {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ runs: { "exp-base": { note: "runs-only must not apply" } } }),
+		});
+		expect(runsOnly.status).toBe(400);
+		expect((await runsOnly.json()).error).toMatch(/closed/);
+		const stillUnchangedRun = (await (await fetch(`${base}/api/runs/exp-base`)).json()) as { run: { note: string } };
+		expect(stillUnchangedRun.run.note).toBe("");
+		for (const [url, body] of [
+			[`${base}/api/runs`, { benchmark: "harbor", jobName: "exp-late", model: "m/x" }],
+			[`${base}/api/experiments/exp/arms`, { arm: "late", model: "m/y" }],
+		] as const) {
+			const response = await fetch(url, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(body),
+			});
+			expect(response.status).toBe(400);
+			expect((await response.json()).error).toMatch(/closed/);
+		}
+		const resume = await fetch(`${base}/api/runs/exp-base/resume`, { method: "POST" });
+		expect(resume.status).toBe(400);
+		expect((await resume.json()).error).toMatch(/closed/);
+		const goal = await fetch(`${base}/api/experiments/exp`, {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ goal: "changed" }),
+		});
+		expect(goal.status).toBe(400);
+		expect((await goal.json()).error).toMatch(/closed/);
+	});
+	it("surfaces partial legacy closure in GET and rejects grouped launches", async () => {
+		const jobsDir = makeJobsDir();
+		const dbPath = path.join(jobsDir, "_manager", "partial-closure.sqlite");
+		const seed = new RunStore(jobsDir, dbPath);
+		seed.setExperimentMeta("partial", { goal: "legacy row" });
+		seed.close();
+		const legacyDb = new Database(dbPath);
+		legacyDb.query("UPDATE experiments SET closed_at = ? WHERE id = ?").run(1_752_000_000_001, "partial");
+		legacyDb.close();
+
+		const manager = new ManagerServer(jobsDir, dbPath);
+		cleanups.push(() => {
+			void manager.stop();
+		});
+		const server = manager.start(0);
+		const base = `http://localhost:${server.port}`;
+		const detail = (await (await fetch(`${base}/api/experiments/partial`)).json()) as {
+			closure: { verdict: string; closedAt: number } | null;
+			arms: unknown[];
+		};
+		expect(detail).toMatchObject({
+			closure: { verdict: "", closedAt: 1_752_000_000_001 },
+			arms: [],
+		});
+
+		const launch = await fetch(`${base}/api/runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ benchmark: "harbor", jobName: "partial-arm", model: "m/x" }),
+		});
+		expect(launch.status).toBe(400);
+		expect((await launch.json()).error).toMatch(/closed/);
+	});
+
+});
+
