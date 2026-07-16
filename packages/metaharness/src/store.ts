@@ -8,10 +8,12 @@
  */
 
 import { Database } from "bun:sqlite";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { readBenchmarkSnapshot } from "./benchmarks";
 import { readJobResult } from "./runner";
+import { canonicalArmOf } from "./experiments";
 
 export type RunStatus = "running" | "complete" | "failed" | "cancelled";
 
@@ -39,6 +41,8 @@ export interface RunRow {
 	label: string;
 	status: RunStatus;
 	pid: number | null;
+	/** Opaque token identifying the launch that owns this row. */
+	launchToken: string | null;
 	exitCode: number | null;
 	createdAt: number;
 	finishedAt: number | null;
@@ -120,6 +124,7 @@ CREATE TABLE IF NOT EXISTS runs (
 	config_json TEXT NOT NULL DEFAULT '{}',
 	status TEXT NOT NULL DEFAULT 'running',
 	pid INTEGER,
+	launch_token TEXT,
 	exit_code INTEGER,
 	created_at INTEGER NOT NULL,
 	finished_at INTEGER,
@@ -161,9 +166,12 @@ CREATE TABLE IF NOT EXISTS experiments (
 );
 CREATE TABLE IF NOT EXISTS experiment_launches (
 	job_name TEXT PRIMARY KEY,
+	reservation_token TEXT,
 	created_at INTEGER NOT NULL
 );
 `;
+/** Pre-spawn reservations older than this are eligible for startup cleanup. */
+const PRESPAWN_RESERVATION_STALE_MS = 30 * 60 * 1000;
 
 /** Directory names inside the jobs root that are not Harbor job dirs. */
 const NON_JOB_DIRS = new Set(["_bench", "_manager"]);
@@ -230,6 +238,17 @@ function addColumnIfMissing(db: Database, columns: Set<string>, name: string, sq
 export class RunStore {
 	#db: Database;
 	readonly jobsDir: string;
+	#expectedLaunchSnapshots = new Map<
+		string,
+		{
+			jobName: string;
+			status: RunStatus;
+			pid: number | null;
+			launchToken: string | null;
+			exitCode: number | null;
+			finishedAt: number | null;
+		}
+	>();
 
 	constructor(jobsDir: string, dbPath?: string) {
 		this.jobsDir = jobsDir;
@@ -248,6 +267,7 @@ export class RunStore {
 		addColumnIfMissing(this.#db, runColumns, "config_json", "ALTER TABLE runs ADD COLUMN config_json TEXT NOT NULL DEFAULT '{}'");
 		addColumnIfMissing(this.#db, runColumns, "score", "ALTER TABLE runs ADD COLUMN score REAL");
 		addColumnIfMissing(this.#db, runColumns, "metrics_json", "ALTER TABLE runs ADD COLUMN metrics_json TEXT NOT NULL DEFAULT '{}'");
+		addColumnIfMissing(this.#db, runColumns, "launch_token", "ALTER TABLE runs ADD COLUMN launch_token TEXT");
 		if (runColumns.has("slide") && !runColumns.has("prewalk")) {
 			this.#db.run("ALTER TABLE runs RENAME COLUMN slide TO prewalk");
 		}
@@ -269,23 +289,39 @@ export class RunStore {
 			"closure_verdict",
 			"ALTER TABLE experiments ADD COLUMN closure_verdict TEXT",
 		);
+		const launchColumns = new Set(
+			(this.#db.query("PRAGMA table_info(experiment_launches)").all() as Array<{ name: string }>).map(c => c.name),
+		);
+		addColumnIfMissing(
+			this.#db,
+			launchColumns,
+			"reservation_token",
+			"ALTER TABLE experiment_launches ADD COLUMN reservation_token TEXT",
+		);
+		const staleBefore = Date.now() - PRESPAWN_RESERVATION_STALE_MS;
 		addColumnIfMissing(this.#db, experimentColumns, "closed_at", "ALTER TABLE experiments ADD COLUMN closed_at INTEGER");
-		for (const row of this.#db.query("SELECT job_name FROM experiment_launches").all() as Array<{ job_name: string }>) {
+		for (const row of this.#db
+			.query("SELECT job_name, reservation_token, created_at FROM experiment_launches")
+			.all() as Array<{ job_name: string; reservation_token: string | null; created_at: number }>) {
 			const jobDir = path.join(this.jobsDir, row.job_name);
-			let missingOrEmpty = !fs.existsSync(jobDir);
-			if (!missingOrEmpty) {
-				try {
-					missingOrEmpty = fs.statSync(jobDir).isDirectory() && fs.readdirSync(jobDir).length === 0;
-				} catch {
-					missingOrEmpty = false;
-				}
+			try {
+				if (fs.readdirSync(jobDir).length > 0) continue;
+			} catch (err) {
+				if ((err as NodeJS.ErrnoException).code !== "ENOENT") continue;
 			}
-			if (
-				this.#db.query("SELECT 1 FROM runs WHERE job_name = ?").get(row.job_name) == null &&
-				missingOrEmpty
-			) {
-				this.#db.query("DELETE FROM experiment_launches WHERE job_name = ?").run(row.job_name);
-			}
+			const query =
+				row.reservation_token === null
+					? `DELETE FROM experiment_launches
+						 WHERE job_name = ? AND reservation_token IS NULL AND created_at < ?
+						   AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.job_name = experiment_launches.job_name)`
+					: `DELETE FROM experiment_launches
+						 WHERE job_name = ? AND reservation_token = ? AND created_at < ?
+						   AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.job_name = experiment_launches.job_name)`;
+			const args =
+				row.reservation_token === null
+					? [row.job_name, staleBefore]
+					: [row.job_name, row.reservation_token, staleBefore];
+			this.#db.query(query).run(...args);
 		}
 	}
 
@@ -294,17 +330,86 @@ export class RunStore {
 	}
 
 	/** Register a run this manager just launched (pid-owning). */
-	registerLaunch(launch: LaunchRecord): void {
+	registerLaunch(launch: LaunchRecord): string {
+		const launchToken = this.reserveLaunch(launch);
+		if (!this.bindLaunchPid(launch.jobName, launchToken, launch.pid)) {
+			throw new Error(`launch ${launch.jobName} reservation disappeared`);
+		}
+		fs.writeFileSync(
+			path.join(this.jobsDir, launch.jobName, "manager.json"),
+			JSON.stringify(launch, null, 2),
+		);
+		return launchToken;
+	}
+
+	/** Promote an optional token-owned grouped admission into a pid-null launch row. */
+	reserveLaunch(
+		launch: Omit<LaunchRecord, "pid">,
+		admissionToken?: string,
+		expectedLaunchToken?: string | null,
+	): string {
+		const launchToken = admissionToken ?? crypto.randomUUID();
+		let promoted = false;
 		const tx = this.#db.transaction(() => {
-			this.#db.query("DELETE FROM trials WHERE job_name = ?").run(launch.jobName);
-			this.#db.query("DELETE FROM experiment_launches WHERE job_name = ?").run(launch.jobName);
+			const experimentId = experimentIdOf(launch.jobName);
+			const existingRun = this.#db
+				.query("SELECT status, launch_token, pid, exit_code, finished_at FROM runs WHERE job_name = ?")
+				.get(launch.jobName) as {
+				status: RunStatus;
+				launch_token: string | null;
+				pid: number | null;
+				exit_code: number | null;
+				finished_at: number | null;
+			} | null;
+			if (expectedLaunchToken !== undefined) {
+				const matches =
+					existingRun !== null &&
+					(expectedLaunchToken === null
+						? existingRun.launch_token === null
+						: existingRun.launch_token === expectedLaunchToken);
+				if (!matches) throw new Error(`launch ${launch.jobName} token changed`);
+			}
+			if (expectedLaunchToken !== undefined && existingRun !== null) {
+				this.#expectedLaunchSnapshots.set(launchToken, {
+					jobName: launch.jobName,
+					status: existingRun.status,
+					launchToken: existingRun.launch_token,
+					pid: existingRun.pid,
+					exitCode: existingRun.exit_code,
+					finishedAt: existingRun.finished_at,
+				});
+			}
+			if (admissionToken !== undefined && existingRun !== null) {
+				throw new Error(`run ${launch.jobName} already exists`);
+			}
+			const admissionReservation = this.#db
+				.query("SELECT reservation_token FROM experiment_launches WHERE job_name = ?")
+				.get(launch.jobName) as { reservation_token: string | null } | null;
+			const closure = this.#db
+				.query("SELECT closure_verdict, closed_at FROM experiments WHERE id = ?")
+				.get(experimentId) as { closure_verdict: string | null; closed_at: number | null } | null;
+			if (
+				(closure?.closure_verdict != null || closure?.closed_at != null) &&
+				(admissionToken === undefined || admissionReservation?.reservation_token !== admissionToken)
+			) {
+				throw new Error(`experiment ${experimentId} is closed`);
+			}
+			if (admissionToken === undefined) {
+				if (admissionReservation !== null) throw new Error(`launch ${launch.jobName} is already reserved`);
+			} else {
+				const claimed = this.#db
+					.query("DELETE FROM experiment_launches WHERE job_name = ? AND reservation_token = ?")
+					.run(launch.jobName, admissionToken);
+				if (claimed.changes === 0) throw new Error(`launch ${launch.jobName} reservation disappeared`);
+			}
+			if (expectedLaunchToken === undefined) this.#db.query("DELETE FROM trials WHERE job_name = ?").run(launch.jobName);
 			this.#db
 				.query(
 					`INSERT INTO runs
-					 (job_name, benchmark, dataset, agent, models, prewalk, role, note, config_json, status, pid, created_at)
-					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)
+					 (job_name, benchmark, dataset, agent, models, prewalk, role, note, config_json, status, pid, launch_token, created_at)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', NULL, ?, ?)
 					 ON CONFLICT(job_name) DO UPDATE SET
-						benchmark = excluded.benchmark, pid = excluded.pid, status = 'running',
+						benchmark = excluded.benchmark, pid = NULL, launch_token = excluded.launch_token, status = 'running',
 						config_json = excluded.config_json,
 						role = CASE WHEN excluded.role != '' THEN excluded.role ELSE runs.role END,
 						note = CASE WHEN excluded.note != '' THEN excluded.note ELSE runs.note END`,
@@ -319,14 +424,105 @@ export class RunStore {
 					launch.role ?? "",
 					launch.note ?? "",
 					JSON.stringify(launch.config ?? {}),
-					launch.pid,
+					launchToken,
 					Date.now(),
 				);
 		});
-		tx();
-		const jobDir = path.join(this.jobsDir, launch.jobName);
-		fs.mkdirSync(jobDir, { recursive: true });
-		fs.writeFileSync(path.join(jobDir, "manager.json"), JSON.stringify(launch, null, 2));
+		try {
+			tx();
+			promoted = admissionToken !== undefined;
+			const jobDir = path.join(this.jobsDir, launch.jobName);
+			fs.mkdirSync(jobDir, { recursive: true });
+			fs.writeFileSync(path.join(jobDir, "manager.json"), JSON.stringify(launch, null, 2));
+			return launchToken;
+		} catch (err) {
+			if (promoted && admissionToken !== undefined) {
+				this.#db.transaction(() => {
+					this.#db
+						.query(
+							"DELETE FROM runs WHERE job_name = ? AND launch_token = ? AND status = 'running' AND pid IS NULL",
+						)
+						.run(launch.jobName, admissionToken);
+					this.#db
+						.query(
+							`INSERT INTO experiment_launches (job_name, reservation_token, created_at)
+							 SELECT ?, ?, ?
+							 WHERE NOT EXISTS (SELECT 1 FROM runs WHERE job_name = ?)
+							 ON CONFLICT(job_name) DO NOTHING`,
+						)
+						.run(launch.jobName, admissionToken, Date.now(), launch.jobName);
+				})();
+			} else if (expectedLaunchToken !== undefined) {
+				if (!this.restoreExpectedLaunch(launch.jobName, launchToken)) {
+					this.discardExpectedLaunchSnapshot(launchToken);
+				}
+			}
+			throw err;
+		}
+	}
+
+	/**
+	 * Roll back a grouped launch after reservation promotion but before pid binding.
+	 * The launch row and restored admission are both guarded by the owner's token.
+	 */
+	rollbackLaunch(jobName: string, launchToken: string, admissionToken: string): boolean {
+		if (launchToken !== admissionToken) return false;
+		return this.#db.transaction(() => {
+			const deleted = this.#db
+				.query(
+					"DELETE FROM runs WHERE job_name = ? AND launch_token = ? AND status = 'running' AND pid IS NULL",
+				)
+				.run(jobName, launchToken);
+			if (deleted.changes === 0) {
+				const replacementRun = this.#db.query("SELECT 1 FROM runs WHERE job_name = ?").get(jobName);
+				const replacementReservation = this.#db
+					.query("SELECT 1 FROM experiment_launches WHERE job_name = ?")
+					.get(jobName);
+				if (replacementRun != null || replacementReservation != null) return false;
+				this.#db
+					.query(
+						"INSERT INTO experiment_launches (job_name, reservation_token, created_at) VALUES (?, ?, ?)",
+					)
+					.run(jobName, admissionToken, Date.now());
+				return true;
+			}
+			this.#db.query("DELETE FROM trials WHERE job_name = ?").run(jobName);
+			this.#db
+				.query(
+					`INSERT INTO experiment_launches (job_name, reservation_token, created_at)
+					 VALUES (?, ?, ?)
+					 ON CONFLICT(job_name) DO NOTHING`,
+				)
+				.run(jobName, admissionToken, Date.now());
+			return true;
+
+		})();
+	}
+	/** Restore a resume row after a pre-bind spawn failure. */
+	restoreExpectedLaunch(jobName: string, launchToken: string): boolean {
+		const snapshot = this.#expectedLaunchSnapshots.get(launchToken);
+		if (!snapshot || snapshot.jobName !== jobName) return false;
+		const result = this.#db
+			.query(
+				"UPDATE runs SET status = ?, pid = ?, launch_token = ?, exit_code = ?, finished_at = ? WHERE job_name = ? AND launch_token = ?",
+			)
+			.run(snapshot.status, snapshot.pid, snapshot.launchToken, snapshot.exitCode, snapshot.finishedAt, jobName, launchToken);
+		this.#expectedLaunchSnapshots.delete(launchToken);
+		return result.changes > 0;
+	}
+
+
+	/** Drop a resume snapshot once its launch attempt is no longer recoverable. */
+	discardExpectedLaunchSnapshot(launchToken: string): void {
+		this.#expectedLaunchSnapshots.delete(launchToken);
+	}
+
+	/** Bind a spawned process to its still-current launch reservation. */
+	bindLaunchPid(jobName: string, launchToken: string, pid: number): boolean {
+		const result = this.#db
+			.query("UPDATE runs SET pid = ? WHERE job_name = ? AND launch_token = ? AND status = 'running'")
+			.run(pid, jobName, launchToken);
+		return result.changes > 0;
 	}
 
 	/** Upsert experiment metadata while preserving omitted fields. */
@@ -336,10 +532,11 @@ export class RunStore {
 		goal?: string;
 		maxRuns?: number | null;
 		maxArms?: number | null;
-	}): void {
+	}): string {
 		if (!admission.jobName) throw new Error("jobName must be non-empty");
 		validateExperimentLimit("maxRuns", admission.maxRuns);
 		validateExperimentLimit("maxArms", admission.maxArms);
+		const reservationToken = crypto.randomUUID();
 		const id = experimentIdOf(admission.jobName);
 		const tx = this.#db.transaction(() => {
 			const existing = this.#db.query(
@@ -354,6 +551,8 @@ export class RunStore {
 			if (existing && (existing.closure_verdict != null || existing.closed_at != null)) {
 				throw new Error("experiment is closed");
 			}
+			const hasRun = this.#db.query("SELECT 1 FROM runs WHERE job_name = ?").get(admission.jobName) != null;
+			if (hasRun) throw new Error(`run ${admission.jobName} already exists`);
 			validateExperimentLimit("maxRuns", existing?.max_runs);
 			validateExperimentLimit("maxArms", existing?.max_arms);
 			const hasReservation =
@@ -366,7 +565,11 @@ export class RunStore {
 			const runCount = runNames.filter(r => experimentIdOf(r.job_name) === id).length;
 			const reservationCount = reservationNames.filter(r => experimentIdOf(r.job_name) === id).length;
 			const groupedCount = runCount + reservationCount;
-			const occupiedCount = groupedCount;
+			const occupiedArms = new Set(
+				[...runNames, ...reservationNames]
+					.filter(name => experimentIdOf(name.job_name) === id)
+					.map(name => canonicalArmOf(name.job_name)),
+			);
 			const maxRuns =
 				existing?.max_runs != null
 					? existing.max_runs
@@ -381,8 +584,10 @@ export class RunStore {
 			if (groupedCount > 0 && admission.maxArms != null && admission.maxArms !== (existing?.max_arms ?? null)) {
 				throw new Error("maxArms cannot change after grouped launches exist");
 			}
-			if (maxArms !== null && occupiedCount >= maxArms) throw new Error("maxArms limit reached");
-			if (maxRuns !== null && occupiedCount >= maxRuns) throw new Error("maxRuns limit reached");
+			if (maxArms !== null && !occupiedArms.has(canonicalArmOf(admission.jobName)) && occupiedArms.size >= maxArms) {
+				throw new Error("maxArms limit reached");
+			}
+			if (maxRuns !== null && groupedCount >= maxRuns) throw new Error("maxRuns limit reached");
 			const goal = admission.goal ?? existing?.goal ?? "";
 			this.#db
 				.query(
@@ -397,15 +602,33 @@ export class RunStore {
 				)
 				.run(id, goal, Date.now(), maxRuns, maxArms);
 			this.#db
-				.query("INSERT INTO experiment_launches (job_name, created_at) VALUES (?, ?) ON CONFLICT(job_name) DO NOTHING")
-				.run(admission.jobName, Date.now());
+				.query(
+					"INSERT INTO experiment_launches (job_name, reservation_token, created_at) VALUES (?, ?, ?) ON CONFLICT(job_name) DO NOTHING",
+				)
+				.run(admission.jobName, reservationToken, Date.now());
 		});
 		tx();
+		return reservationToken;
 	}
 
 	/** Release a pre-spawn launch reservation. */
-	releaseExperimentLaunch(jobName: string): void {
-		this.#db.query("DELETE FROM experiment_launches WHERE job_name = ?").run(jobName);
+	releaseExperimentLaunch(jobName: string, reservationToken?: string): boolean {
+		const result =
+			reservationToken === undefined
+				? this.#db.query("DELETE FROM experiment_launches WHERE job_name = ?").run(jobName)
+				: this.#db
+						.query("DELETE FROM experiment_launches WHERE job_name = ? AND reservation_token = ?")
+						.run(jobName, reservationToken);
+		return result.changes > 0;
+	}
+
+	/** Check whether a reservation is still owned by the supplied token. */
+	hasExperimentLaunch(jobName: string, reservationToken: string): boolean {
+		return (
+			this.#db
+				.query("SELECT 1 FROM experiment_launches WHERE job_name = ? AND reservation_token = ?")
+				.get(jobName, reservationToken) != null
+		);
 	}
 
 	setExperimentMeta(id: string, update: ExperimentMetaUpdate): void {
@@ -449,7 +672,7 @@ export class RunStore {
 	}
 
 	/** Persist a non-empty measured verdict and close an experiment. */
-	closeExperiment(id: string, verdict: string, closedAt = Date.now()): void {
+	closeExperiment(id: string, verdict: string, closedAt = Date.now()): boolean {
 		const measuredVerdict = validateExperimentVerdict(verdict);
 		if (!Number.isSafeInteger(closedAt) || closedAt < 0) {
 			throw new Error("closedAt must be a non-negative safe integer");
@@ -464,9 +687,11 @@ export class RunStore {
 				closure_verdict: string | null;
 				closed_at: number | null;
 			} | null;
-			if (existing && (existing.closure_verdict != null || existing.closed_at != null)) {
-				throw new Error("experiment is already closed");
-			}
+			if (existing && (existing.closure_verdict != null || existing.closed_at != null)) return false;
+			const liveRuns = this.#db.query("SELECT job_name FROM runs WHERE status = 'running' AND pid IS NOT NULL").all() as Array<{
+				job_name: string;
+			}>;
+			if (liveRuns.some(run => experimentIdOf(run.job_name) === id)) return false;
 			const result = this.#db
 				.query(
 					`INSERT INTO experiments
@@ -487,9 +712,9 @@ export class RunStore {
 					measuredVerdict,
 					closedAt,
 				);
-			if (result.changes === 0) throw new Error("experiment is already closed");
+			return result.changes > 0;
 		});
-		tx();
+		return tx();
 	}
 
 	/** Stored experiment metadata, or null when the id was never registered. */
@@ -548,11 +773,31 @@ export class RunStore {
 	}
 
 	/** Mark a launched run's terminal state (called when its child process exits). */
-	markExit(jobName: string, exitCode: number | null, cancelled = false): void {
+	markExit(jobName: string, exitCode: number | null, cancelled = false, launchToken?: string | null): boolean {
 		const status: RunStatus = cancelled ? "cancelled" : exitCode === 0 ? "complete" : "failed";
-		this.#db
-			.query("UPDATE runs SET status = ?, exit_code = ?, finished_at = ?, pid = NULL WHERE job_name = ?")
-			.run(status, exitCode, Date.now(), jobName);
+		if (launchToken === undefined) {
+			return (
+				this.#db
+					.query("UPDATE runs SET status = ?, exit_code = ?, finished_at = ?, pid = NULL WHERE job_name = ?")
+					.run(status, exitCode, Date.now(), jobName).changes > 0
+			);
+		}
+		if (launchToken === null) {
+			return (
+				this.#db
+					.query(
+						"UPDATE runs SET status = ?, exit_code = ?, finished_at = ?, pid = NULL WHERE job_name = ? AND launch_token IS NULL",
+					)
+					.run(status, exitCode, Date.now(), jobName).changes > 0
+			);
+		}
+		return (
+			this.#db
+				.query(
+					"UPDATE runs SET status = ?, exit_code = ?, finished_at = ?, pid = NULL WHERE job_name = ? AND launch_token = ?",
+				)
+				.run(status, exitCode, Date.now(), jobName, launchToken).changes > 0
+		);
 	}
 
 	/**
@@ -566,35 +811,57 @@ export class RunStore {
 		} catch {
 			return 0;
 		}
-		const known = new Set(
-			(this.#db.query("SELECT job_name FROM runs").all() as Array<{ job_name: string }>).map(r => r.job_name),
-		);
 		let added = 0;
 		for (const e of entries) {
-			if (!e.isDirectory() || NON_JOB_DIRS.has(e.name) || known.has(e.name)) continue;
+			if (!e.isDirectory() || NON_JOB_DIRS.has(e.name)) continue;
+			const hasReservation = () =>
+				this.#db.query("SELECT 1 FROM experiment_launches WHERE job_name = ?").get(e.name) !== null;
+			if (hasReservation()) continue;
 			const jobDir = path.join(this.jobsDir, e.name);
-			if (fs.readdirSync(jobDir).length === 0) continue;
-			const meta = readHarborConfig(jobDir);
+			let isEmpty: boolean;
+			try {
+				isEmpty = fs.readdirSync(jobDir).length === 0;
+			} catch (err) {
+				if (hasReservation()) continue;
+				throw err;
+			}
+			if (isEmpty) continue;
+			let meta: { dataset: string; agent: string; models: string };
+			try {
+				meta = readHarborConfig(jobDir);
+			} catch (err) {
+				if (hasReservation()) continue;
+				throw err;
+			}
 			const createdAt = dirCreatedAt(jobDir);
-			this.#db
+			const result = this.#db
 				.query(
 					`INSERT INTO runs (job_name, dataset, agent, models, status, created_at)
-					 VALUES (?, ?, ?, ?, 'running', ?)`,
+					 SELECT ?, ?, ?, ?, 'running', ?
+					 WHERE NOT EXISTS (SELECT 1 FROM runs WHERE job_name = ?)
+					   AND NOT EXISTS (SELECT 1 FROM experiment_launches WHERE job_name = ?)
+					 ON CONFLICT(job_name) DO NOTHING`,
 				)
-				.run(e.name, meta.dataset, meta.agent, meta.models, createdAt);
-			this.#db.query("DELETE FROM experiment_launches WHERE job_name = ?").run(e.name);
-			this.syncRun(e.name);
+				.run(e.name, meta.dataset, meta.agent, meta.models, createdAt, e.name, e.name);
+			if (result.changes === 0) continue;
+			const insertedRun = this.getRun(e.name);
+			this.syncRun(e.name, insertedRun?.launchToken ?? null);
 			added++;
 		}
 		return added;
 	}
 
-	/** Re-read a job dir from disk and mirror trial + rollup state into the DB. */
-	syncRun(jobName: string): RunRow | null {
-		const jobDir = path.join(this.jobsDir, jobName);
-		if (!fs.existsSync(jobDir)) return this.getRun(jobName);
+	/** Re-read a job dir and mirror trial + rollup state into the DB. */
+	syncRun(jobName: string, launchToken?: string | null): RunRow | null {
 		const row = this.getRun(jobName);
-		if (!row) return null;
+		if (launchToken !== undefined) {
+			const matches = launchToken === null ? row?.launchToken === null : row?.launchToken === launchToken;
+			if (!row || !matches) return row;
+		} else if (!row) {
+			return null;
+		}
+		const jobDir = path.join(this.jobsDir, jobName);
+		if (!fs.existsSync(jobDir)) return row;
 		const snapshot = readBenchmarkSnapshot(row.benchmark, jobDir);
 		const now = Date.now();
 		const upsert = this.#db.query(
@@ -607,6 +874,12 @@ export class RunStore {
 				trace_path = excluded.trace_path, updated_at = excluded.updated_at`,
 		);
 		const tx = this.#db.transaction(() => {
+			if (launchToken !== undefined) {
+				const current = this.#db
+					.query("SELECT launch_token FROM runs WHERE job_name = ?")
+					.get(jobName) as { launch_token: string | null } | null;
+				if (current?.launch_token !== launchToken) return false;
+			}
 			// Prune rows whose trial dirs vanished from disk (a resume deletes
 			// interrupted trial dirs and re-runs the task under a fresh suffix) —
 			// otherwise phantom `running` rows haunt the dashboard forever.
@@ -630,27 +903,74 @@ export class RunStore {
 					now,
 				);
 			}
-			this.#db
-				.query(
-					`UPDATE runs SET n_total = ?, done = ?, pass = ?, fail = ?, error = ?, running = ?,
-					 cost_usd = ?, tok_in = ?, tok_out = ?, tok_cache = ?, score = ?, metrics_json = ?
-					 WHERE job_name = ?`,
-				)
-				.run(
-					snapshot.total,
-					snapshot.done,
-					snapshot.pass,
-					snapshot.fail,
-					snapshot.error,
-					snapshot.running,
-					snapshot.costUsd,
-					snapshot.tokIn,
-					snapshot.tokOut,
-					snapshot.tokCache,
-					snapshot.score,
-					JSON.stringify(snapshot.metrics),
-					jobName,
-				);
+			if (launchToken === undefined) {
+				this.#db
+					.query(
+						`UPDATE runs SET n_total = ?, done = ?, pass = ?, fail = ?, error = ?, running = ?,
+						 cost_usd = ?, tok_in = ?, tok_out = ?, tok_cache = ?, score = ?, metrics_json = ?
+						 WHERE job_name = ?`,
+					)
+					.run(
+						snapshot.total,
+						snapshot.done,
+						snapshot.pass,
+						snapshot.fail,
+						snapshot.error,
+						snapshot.running,
+						snapshot.costUsd,
+						snapshot.tokIn,
+						snapshot.tokOut,
+						snapshot.tokCache,
+						snapshot.score,
+						JSON.stringify(snapshot.metrics),
+						jobName,
+					);
+			} else if (launchToken === null) {
+				this.#db
+					.query(
+						`UPDATE runs SET n_total = ?, done = ?, pass = ?, fail = ?, error = ?, running = ?,
+						 cost_usd = ?, tok_in = ?, tok_out = ?, tok_cache = ?, score = ?, metrics_json = ?
+						 WHERE job_name = ? AND launch_token IS NULL`,
+					)
+					.run(
+						snapshot.total,
+						snapshot.done,
+						snapshot.pass,
+						snapshot.fail,
+						snapshot.error,
+						snapshot.running,
+						snapshot.costUsd,
+						snapshot.tokIn,
+						snapshot.tokOut,
+						snapshot.tokCache,
+						snapshot.score,
+						JSON.stringify(snapshot.metrics),
+						jobName,
+					);
+			} else {
+				this.#db
+					.query(
+						`UPDATE runs SET n_total = ?, done = ?, pass = ?, fail = ?, error = ?, running = ?,
+						 cost_usd = ?, tok_in = ?, tok_out = ?, tok_cache = ?, score = ?, metrics_json = ?
+						 WHERE job_name = ? AND launch_token = ?`,
+					)
+					.run(
+						snapshot.total,
+						snapshot.done,
+						snapshot.pass,
+						snapshot.fail,
+						snapshot.error,
+						snapshot.running,
+						snapshot.costUsd,
+						snapshot.tokIn,
+						snapshot.tokOut,
+						snapshot.tokCache,
+						snapshot.score,
+						JSON.stringify(snapshot.metrics),
+						jobName,
+						launchToken,
+					);
+			}
 			// Runs with no owning process (historical dirs, or a runner that died
 			// with a previous manager). Infer terminal state from result metadata
 			// or directory freshness — an orphaned harbor child may still be
@@ -669,32 +989,50 @@ export class RunStore {
 					finishedAt = jobDirMtime(jobDir);
 				}
 				if (status !== row.status) {
-					this.#db
-						.query("UPDATE runs SET status = ?, finished_at = ? WHERE job_name = ?")
-						.run(status, finishedAt, jobName);
+					if (launchToken === undefined) {
+						this.#db
+							.query("UPDATE runs SET status = ?, finished_at = ? WHERE job_name = ?")
+							.run(status, finishedAt, jobName);
+					} else if (launchToken === null) {
+						this.#db
+							.query("UPDATE runs SET status = ?, finished_at = ? WHERE job_name = ? AND launch_token IS NULL")
+							.run(status, finishedAt, jobName);
+					} else {
+						this.#db
+							.query("UPDATE runs SET status = ?, finished_at = ? WHERE job_name = ? AND launch_token = ?")
+							.run(status, finishedAt, jobName, launchToken);
+					}
 				}
 			}
+			return true;
 		});
-		tx();
+		if (!tx()) return this.getRun(jobName);
 		return this.getRun(jobName);
 	}
 
 	/** Sync every run currently marked running; returns the refreshed rows. */
 	syncActive(): RunRow[] {
-		const active = this.#db.query("SELECT job_name FROM runs WHERE status = 'running'").all() as Array<{
+		const active = this.#db.query("SELECT job_name, launch_token, pid FROM runs WHERE status = 'running'").all() as Array<{
 			job_name: string;
+			launch_token: string | null;
+			pid: number | null;
 		}>;
 		const out: RunRow[] = [];
-		for (const { job_name } of active) {
+		for (const { job_name, launch_token, pid } of active) {
 			// A pid-owning run whose runner died without markExit (manager
 			// restart) loses its pid here; syncRun's disk inference then decides
 			// the real status — the workload may have completed, or may still be
 			// running as an orphan.
-			const row = this.getRun(job_name);
-			if (row?.pid != null && !processAlive(row.pid)) {
-				this.#db.query("UPDATE runs SET pid = NULL WHERE job_name = ?").run(job_name);
+			if (pid != null && !processAlive(pid)) {
+				if (launch_token === null) {
+					this.#db.query("UPDATE runs SET pid = NULL WHERE job_name = ? AND launch_token IS NULL").run(job_name);
+				} else {
+					this.#db
+						.query("UPDATE runs SET pid = NULL WHERE job_name = ? AND launch_token = ?")
+						.run(job_name, launch_token);
+				}
 			}
-			const synced = this.syncRun(job_name);
+			const synced = this.syncRun(job_name, launch_token);
 			if (synced) out.push(synced);
 		}
 		return out;
@@ -706,8 +1044,11 @@ export class RunStore {
 	 * the periodic ticker only revisits rows already marked running.
 	 */
 	syncAll(): void {
-		const rows = this.#db.query("SELECT job_name FROM runs").all() as Array<{ job_name: string }>;
-		for (const { job_name } of rows) this.syncRun(job_name);
+		const rows = this.#db.query("SELECT job_name, launch_token FROM runs").all() as Array<{
+			job_name: string;
+			launch_token: string | null;
+		}>;
+		for (const { job_name, launch_token } of rows) this.syncRun(job_name, launch_token);
 	}
 
 	getRun(jobName: string): RunRow | null {
@@ -765,7 +1106,7 @@ function rowToExperimentMeta(r: {
 
 function rowToRun(r: Record<string, unknown>): RunRow {
 	return {
-		benchmark: String(r.benchmark ?? "harbor") as BenchmarkKind,
+		benchmark: String(r.benchmark) as BenchmarkKind,
 		jobName: String(r.job_name),
 		dataset: String(r.dataset),
 		agent: String(r.agent),
@@ -777,6 +1118,7 @@ function rowToRun(r: Record<string, unknown>): RunRow {
 		label: String(r.label ?? ""),
 		status: String(r.status) as RunStatus,
 		pid: r.pid === null ? null : Number(r.pid),
+		launchToken: r.launch_token === null ? null : String(r.launch_token),
 		exitCode: r.exit_code === null ? null : Number(r.exit_code),
 		createdAt: Number(r.created_at),
 		finishedAt: r.finished_at === null ? null : Number(r.finished_at),
