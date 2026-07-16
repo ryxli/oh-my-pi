@@ -32,7 +32,9 @@ export const localBackend: MemoryBackend = {
 		enqueueMemoryConsolidation(agentDir, cwd);
 	},
 	async save(context, input) {
-		return saveLearnedLesson(context.agentDir, context.cwd, input);
+		const result = await saveLearnedLesson(context.agentDir, context.cwd, input);
+		if (result.stored > 0) enqueueMemoryConsolidation(context.agentDir, context.cwd);
+		return result;
 	},
 	async status() {
 		return {
