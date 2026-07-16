@@ -119,6 +119,10 @@ describe("reportLocalOnlyPromptResult", () => {
 				onError: () => {},
 				emit: async () => {},
 			},
+			getAsyncJobControl: () => ({
+				inspect: () => null,
+				cancel: () => ({ cancelled: false, reason: "not-found" }),
+			}),
 			sendCustomMessage: async (_message: unknown, options?: { triggerTurn?: boolean }) => {
 				sentOptions = options;
 			},
@@ -163,6 +167,10 @@ describe("reportLocalOnlyPromptResult", () => {
 				onError: () => {},
 				emit: async () => {},
 			},
+			getAsyncJobControl: () => ({
+				inspect: () => null,
+				cancel: () => ({ cancelled: false, reason: "not-found" }),
+			}),
 			sendUserMessage: async (content: unknown) => {
 				sentContent = content;
 			},
@@ -215,6 +223,10 @@ describe("reportLocalOnlyPromptResult", () => {
 				onError: () => {},
 				emit: async () => {},
 			},
+			getAsyncJobControl: () => ({
+				inspect: () => null,
+				cancel: () => ({ cancelled: false, reason: "not-found" }),
+			}),
 			sendUserMessage: async () => {
 				throw thrown;
 			},

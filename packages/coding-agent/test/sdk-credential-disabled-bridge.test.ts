@@ -72,6 +72,7 @@ const initializeRunnerForTest = (runner: ExtensionRunner | undefined): void => {
 			getContextUsage: () => undefined,
 			compact: async () => {},
 			getSystemPrompt: () => [],
+			asyncJobs: { inspect: () => null, cancel: () => ({ cancelled: false, reason: "not-found" }) },
 		},
 	);
 };
@@ -539,6 +540,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 					getContextUsage: () => undefined,
 					compact: async () => {},
 					getSystemPrompt: () => [],
+					asyncJobs: { inspect: () => null, cancel: () => ({ cancelled: false, reason: "not-found" }) },
 				},
 				undefined,
 				undefined,

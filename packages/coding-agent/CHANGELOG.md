@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added an owner-scoped async-job control capability to the extension API (`ctx.asyncJobs`). An extension can now inspect one of its own parent session's detached async jobs (immutable public snapshot: `id`, `type`, `status`, `startTime`, `agentId`) and atomically cancel exactly that job. Cancellation returns a definitive result, refuses jobs owned by another session (indistinguishable from missing) and jobs that are not running, and preserves the manager's abort + late-delivery-suppression semantics. The capability is wired identically through every extension initialization surface (print/RPC, interactive UI, ACP, and eval-spawned subagents) via a single `AgentSession.getAsyncJobControl()` seam.
+
 ## [16.3.15] - 2026-07-09
 
 ### Changed
