@@ -35,8 +35,12 @@ describe("issue #1020 - ctx.shutdown() in interactive mode", () => {
 			shutdownRequested: false,
 			session: {
 				extensionRunner: fakeExtensionRunner,
-				// other session fields are only touched lazily by other actions; we
-				// only invoke `shutdown`, so leave them out.
+				// `asyncJobs` is wired eagerly during init; the rest of the session
+				// fields are only touched lazily by other actions we don't invoke.
+				getAsyncJobControl: () => ({
+					inspect: () => null,
+					cancel: () => ({ cancelled: false, reason: "not-found" }),
+				}),
 			},
 		} as unknown as InteractiveModeContext;
 
@@ -71,6 +75,10 @@ describe("issue #1020 - ctx.shutdown() in interactive mode", () => {
 			shutdownRequested: false,
 			session: {
 				extensionRunner: fakeExtensionRunner,
+				getAsyncJobControl: () => ({
+					inspect: () => null,
+					cancel: () => ({ cancelled: false, reason: "not-found" }),
+				}),
 			},
 			setToolUIContext: () => {},
 			editor: {

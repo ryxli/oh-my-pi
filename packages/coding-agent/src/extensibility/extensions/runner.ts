@@ -25,6 +25,7 @@ import type {
 	ContextUsage,
 	Extension,
 	ExtensionActions,
+	ExtensionAsyncJobControl,
 	ExtensionCommandContext,
 	ExtensionCommandContextActions,
 	ExtensionContext,
@@ -236,6 +237,15 @@ export class ExtensionRunner {
 	#switchSessionHandler: SwitchSessionHandler = async () => ({ cancelled: false });
 	#reloadHandler: () => Promise<void> = async () => {};
 	#shutdownHandler: ShutdownHandler = () => {};
+	/**
+	 * Owner-scoped async-job control installed by {@link initialize}. The default
+	 * is inert: it reports every job as unknown so an uninitialized runtime never
+	 * touches another session's jobs.
+	 */
+	#asyncJobControl: ExtensionAsyncJobControl = {
+		inspect: () => null,
+		cancel: () => ({ cancelled: false, reason: "not-found" }),
+	};
 	#getMemoryFn?: () => MemoryRuntimeContext | undefined;
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
 	#initialized = false;
@@ -288,6 +298,7 @@ export class ExtensionRunner {
 		this.#hasPendingMessagesFn = contextActions.hasPendingMessages;
 		this.#shutdownHandler = contextActions.shutdown;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
+		this.#asyncJobControl = contextActions.asyncJobs;
 
 		// Command context actions (optional, only for interactive mode)
 		if (commandContextActions) {
@@ -539,6 +550,7 @@ export class ExtensionRunner {
 			shutdown: () => this.#shutdownHandler(),
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			memory: this.#getMemoryFn?.(),
+			asyncJobs: this.#asyncJobControl,
 		};
 	}
 

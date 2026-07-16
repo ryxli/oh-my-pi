@@ -2243,6 +2243,7 @@ export class AcpAgent implements Agent {
 				getContextUsage: () => record.session.getContextUsage(),
 				getSystemPrompt: () => record.session.systemPrompt,
 				compact: instructionsOrOptions => runExtensionCompact(record.session, instructionsOrOptions),
+				asyncJobs: record.session.getAsyncJobControl(),
 			},
 			{
 				getContextUsage: () => record.session.getContextUsage(),

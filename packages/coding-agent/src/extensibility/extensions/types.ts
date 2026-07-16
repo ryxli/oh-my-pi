@@ -353,6 +353,52 @@ export interface ExtensionModelQuery {
 	family(model: Model): string;
 }
 
+/**
+ * Immutable public snapshot of a single async job, safe to hand to an
+ * extension. Carries only stable, non-secret fields; never exposes the
+ * underlying `AsyncJob` (abort controller, promise, result/error text).
+ */
+export interface ExtensionAsyncJobInfo {
+	id: string;
+	type: "bash" | "task";
+	status: "running" | "completed" | "failed" | "cancelled";
+	/** Epoch ms when the job was registered. */
+	startTime: number;
+	/** Registry id of the owning agent. Present only for the caller's own jobs. */
+	agentId?: string;
+}
+
+/**
+ * Definitive result of an owner-scoped cancel request. `not-found` covers both
+ * an unknown id and a job owned by another session — the two are deliberately
+ * indistinguishable so an extension cannot enumerate another session's jobs.
+ * `not-running` means the job is owned but already terminal.
+ */
+export type ExtensionAsyncJobCancelResult =
+	| { cancelled: true; job: ExtensionAsyncJobInfo }
+	| { cancelled: false; reason: "not-found" }
+	| { cancelled: false; reason: "not-running"; job: ExtensionAsyncJobInfo };
+
+/**
+ * Owner-scoped capability for event-driven control of the current parent
+ * session's detached async jobs. Every operation is restricted to jobs the
+ * calling session registered, so an extension can never inspect or cancel
+ * another parent session's jobs.
+ */
+export interface ExtensionAsyncJobControl {
+	/**
+	 * Inspect one owned job's immutable public snapshot. Returns null when the
+	 * id is unknown or the job is owned by another session.
+	 */
+	inspect(jobId: string): ExtensionAsyncJobInfo | null;
+	/**
+	 * Atomically cancel one owned job. Preserves the manager's cancellation
+	 * semantics (abort the job and suppress late completion delivery). Refuses
+	 * jobs not owned by this session and jobs that are not running.
+	 */
+	cancel(jobId: string): ExtensionAsyncJobCancelResult;
+}
+
 export interface ExtensionContext {
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
@@ -384,6 +430,8 @@ export interface ExtensionContext {
 	getSystemPrompt(): string[];
 	/** Structured memory runtime for status/search/save across the configured backend. */
 	memory?: MemoryRuntimeContext;
+	/** Owner-scoped control over this session's detached async jobs. */
+	asyncJobs: ExtensionAsyncJobControl;
 }
 
 /**
@@ -1364,6 +1412,7 @@ export interface ExtensionContextActions {
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
 	getSystemPrompt: () => string[];
+	asyncJobs: ExtensionAsyncJobControl;
 }
 
 /** Actions for ExtensionCommandContext (ctx.* in command handlers). */
