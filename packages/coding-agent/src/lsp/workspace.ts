@@ -95,6 +95,19 @@ export function isLspWorkspaceWideAction(action: string, file?: string, roots?: 
 	);
 }
 
+/**
+ * Join a workspace error summary with its roots, one root per line.
+ *
+ * The renderer shows a tool error's first line as a 60-column title and
+ * ellipsizes the remainder, so the old inline form (`... Choose one of:
+ * <roots>`) spent the whole budget on prose and cut every root away - exactly
+ * the payload the caller needs. Keep the summary short and give each root its
+ * own line so the agent and the transcript both see them.
+ */
+function withRootList(summary: string, roots: readonly string[]): string {
+	return [summary, ...roots.map(root => `root: ${root}`)].join("\n");
+}
+
 export function resolveLspWorkspaceRoot(
 	roots: readonly string[],
 	options: { workspace?: string; file?: string; workspaceWide?: boolean },
@@ -114,10 +127,15 @@ export function resolveLspWorkspaceRoot(
 			? roots.filter(root => canonicalizeLspPath(root) === canonicalizeLspPath(workspace))
 			: roots.filter(root => path.basename(root) === workspace);
 		if (matches.length > 1) {
-			throw new ToolError(`Workspace "${workspace}" is ambiguous. Choose an absolute root: ${matches.join(", ")}`);
+			throw new ToolError(withRootList(`Workspace "${workspace}" is ambiguous; pass an absolute root.`, matches));
 		}
 		if (matches.length === 0) {
-			throw new ToolError(`Unknown workspace "${workspace}". Choose one of: ${roots.join(", ")}`);
+			throw new ToolError(
+				withRootList(
+					`Unknown workspace "${workspace}".\nFix: /add-dir <dir> to register it (launch flag: --add-dir).`,
+					roots,
+				),
+			);
 		}
 		const selected = matches[0];
 		if (file && file !== "*") {
@@ -128,7 +146,7 @@ export function resolveLspWorkspaceRoot(
 	}
 
 	if (workspaceWide && roots.length > 1) {
-		throw new ToolError(`workspace is required for this action. Choose one of: ${roots.join(", ")}`);
+		throw new ToolError(withRootList("workspace is required for this action.", roots));
 	}
 	if (file && file !== "*" && globPattern) {
 		validateLspGlobWithinRoot(roots[0], file);
@@ -141,19 +159,22 @@ export function resolveLspWorkspaceRoot(
 				.filter(root => isPathWithinRoot(canonicalizeLspPath(root), target))
 				.sort((a, b) => canonicalizeLspPath(b).length - canonicalizeLspPath(a).length);
 			if (matches.length > 0) return matches[0];
-			throw new ToolError(`File is outside all workspace roots. Choose one of: ${roots.join(", ")}`);
+			throw new ToolError(
+				withRootList(
+					"File is outside every workspace root.\nFix: /add-dir <dir> (workspace only picks an existing root).",
+					roots,
+				),
+			);
 		}
 
 		const candidates = roots.map(root => resolveLspPathWithinRoot(root, file));
 		const matches = roots.filter((_root, index) => fs.existsSync(candidates[index]));
 		if (matches.length === 1) return matches[0];
 		if (matches.length > 1) {
-			throw new ToolError(`Relative path "${file}" is ambiguous. Choose a workspace root: ${matches.join(", ")}`);
+			throw new ToolError(withRootList(`Relative path "${file}" is ambiguous; pass workspace.`, matches));
 		}
 		if (roots.length > 1) {
-			throw new ToolError(
-				`workspace is required for missing relative path "${file}". Choose one of: ${roots.join(", ")}`,
-			);
+			throw new ToolError(withRootList(`workspace is required for missing relative path "${file}".`, roots));
 		}
 	}
 

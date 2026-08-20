@@ -254,6 +254,26 @@ describe("TanCommandController", () => {
 		expect(harness.ctx.showStatus).toHaveBeenCalledWith("Dispatched background tan job-123");
 	});
 
+	it("grants a Tan the parent's enabled LSP tool", async () => {
+		const harness = createContext({ enabledToolNames: ["read", "bash", "lsp"] });
+		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
+		const { clone } = createCloneStub();
+		let capturedOptions: CreateAgentSessionOptions | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			capturedOptions = options;
+			return { session: clone } as unknown as CreateAgentSessionResult;
+		});
+		const controller = new TanCommandController(harness.ctx);
+
+		await controller.start("inspect the symbol graph");
+		const run = harness.capturedRun;
+		if (!run) throw new Error("run function was not captured");
+		await run({ jobId: "job-1", signal: new AbortController().signal, reportProgress: async () => {} });
+
+		expect(capturedOptions?.enableLsp).toBe(true);
+		expect(capturedOptions?.toolNames).toEqual(["read", "bash", "lsp"]);
+	});
+
 	it("keeps the dispatching session's local:// root after the interactive session switches", async () => {
 		const harness = createContext();
 		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
@@ -465,7 +485,7 @@ describe("TanCommandController", () => {
 		expect(appendSessionInit).toHaveBeenCalledWith({
 			systemPrompt: "system prompt",
 			task: "park me",
-			tools: ["read", "bash"],
+			tools: ["read", "bash", "lsp"],
 		});
 		// Parked (not unregistered) before dispose, then the disposed session is nulled
 		// out — the hub keeps the ref and reads its transcript from the session file.

@@ -110,7 +110,6 @@ export class TanCommandController {
 		const sessionDir = parentFile.slice(0, -6);
 		const settings = createSubagentSettings(this.ctx.settings);
 		const customTools = mcpManager ? createMCPProxyTools(mcpManager) : undefined;
-		const enableLsp = this.ctx.settings.get("task.enableLsp") !== false;
 		const agentRegistry = AgentRegistry.global();
 		const cloneId = `Tan-${Snowflake.next()}`;
 		const cloneFile = path.join(sessionDir, `${cloneId}.jsonl`);

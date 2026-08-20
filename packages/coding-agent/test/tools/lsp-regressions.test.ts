@@ -49,6 +49,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/lsp/utils";
 import { getThemeByName, initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { TRUNCATE_LENGTHS } from "@oh-my-pi/pi-coding-agent/tools/render-utils";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { clampTimeout } from "@oh-my-pi/pi-coding-agent/tools/tool-timeouts";
 import * as piUtils from "@oh-my-pi/pi-utils";
@@ -478,6 +479,36 @@ describe("lsp regressions", () => {
 			const status = textResult(await tool.execute("multi-root-status", { action: "status" }));
 			expect(status).toContain(`Workspace: ${cwd}\n  Language servers: fake (configured, not started)`);
 			expect(status).toContain(`Workspace: ${sibling}\n  Language servers: fake (ready)`);
+		} finally {
+			await lspClient.shutdownAll();
+			tempDir.removeSync();
+		}
+	});
+
+	it("points an out-of-root file at /add-dir and keeps each root on its own line", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-out-of-root-");
+		const cwd = path.join(tempDir.path(), "project");
+		const outside = path.join(tempDir.path(), "outside", "file.ts");
+		try {
+			await fs.promises.mkdir(cwd, { recursive: true });
+			await fs.promises.mkdir(path.dirname(outside), { recursive: true });
+			await Bun.write(outside, "export const value = 1;\n");
+			const tool = new LspTool(makeLspSession(cwd));
+			const error = await tool
+				.execute("out-of-root", { action: "diagnostics", file: outside })
+				.then(() => undefined)
+				.catch((err: Error) => err);
+			const lines = (error?.message ?? "").split("\n");
+			// No existing root can reach the file, so the remedy is registering one.
+			// Naming a root list here sent callers down a dead end (`workspace` only
+			// selects an already-registered root).
+			expect(lines[0]).toContain("outside every workspace root");
+			expect(error?.message).toContain("/add-dir");
+			// The renderer shows line 0 as a title truncated to TRUNCATE_LENGTHS.TITLE
+			// and ellipsizes the rest, so an inline root list was cut away entirely.
+			// Keep the summary inside the budget and give each root its own line.
+			expect(lines[0].length).toBeLessThanOrEqual(TRUNCATE_LENGTHS.TITLE);
+			expect(lines).toContain(`root: ${cwd}`);
 		} finally {
 			await lspClient.shutdownAll();
 			tempDir.removeSync();
