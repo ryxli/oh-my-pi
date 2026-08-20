@@ -46,6 +46,15 @@ const DEFAULT_ANTIGRAVITY_MODEL = "gemini-3-pro-image";
 const DEFAULT_XAI_IMAGE_MODEL = "grok-imagine-image";
 const DEFAULT_DEEPINFRA_IMAGE_MODEL = "black-forest-labs/FLUX-2-pro";
 const DEEPINFRA_IMAGES_URL = "https://api.deepinfra.com/v1/openai/images/generations";
+const DEFAULT_BFL_IMAGE_MODEL = "flux-2-pro";
+const DEFAULT_BFL_EDIT_MODEL = "flux-kontext-pro";
+const BFL_BASE_URL = "https://api.bfl.ai/v1";
+const BFL_POLLING_ORIGINS: Record<string, true> = {
+	"https://api.bfl.ai": true,
+	"https://api.eu.bfl.ai": true,
+	"https://api.us.bfl.ai": true,
+};
+const BFL_POLL_INTERVAL_MS = 1500;
 const IMAGE_TIMEOUT = 3 * 60 * 1000; // 3 minutes
 const MAX_IMAGE_SIZE = 35 * 1024 * 1024;
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
@@ -331,6 +340,67 @@ type XAIImageRequestBody =
 	| (XAIImageRequestBase & { readonly image: XAIImageReference; readonly images?: never })
 	| (XAIImageRequestBase & { readonly images: readonly XAIImageReference[]; readonly image?: never });
 
+// BFL task API: POST /v1/<model> -> {id, polling_url}; poll until "Ready".
+interface BFLGenerationRequest {
+	prompt: string;
+	/** Kontext models only; others ignore it. */
+	aspect_ratio?: string;
+	width?: number;
+	height?: number;
+	/** Base64 source image (Kontext edits). */
+	input_image?: string;
+}
+
+// flux-2-pro/flux-pro-1.1 take width/height and ignore aspect_ratio (Kontext only).
+function resolveBFLDimensions(aspectRatio: string): { width: number; height: number } {
+	const [w = 1, h = 1] = aspectRatio.split(":").map(Number);
+	const scale = Math.sqrt((1024 * 1024) / (w * h));
+	const snap = (term: number) => Math.min(1440, Math.max(256, Math.floor((term * scale) / 32) * 32));
+	return { width: snap(w), height: snap(h) };
+}
+
+interface BFLSubmitResponse {
+	id?: string;
+	polling_url?: string;
+}
+
+interface BFLResultResponse {
+	status?: string;
+	result?: { sample?: string };
+}
+
+/**
+ * BFL returns regional polling endpoints, but the x-key must never follow a
+ * response-controlled URL off the BFL API estate.
+ */
+function resolveBFLPollingUrl(submitted: BFLSubmitResponse): string {
+	if (!submitted.polling_url) {
+		if (!submitted.id?.trim()) {
+			throw new ProviderHttpError("BFL response missing both polling URL and task id", 502);
+		}
+		return `${BFL_BASE_URL}/get_result?id=${encodeURIComponent(submitted.id)}`;
+	}
+
+	let url: URL;
+	try {
+		url = new URL(submitted.polling_url);
+	} catch {
+		throw new ProviderHttpError("BFL returned an invalid polling URL", 502);
+	}
+	// Documented BFL API polling origins. Delivery URLs are separate and never
+	// receive x-key.
+	if (
+		url.protocol !== "https:" ||
+		BFL_POLLING_ORIGINS[url.origin] !== true ||
+		url.username ||
+		url.password ||
+		url.port
+	) {
+		throw new ProviderHttpError("BFL returned an untrusted polling URL", 502);
+	}
+	return url.href;
+}
+
 interface AntigravityResponseChunk {
 	response?: {
 		candidates?: Array<{
@@ -563,11 +633,11 @@ export function setImageProviderOrder(providers: readonly string[]): void {
 	configuredImageProviderOrder = providers.filter(isImageProviderId);
 }
 function assertImageAspectRatioSupported(provider: ImageProvider, aspectRatio: ImageGenParams["aspect_ratio"]): void {
-	if (!aspectRatio || provider === "xai" || COMMON_IMAGE_ASPECT_RATIO_SET.has(aspectRatio)) {
+	if (!aspectRatio || provider === "xai" || provider === "bfl" || COMMON_IMAGE_ASPECT_RATIO_SET.has(aspectRatio)) {
 		return;
 	}
 	throw new Error(
-		`Aspect ratio ${aspectRatio} is only supported by xAI image generation. Set providers.image to xai or use one of ${COMMON_IMAGE_ASPECT_RATIOS.join(", ")}.`,
+		`Aspect ratio ${aspectRatio} is only supported by xAI and BFL image generation. Set providers.image to xai or bfl, or use one of ${COMMON_IMAGE_ASPECT_RATIOS.join(", ")}.`,
 	);
 }
 
@@ -645,6 +715,18 @@ async function findDeepInfraImageCredentials(
 	}
 	const apiKey = getEnvApiKey("deepinfra");
 	if (apiKey) return { provider: "deepinfra", apiKey };
+	return null;
+}
+
+async function findBFLImageCredentials(modelRegistry?: ModelRegistry, sessionId?: string): Promise<ImageApiKey | null> {
+	if (modelRegistry) {
+		// AuthStorage.getApiKey already falls back to env keys, so this covers BFL_API_KEY too.
+		const apiKey = await modelRegistry.getApiKeyForProvider("bfl", sessionId);
+		if (apiKey) return { provider: "bfl", apiKey: modelRegistry.resolver("bfl", { sessionId }) };
+		return null;
+	}
+	const apiKey = getEnvApiKey("bfl") ?? $env.BFL_API_KEY;
+	if (apiKey) return { provider: "bfl", apiKey };
 	return null;
 }
 
@@ -775,6 +857,8 @@ async function findImageApiKey(
 			return modelRegistry ? findAntigravityCredentials(modelRegistry, sessionId) : null;
 		case "xai":
 			return findXAIImageCredentials(modelRegistry);
+		case "bfl":
+			return findBFLImageCredentials(modelRegistry, sessionId);
 		case "openrouter":
 			return findOpenRouterImageCredentials(modelRegistry, sessionId);
 		case "deepinfra":
@@ -1268,11 +1352,16 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 										? DEFAULT_XAI_IMAGE_MODEL
 										: provider === "deepinfra"
 											? DEFAULT_DEEPINFRA_IMAGE_MODEL
+										: provider === "bfl"
+											? resolvedImages.length > 0
+												? DEFAULT_BFL_EDIT_MODEL
+												: DEFAULT_BFL_IMAGE_MODEL
 											: DEFAULT_MODEL;
 					const resolvedModel = provider === "openrouter" ? resolveOpenRouterModel(model) : model;
 					if (
 						params.aspect_ratio &&
 						provider !== "xai" &&
+						provider !== "bfl" &&
 						!COMMON_IMAGE_ASPECT_RATIO_SET.has(params.aspect_ratio)
 					) {
 						unsupportedAspectRatioProvider ??= provider;
@@ -1643,6 +1732,118 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 						return buildImageEndpointResult(provider, resolvedModel, inlineImages);
 					}
 
+					if (provider === "bfl") {
+						const prompt = assemblePrompt(params);
+						// ProviderHttpError (not plain Error) so the provider loop falls through.
+						if (resolvedImages.length > 1) {
+							throw new ProviderHttpError(
+								`BFL Kontext edits accept a single reference image; got ${resolvedImages.length}.`,
+								422,
+							);
+						}
+						const bflBody: BFLGenerationRequest =
+							resolvedImages.length > 0
+								? {
+										prompt,
+										...(params.aspect_ratio ? { aspect_ratio: params.aspect_ratio } : {}),
+										input_image: resolvedImages[0].data,
+									}
+								: { prompt, ...resolveBFLDimensions(params.aspect_ratio ?? "1:1") };
+
+						const sampleUrl = await withAuth(
+							apiKey.apiKey,
+							async key => {
+								// x-key only; Authorization: Bearer is ignored.
+								const submitResp = await fetchImpl(`${BFL_BASE_URL}/${resolvedModel}`, {
+									method: "POST",
+									headers: { "x-key": key, "Content-Type": "application/json" },
+									body: JSON.stringify(bflBody),
+									signal: requestSignal,
+								});
+								const submitText = await submitResp.text();
+								if (!submitResp.ok) {
+									throw new ProviderHttpError(
+										`BFL image request failed (${submitResp.status}): ${submitText}`,
+										submitResp.status,
+										{ headers: submitResp.headers },
+									);
+								}
+								let submitted: BFLSubmitResponse;
+								try {
+									submitted = JSON.parse(submitText) as BFLSubmitResponse;
+								} catch {
+									throw new ProviderHttpError(`BFL returned malformed JSON: ${submitText.slice(0, 200)}`, 502);
+								}
+								const pollingUrl = resolveBFLPollingUrl(submitted);
+
+								// requestSignal (3-min IMAGE_TIMEOUT) bounds the poll loop.
+								for (;;) {
+									const pollResp = await fetchImpl(pollingUrl, {
+										method: "GET",
+										headers: { "x-key": key },
+										signal: requestSignal,
+									});
+									const pollText = await pollResp.text();
+									if (!pollResp.ok) {
+										throw new ProviderHttpError(
+											`BFL image poll failed (${pollResp.status}): ${pollText}`,
+											pollResp.status,
+											{ headers: pollResp.headers },
+										);
+									}
+									let poll: BFLResultResponse;
+									try {
+										poll = JSON.parse(pollText) as BFLResultResponse;
+									} catch {
+										throw new ProviderHttpError(
+											`BFL returned malformed JSON: ${pollText.slice(0, 200)}`,
+											502,
+										);
+									}
+									if (poll.status === "Ready") {
+										const sample = poll.result?.sample;
+										if (!sample) {
+											throw new ProviderHttpError(`BFL result missing sample URL: ${pollText}`, 502);
+										}
+										return sample;
+									}
+									if (poll.status !== "Pending" && poll.status !== "Queued" && poll.status !== "Processing") {
+										throw new ProviderHttpError(
+											`BFL image generation failed (${poll.status ?? "unknown status"}): ${pollText}`,
+											422,
+										);
+									}
+									await Bun.sleep(BFL_POLL_INTERVAL_MS);
+								}
+							},
+							{ signal: requestSignal },
+						);
+
+						// result.sample is a signed URL (~10 min); download immediately. Download
+						// failures throw plain Error, so wrap them for provider fallthrough.
+						let bflImage: InlineImageData;
+						try {
+							bflImage = await loadImageFromUrl(sampleUrl, fetchImpl, requestSignal);
+						} catch (error) {
+							if (error instanceof ProviderHttpError) throw error;
+							throw new ProviderHttpError(error instanceof Error ? error.message : String(error), 502);
+						}
+						const bflImagePaths = await saveImagesToTemp([bflImage]);
+
+						return {
+							content: [
+								{ type: "text", text: buildResponseSummary(provider, resolvedModel, bflImagePaths, undefined) },
+							],
+							details: {
+								provider,
+								model: resolvedModel,
+								imageCount: 1,
+								imagePaths: bflImagePaths,
+								images: [bflImage],
+							},
+						};
+					}
+
 					const parts = [] as Array<{ text?: string; inlineData?: InlineImageData }>;
 					for (const image of resolvedImages) {
 						parts.push({ inlineData: image });
@@ -1754,7 +1955,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 
 			if (!foundCredentials) {
 				throw new Error(
-					"No image API credentials found. Connect a Codex (ChatGPT) subscription, use a GPT Responses/Codex model with OpenAI credentials, log in with google-antigravity or xAI Grok OAuth, or set OPENAI_API_KEY, XAI_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY, or DEEPINFRA_API_KEY.",
+					"No image API credentials found. Connect a Codex (ChatGPT) subscription, use a GPT Responses/Codex model with OpenAI credentials, log in with google-antigravity, xAI Grok OAuth, or Black Forest Labs, or set OPENAI_API_KEY, XAI_API_KEY, BFL_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY, or DEEPINFRA_API_KEY.",
 				);
 			}
 

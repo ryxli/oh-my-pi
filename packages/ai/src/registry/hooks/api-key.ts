@@ -4,6 +4,7 @@
  * `login "custom"` flows that paste keys but need region/endpoint prompts.
  */
 import type { HeadersHook, Lazy, LoginHook } from "./types";
+import { loginBfl } from "../oauth/black-forest-labs";
 
 export const API_KEY_HEADERS_HOOKS: Record<string, Lazy<HeadersHook>> = {
 	"coreweave-project": () => import("../oauth/coreweave").then(m => m.requireCoreWeaveProjectHeaders),
@@ -13,6 +14,7 @@ export const API_KEY_HEADERS_HOOKS: Record<string, Lazy<HeadersHook>> = {
 export const API_KEY_LOGIN_HOOKS: Record<string, Lazy<LoginHook>> = {
 	"alibaba-coding-plan": () => import("../oauth/alibaba-coding-plan").then(m => m.loginAlibabaCodingPlan),
 	"alibaba-token-plan": () => import("../oauth/alibaba-token-plan").then(m => m.loginAlibabaTokenPlan),
+	bfl: async () => loginBfl,
 	"cloudflare-ai-gateway": () => import("../oauth/cloudflare-ai-gateway").then(m => m.loginCloudflareAiGateway),
 	kilo: () => import("../oauth/kilo").then(m => m.loginKilo),
 	xiaomi: () => import("../oauth/xiaomi").then(m => m.loginXiaomi),

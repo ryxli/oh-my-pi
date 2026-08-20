@@ -179,6 +179,9 @@
 - Improved chat history stability in long-running sessions by avoiding unnecessary updates when date or directory context changes.
 - Fixed the trace CLI hanging during proxy connections and added support for forward HTTP proxies.
 - Fixed newly started sessions using stale model context-window limits after background model discovery completes; the active model now refreshes automatically so context usage and compaction thresholds match the model catalog.
+### Added
+
+- Added Black Forest Labs (FLUX) to the `generate_image` tool: text-to-image via `flux-2-pro`, edits via `flux-kontext-pro`, authenticated with `/login bfl` or `BFL_API_KEY`.
 
 ## [18.1.1] - 2026-09-01
 

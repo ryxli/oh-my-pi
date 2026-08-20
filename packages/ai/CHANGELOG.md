@@ -88,6 +88,9 @@
 - Fixed incorrect operating-system information reported in request headers on non-Linux systems.
 - Fixed Google Antigravity quota handling so requests rotate to another account with available usage instead of unnecessarily switching models.
 - Fixed Anthropic authentication for newer models by updating the Claude Code request fingerprint.
+### Added
+
+- Added Black Forest Labs (`bfl`) as a login provider.
 
 ## [18.1.0] - 2026-09-01
 

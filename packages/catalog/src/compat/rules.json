@@ -12,6 +12,7 @@
 		"auth/azure.kdl",
 		"auth/baseten.kdl",
 		"auth/bedrock-mantle.kdl",
+		"auth/bfl.kdl",
 		"auth/cerebras.kdl",
 		"auth/cline-pass.kdl",
 		"auth/cloudflare-ai-gateway.kdl",
@@ -16778,6 +16779,20 @@
 					"instructions": "Create or copy your API key from the Exa dashboard.",
 					"prompt": "Paste your Exa API key",
 					"placeholder": "API key"
+				}
+			},
+			{
+				"id": "bfl",
+				"apiKeyFormat": "bearer",
+				"name": "Black Forest Labs (FLUX)",
+				"env": {
+					"vars": [
+						"BFL_API_KEY"
+					]
+				},
+				"login": {
+					"kind": "custom",
+					"hook": "bfl"
 				}
 			},
 			{

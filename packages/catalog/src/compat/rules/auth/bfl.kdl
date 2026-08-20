@@ -1,0 +1,5 @@
+auth "bfl" {
+	name "Black Forest Labs (FLUX)"
+	env "BFL_API_KEY"
+	login "custom" hook="bfl"
+}
