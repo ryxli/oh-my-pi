@@ -61,8 +61,8 @@ import { getLanguageFromPath } from "../../src/utils/lang-from-path";
 const lspTestSettings = Settings.isolated();
 
 /** Minimal LSP tool session: production always supplies `settings`; these tests only need cwd + a default settings stub. */
-function makeLspSession(cwd: string): ToolSession {
-	return { cwd, settings: lspTestSettings } as ToolSession;
+function makeLspSession(cwd: string, additionalDirectories?: string[]): ToolSession {
+	return { cwd, additionalDirectories, settings: lspTestSettings } as ToolSession;
 }
 
 interface RpcMessage {
@@ -426,6 +426,84 @@ describe("lsp regressions", () => {
 		}
 	});
 
+	it("exposes optional workspace selection in the LSP schema", () => {
+		expect(arkToWireSchema(lspSchema)).toMatchObject({
+			properties: { workspace: { type: "string" } },
+		});
+	});
+
+	it("routes explicit workspaces to per-root clients and reports status by root", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-multi-root-client-");
+		const cwd = path.join(tempDir.path(), "primary");
+		const sibling = path.join(tempDir.path(), "sibling");
+		try {
+			const config = JSON.stringify({
+				servers: {
+					fake: {
+						command: process.execPath,
+						fileTypes: [".ts"],
+						rootMarkers: [".omp"],
+					},
+				},
+			});
+			await fs.promises.mkdir(path.join(cwd, ".omp"), { recursive: true });
+			await fs.promises.mkdir(path.join(sibling, ".omp"), { recursive: true });
+			await Bun.write(path.join(cwd, ".omp", "lsp.json"), config);
+			await Bun.write(path.join(sibling, ".omp", "lsp.json"), config);
+
+			const server = installFakeLsp((message, fake) => {
+				if (message.method === "initialize") {
+					fake.send({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });
+				} else if (message.method === "shutdown") {
+					fake.send({ jsonrpc: "2.0", id: message.id, result: null });
+				} else if (message.method === "exit") {
+					fake.exit(0);
+				}
+			});
+			const tool = new LspTool(makeLspSession(cwd, [sibling]));
+			await expect(tool.execute("multi-root-capabilities-missing", { action: "capabilities" })).rejects.toThrow(
+				"workspace is required for this action",
+			);
+			const capabilities = await tool.execute("multi-root-capabilities", {
+				action: "capabilities",
+				workspace: "sibling",
+			});
+			const initialize = server.received.find(message => message.method === "initialize");
+			expect(initialize?.params).toMatchObject({
+				rootPath: sibling,
+				rootUri: fileToUri(sibling),
+			});
+			expect(capabilities.details?.request?.workspace).toBe(sibling);
+
+			const status = textResult(await tool.execute("multi-root-status", { action: "status" }));
+			expect(status).toContain(`Workspace: ${cwd}\n  Language servers: fake (configured, not started)`);
+			expect(status).toContain(`Workspace: ${sibling}\n  Language servers: fake (ready)`);
+		} finally {
+			await lspClient.shutdownAll();
+			tempDir.removeSync();
+		}
+	});
+
+	it("rejects rename_file destinations outside the selected workspace", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-rename-root-");
+		const cwd = path.join(tempDir.path(), "project");
+		const source = path.join(cwd, "source.ts");
+		try {
+			await fs.promises.mkdir(cwd, { recursive: true });
+			await Bun.write(source, "export const value = 1;\n");
+			const tool = new LspTool(makeLspSession(cwd));
+			await expect(
+				tool.execute("rename-root-escape", {
+					action: "rename_file",
+					file: source,
+					new_name: "../outside.ts",
+					workspace: cwd,
+				}),
+			).rejects.toThrow('Destination "../outside.ts" is outside workspace root');
+		} finally {
+			tempDir.removeSync();
+		}
+	});
 	it("uses a custom server languageId for disk and in-memory document opens", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-language-id-");
 		const filePath = path.join(tempDir.path(), "foo.gd");
@@ -4316,9 +4394,9 @@ describe("lsp regressions", () => {
 			},
 			idleTimeoutMs: undefined,
 		});
-		vi.spyOn(lspClient, "getActiveClients").mockReturnValue([
-			{ name: "typescript-language-server", status: "ready", fileTypes: [".ts"] },
-		]);
+		vi.spyOn(lspClient, "getActiveOrPendingClient").mockImplementation(async config =>
+			config.command === "typescript-language-server" ? ({ status: "ready" } as LspClient) : undefined,
+		);
 
 		const tool = new LspTool(makeLspSession(process.cwd()));
 		const result = await tool.execute("status-test", { action: "status" });
@@ -4329,6 +4407,7 @@ describe("lsp regressions", () => {
 
 		expect(output).toContain("rust-analyzer (configured, not started)");
 		expect(output).toContain("typescript-language-server (ready)");
+		expect(output).not.toContain("Workspace:");
 	});
 
 	it("reload * invalidates the per-cwd config cache so newly written .omp/lsp.json is observed", async () => {
@@ -4359,7 +4438,6 @@ describe("lsp regressions", () => {
 			// the refreshed server list — the spawn path would race with the
 			// test's teardown.
 			vi.spyOn(lspClient, "getOrCreateClient").mockRejectedValue(new Error("spawn suppressed in test"));
-			vi.spyOn(lspClient, "getActiveClients").mockReturnValue([]);
 
 			const tool = new LspTool(makeLspSession(cwd));
 
