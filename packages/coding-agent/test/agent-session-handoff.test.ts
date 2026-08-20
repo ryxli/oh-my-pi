@@ -6,6 +6,7 @@ import type { AssistantMessage, Model, ToolCall } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
@@ -16,6 +17,7 @@ import {
 import { SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -158,6 +160,85 @@ describe("AgentSession handoff", () => {
 		expect(session.agent.state.messages.some(message => message.role === "compactionSummary")).toBe(true);
 		expect(events.filter(event => event.type === "auto_compaction_start")).toHaveLength(0);
 		expect(events.filter(event => event.type === "auto_compaction_end")).toHaveLength(0);
+	});
+
+	it("keeps an owner async result deliverable through automatic in-place handoff", async () => {
+		// The default fixture intentionally has no async manager. Replace it with
+		// a session that does, so this proves the preserved-work contract through
+		// the public owner-delivery path rather than a private lifecycle seam.
+		await session.dispose();
+		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		const mock = createMockModel({ handler: () => ({ content: ["acknowledged"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const jobs = new AsyncJobManager({});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({
+				"compaction.enabled": true,
+				"compaction.autoContinue": false,
+				"compaction.asyncEnabled": true,
+				"compaction.keepRecentTokens": 1,
+			}),
+			modelRegistry,
+			obfuscator,
+			agentId: "Main",
+			asyncJobManager: jobs,
+		});
+		sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "seed" }],
+			timestamp: Date.now() - 2,
+		});
+		sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "seed response" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			stopReason: "stop",
+			usage: {
+				input: 16,
+				output: 8,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 24,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now() - 1,
+		});
+		const handoffSpy = vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue");
+		const resultGate = Promise.withResolvers<string>();
+		jobs.register("task", "preserved work", () => resultGate.promise, { id: "preserved-work", ownerId: "Main" });
+		const sessionId = session.sessionId;
+		const sessionFile = session.sessionFile;
+
+		await session.handoff(undefined, { autoTriggered: true });
+
+		expect(handoffSpy).toHaveBeenCalledTimes(1);
+		expect(session.sessionId).toBe(sessionId);
+		expect(session.sessionFile).toBe(sessionFile);
+		expect(session.hasPendingAsyncWork()).toBe(true);
+
+		resultGate.resolve("preserved work completed");
+		await session.settleAsyncWork();
+
+		const deliveries = mock.calls.filter(call =>
+			call.context.messages.some(message => {
+				const content = message.content;
+				return (
+					typeof content === "string"
+						? content.includes("preserved work completed")
+						: content.some(block => block.type === "text" && block.text.includes("preserved work completed"))
+				);
+			}),
+		);
+		expect(deliveries).toHaveLength(1);
 	});
 
 	it("runs handoff generation through the configured side stream function", async () => {
