@@ -23,7 +23,22 @@ describe("stats dashboard host arguments", () => {
 			host: "::",
 			json: false,
 			summary: false,
+			range: "24h",
 		});
+	});
+
+	it("forwards an explicit statistics window", async () => {
+		vi.spyOn(theme, "initTheme").mockResolvedValue();
+		const runStatsCommand = vi.spyOn(statsCli, "runStatsCommand").mockResolvedValue();
+		const command = new Stats(["--range", "all"], TEST_CONFIG);
+
+		await command.run();
+
+		expect(runStatsCommand).toHaveBeenCalledWith(
+			expect.objectContaining({
+				range: "all",
+			}),
+		);
 	});
 
 	it("keeps the slash command loopback-only unless a host is requested", () => {

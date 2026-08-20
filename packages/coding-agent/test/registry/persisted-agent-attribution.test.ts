@@ -224,4 +224,40 @@ describe("persisted agent model attribution", () => {
 		expect(history?.resolvedModel).toBe("openai-codex/gpt-5.6-sol@vercel-gw");
 		expect(history?.resolvedModelIsFallback).toBe(true);
 	});
+
+	it("bills a fork only for the turns it ran, not the history it inherited", async () => {
+		using tempDir = TempDir.createSync("@omp-attribution-fork-");
+		// A `/tan` fork opens with a verbatim copy of its source transcript. Those
+		// leading entries are the source's spend; counting them here bills one turn
+		// again for every descendant and inflates the Agent Hub total.
+		const registry = await historyFor(tempDir.path(), "ForkedTan", [
+			JSON.stringify({
+				type: "session",
+				id: "s0",
+				parentId: null,
+				timestamp: "2026-08-07T10:34:37.300Z",
+				inheritedEntries: 3,
+			}),
+			modelChange("m1", "s0", "anthropic/claude-sonnet-5", "task", false),
+			JSON.stringify({
+				type: "session_init",
+				id: "si",
+				parentId: "m1",
+				timestamp: "2026-08-07T10:34:38.000Z",
+				agent: "task",
+				task: "work the source already paid for",
+			}),
+			assistant("a0", "si", SONNET, "toolUse", [{ type: "toolCall", id: "t0", name: "read" }]),
+			assistant("a1", "a0", SONNET, "toolUse", [{ type: "toolCall", id: "t1", name: "read" }]),
+			assistant("a2", "a1", SONNET, "toolUse", [{ type: "toolCall", id: "t2", name: "read" }]),
+		]);
+
+		const history = registry.get("ForkedTan")?.history;
+		// a1 and a2 only. a0 sits inside the inherited prefix and belongs to the source.
+		expect(history?.metrics?.requests).toBe(2);
+		expect(history?.metrics?.cost).toBeCloseTo(1, 6);
+		// Inherited transitions still attribute: a fork that never switched models
+		// is still running the one it inherited.
+		expect(history?.resolvedModel).toBe("anthropic/claude-sonnet-5");
+	});
 });

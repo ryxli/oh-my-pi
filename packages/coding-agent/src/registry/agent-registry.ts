@@ -42,7 +42,15 @@ export type AgentKind = "main" | "sub" | "advisor";
 
 /** Persisted per-agent totals reconstructed from the child session transcript. */
 export interface AgentMetricsSummary {
+	/** Input + output + cache-write tokens. Cache reads are held separately. */
 	tokens: number;
+	/**
+	 * Cache-read tokens, tracked apart from {@link tokens} because `cost` prices
+	 * them while `tokens` does not. Without it no cost-per-token is derivable:
+	 * cache reads dominate volume, so dividing `cost` by `tokens` overstates the
+	 * rate by more than an order of magnitude.
+	 */
+	cacheReadTokens?: number;
 	requests: number;
 	tools: number;
 	cost: number;

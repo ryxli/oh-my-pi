@@ -2880,6 +2880,9 @@ export class SessionManager {
 		manager.#titleUpdatedAt = nowIso();
 		manager.#hasTitleSlot = true;
 		manager.#entries = history;
+		// Everything copied here is the source's work, not this fork's. Record the
+		// boundary so usage accounting attributes each session only to work it ran.
+		manager.#header.inheritedEntries = history.length > 0 ? history.length : undefined;
 		manager.#index.rebuild(history);
 		manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
 		manager.#forceFileCreation = true;
