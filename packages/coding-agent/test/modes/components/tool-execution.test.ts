@@ -13,6 +13,13 @@ class BoldTypeErrorComponent implements Component {
 	}
 }
 
+class UndefinedLinesComponent implements Component {
+	render(_width: number): readonly string[] {
+		// Reproduce a custom extension violating the Component contract at runtime.
+		return undefined as unknown as readonly string[];
+	}
+}
+
 function visibleText(lines: readonly string[]): string {
 	let text = lines.join("\n");
 	text = text.replace(/\x1b\]8;[^\x1b\x07]*(?:\x07|\x1b\\)/g, "");
@@ -64,6 +71,40 @@ describe("ToolExecutionComponent custom renderer failures", () => {
 			text = visibleText(component.render(80));
 		}).not.toThrow();
 		expect(text).toContain("Graphify Graph");
+	});
+
+	it("falls back to the custom tool label when a renderCall child returns invalid lines", () => {
+		const tool: AgentTool = {
+			name: "invalid_lines_renderer",
+			label: "Invalid Lines Renderer",
+			description: "returns invalid render output",
+			parameters: { type: "object", additionalProperties: true },
+			renderCall() {
+				return new UndefinedLinesComponent();
+			},
+			async execute() {
+				return { content: [{ type: "text", text: "ok" }] };
+			},
+		};
+		const ui: ToolExecutionUi = {
+			requestRender() {},
+			requestComponentRender(_component: Component) {},
+			resetDisplay() {},
+		};
+		const component = new ToolExecutionComponent(
+			"invalid_lines_renderer",
+			{},
+			{ showImages: false },
+			tool,
+			ui,
+			process.cwd(),
+		);
+		let text = "";
+
+		expect(() => {
+			text = visibleText(component.render(80));
+		}).not.toThrow();
+		expect(text).toContain("Invalid Lines Renderer");
 	});
 
 	it("preserves raw result text when a renderResult child component throws during render", () => {

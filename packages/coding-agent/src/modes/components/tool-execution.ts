@@ -116,7 +116,11 @@ class SafeToolRendererComponent implements Component {
 
 	render(width: number): readonly string[] {
 		try {
-			return this.#component.render(width);
+			const lines = this.#component.render(width);
+			if (!Array.isArray(lines) || lines.some(line => typeof line !== "string")) {
+				throw new TypeError("tool renderer returned invalid lines");
+			}
+			return lines;
 		} catch (err) {
 			if (!this.#warned) {
 				this.#warned = true;
