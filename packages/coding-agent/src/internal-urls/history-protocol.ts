@@ -107,7 +107,8 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 		const notes: string[] = [];
 		let messages: unknown[];
 		if (ref.session) {
-			messages = ref.session.messages;
+			const streamMessage = ref.session.agent.state.streamMessage;
+			messages = streamMessage ? [...ref.session.messages, streamMessage] : ref.session.messages;
 			notes.push("Source: live session");
 		} else if (ref.sessionFile) {
 			messages = await loadSessionMessagesReadOnly(ref.sessionFile);

@@ -35,8 +35,8 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 	}
 }
 
-function fakeLiveSession(messages: unknown[]): AgentSession {
-	return { messages } as unknown as AgentSession;
+function fakeLiveSession(messages: unknown[], streamMessage: unknown = null): AgentSession {
+	return { messages, agent: { state: { streamMessage } } } as unknown as AgentSession;
 }
 
 function makeToolSession(cwd: string, sessionFile: string = path.join(cwd, "session.jsonl")): ToolSession {
@@ -134,6 +134,24 @@ describe("history:// protocol", () => {
 		expect(resource.content).toContain("## user");
 		expect(resource.content).toContain("hello from live");
 		expect(resource.notes).toContain("Source: live session");
+	});
+
+	it("history://<id> includes the current streaming assistant message", async () => {
+		AgentRegistry.global().register({
+			id: "StreamingAgent",
+			displayName: "task",
+			kind: "sub",
+			session: fakeLiveSession([{ role: "user", content: "start", timestamp: 1 }], {
+				role: "assistant",
+				content: [{ type: "text", text: "partial live output" }],
+				timestamp: 2,
+			}),
+			status: "running",
+		});
+
+		const resource = await InternalUrlRouter.instance().resolve("history://StreamingAgent");
+
+		expect(resource.content).toContain("partial live output");
 	});
 
 	it("read applies line selectors to history transcripts", async () => {
