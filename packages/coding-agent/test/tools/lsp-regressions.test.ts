@@ -45,6 +45,7 @@ import {
 	hasGlobPattern,
 	resolveDiagnosticTargets,
 	resolveSymbolColumn,
+	resolveSymbolPosition,
 	uriToFile,
 } from "@oh-my-pi/pi-coding-agent/lsp/utils";
 import { getThemeByName, initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
@@ -479,6 +480,80 @@ describe("lsp regressions", () => {
 			const status = textResult(await tool.execute("multi-root-status", { action: "status" }));
 			expect(status).toContain(`Workspace: ${cwd}\n  Language servers: fake (configured, not started)`);
 			expect(status).toContain(`Workspace: ${sibling}\n  Language servers: fake (ready)`);
+		} finally {
+			await lspClient.shutdownAll();
+			tempDir.removeSync();
+		}
+	});
+
+	it("uses a unique declaration to repair an ambiguous line hint for references", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-symbol-declaration-");
+		const cwd = tempDir.path();
+		const filePath = path.join(cwd, "symbol.py");
+		try {
+			await fs.promises.mkdir(path.join(cwd, ".omp"), { recursive: true });
+			await Bun.write(
+				path.join(cwd, ".omp", "lsp.json"),
+				JSON.stringify({
+					servers: {
+						fake: { command: process.execPath, fileTypes: [".py"], rootMarkers: [".omp"], isLinter: true },
+					},
+				}),
+			);
+			await Bun.write(filePath, "def shared():\n    pass\n\nshared()\n");
+			const server = installFakeLsp((message, fake) => {
+				if (message.method === "initialize") {
+					fake.send({
+						jsonrpc: "2.0",
+						id: message.id,
+						result: { capabilities: { documentSymbolProvider: true } },
+					});
+				} else if (message.method === "textDocument/documentSymbol") {
+					fake.send({
+						jsonrpc: "2.0",
+						id: message.id,
+						result: [
+							{
+								name: "shared",
+								kind: 12,
+								range: { start: { line: 0, character: 0 }, end: { line: 1, character: 8 } },
+								selectionRange: { start: { line: 0, character: 4 }, end: { line: 0, character: 10 } },
+							},
+						],
+					});
+				} else if (message.method === "textDocument/references") {
+					fake.send({
+						jsonrpc: "2.0",
+						id: message.id,
+						result: [
+							{
+								uri: fileToUri(filePath),
+								range: { start: { line: 0, character: 4 }, end: { line: 0, character: 10 } },
+							},
+							{
+								uri: fileToUri(filePath),
+								range: { start: { line: 3, character: 0 }, end: { line: 3, character: 6 } },
+							},
+						],
+					});
+				} else if (message.method === "shutdown") {
+					fake.send({ jsonrpc: "2.0", id: message.id, result: null });
+				} else if (message.method === "exit") {
+					fake.exit(0);
+				}
+			});
+			const result = textResult(
+				await new LspTool(makeLspSession(cwd)).execute("recovered-reference", {
+					action: "references",
+					file: filePath,
+					line: 3,
+					symbol: "shared",
+				}),
+			);
+			const request = server.received.find(message => message.method === "textDocument/references");
+
+			expect(request?.params).toMatchObject({ position: { line: 0, character: 4 } });
+			expect(result).toContain('Resolved "shared" from line 3 to its unique occurrence at line 1.');
 		} finally {
 			await lspClient.shutdownAll();
 			tempDir.removeSync();
@@ -1463,6 +1538,20 @@ describe("lsp regressions", () => {
 
 			expect(await resolveSymbolColumn(filePath, 1, "foo")).toBe(0);
 			expect(await resolveSymbolColumn(filePath, 1, "foo#2")).toBe(8);
+		} finally {
+			tempDir.removeSync();
+		}
+	});
+
+	it("refuses an approximate line hint when the symbol is ambiguous", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-symbol-ambiguity-");
+		try {
+			const filePath = path.join(tempDir.path(), "symbol.py");
+			await Bun.write(filePath, "def shared():\n    pass\n\nshared()\n");
+
+			expect(resolveSymbolPosition(filePath, 3, "shared")).rejects.toThrow(
+				'Symbol "shared" not found on line 3; found 2 occurrences at lines 1, 4. Use one of those lines.',
+			);
 		} finally {
 			tempDir.removeSync();
 		}

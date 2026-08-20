@@ -85,6 +85,7 @@ import {
 	type WorkspaceEdit,
 } from "./types";
 import {
+	AmbiguousSymbolPositionError,
 	applyCodeAction,
 	dedupeWorkspaceSymbols,
 	extractHoverText,
@@ -98,8 +99,10 @@ import {
 	formatLocation,
 	formatSymbolInformation,
 	formatWorkspaceEdit,
+	parseSymbolSpec,
 	resolveDiagnosticTargets,
-	resolveSymbolColumn,
+	resolveSymbolPosition,
+	type SymbolPosition,
 	sortDiagnostics,
 	symbolKindToIcon,
 	uriToFile,
@@ -113,6 +116,62 @@ import {
 import { runWorkspaceDiagnostics } from "./workspace-diagnostics";
 
 const MAX_RENAME_PAIRS = 1000;
+
+function documentSymbolPositions(
+	symbols: readonly (DocumentSymbol | SymbolInformation)[],
+	symbol: string,
+): Array<Pick<SymbolPosition, "line" | "character">> {
+	const matches: Array<Pick<SymbolPosition, "line" | "character">> = [];
+	const visit = (entry: DocumentSymbol | SymbolInformation): void => {
+		if ("selectionRange" in entry) {
+			if (entry.name === symbol) {
+				matches.push({
+					line: entry.selectionRange.start.line + 1,
+					character: entry.selectionRange.start.character,
+				});
+			}
+			for (const child of entry.children ?? []) visit(child);
+			return;
+		}
+		if (entry.name === symbol) {
+			matches.push({
+				line: entry.location.range.start.line + 1,
+				character: entry.location.range.start.character,
+			});
+		}
+	};
+	for (const entry of symbols) visit(entry);
+	return matches;
+}
+
+async function resolveSemanticSymbolPosition(
+	client: LspClient,
+	filePath: string,
+	uri: string,
+	line: number,
+	symbolSpec: string | undefined,
+	signal?: AbortSignal,
+): Promise<SymbolPosition> {
+	try {
+		return await resolveSymbolPosition(filePath, line, symbolSpec);
+	} catch (error) {
+		if (!(error instanceof AmbiguousSymbolPositionError) || !symbolSpec) throw error;
+		const { symbol, occurrence } = parseSymbolSpec(symbolSpec);
+		if (occurrence !== 1) throw error;
+		let result: (DocumentSymbol | SymbolInformation)[] | null;
+		try {
+			result = (await sendRequest(client, "textDocument/documentSymbol", { textDocument: { uri } }, signal)) as
+				| (DocumentSymbol | SymbolInformation)[]
+				| null;
+		} catch (symbolError) {
+			if (symbolError instanceof ToolAbortError || signal?.aborted) throw symbolError;
+			throw error;
+		}
+		const matches = result ? documentSymbolPositions(result, symbol) : [];
+		if (matches.length !== 1) throw error;
+		return { ...matches[0], recovered: true };
+	}
+}
 
 interface FileRenamePair {
 	oldUri: string;
@@ -136,7 +195,10 @@ async function enumerateRenamePairs(
 			exceeded: false,
 		};
 	}
-	const entries = await fs.promises.readdir(source, { recursive: true, withFileTypes: true });
+	const entries = await fs.promises.readdir(source, {
+		recursive: true,
+		withFileTypes: true,
+	});
 	const pairs: FileRenamePair[] = [];
 	for (const entry of entries) {
 		if (!entry.isFile()) continue;
@@ -410,7 +472,11 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 									text: `${theme.status.error} ${relPath}: all language servers failed (${failedServers.join(", ")})`,
 								},
 							],
-							details: { action, serverName: Array.from(allServerNames).join(", "), success: false },
+							details: {
+								action,
+								serverName: Array.from(allServerNames).join(", "),
+								success: false,
+							},
 						};
 					}
 
@@ -499,14 +565,21 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			// Absolute rename operands are explicit intent and bypass root
 			// confinement (upstream contract); relative paths resolve against the
 			// workspace root and must stay inside it (a "../" escape is an error).
-			const source = path.isAbsolute(file) ? path.resolve(file) : resolveLspPathWithinRoot(workspaceRoot, file, "Source");
+			const source = path.isAbsolute(file)
+				? path.resolve(file)
+				: resolveLspPathWithinRoot(workspaceRoot, file, "Source");
 			const dest = path.isAbsolute(new_name)
 				? path.resolve(new_name)
 				: resolveLspPathWithinRoot(workspaceRoot, new_name, "Destination");
 
 			if (source === dest) {
 				return {
-					content: [{ type: "text", text: "Error: source and destination paths are identical" }],
+					content: [
+						{
+							type: "text",
+							text: "Error: source and destination paths are identical",
+						},
+					],
 					details: { action, success: false, request: params },
 				};
 			}
@@ -938,14 +1011,25 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					const msg = err instanceof Error ? err.message : String(err);
 					return {
 						content: [{ type: "text", text: `Error: invalid JSON in payload: ${msg}` }],
-						details: { action, serverName: chosenName, success: false, request: params },
+						details: {
+							action,
+							serverName: chosenName,
+							success: false,
+							request: params,
+						},
 					};
 				}
 			} else if (resolvedTarget) {
 				const uri = fileToUri(resolvedTarget);
 				if (line !== undefined) {
-					const character = await resolveSymbolColumn(resolvedTarget, line, symbol);
-					requestParams = { textDocument: { uri }, position: { line: line - 1, character } };
+					const position = await resolveSymbolPosition(resolvedTarget, line, symbol);
+					requestParams = {
+						textDocument: { uri },
+						position: {
+							line: position.line - 1,
+							character: position.character,
+						},
+					};
 				} else {
 					requestParams = { textDocument: { uri } };
 				}
@@ -967,7 +1051,12 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 							: JSON.stringify(result, null, 2);
 				return {
 					content: [{ type: "text", text: `${chosenName} ← ${method}:\n${formatted}` }],
-					details: { action, serverName: chosenName, success: true, request: params },
+					details: {
+						action,
+						serverName: chosenName,
+						success: true,
+						request: params,
+					},
 				};
 			} catch (err) {
 				if (err instanceof ToolAbortError || signal?.aborted) {
@@ -981,9 +1070,17 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				const preview = previewRaw.length > 400 ? `${previewRaw.slice(0, 397)}...` : previewRaw;
 				return {
 					content: [
-						{ type: "text", text: `LSP error from ${chosenName} on ${method}: ${msg}\n  params: ${preview}` },
+						{
+							type: "text",
+							text: `LSP error from ${chosenName} on ${method}: ${msg}\n  params: ${preview}`,
+						},
 					],
-					details: { action, serverName: chosenName, success: false, request: params },
+					details: {
+						action,
+						serverName: chosenName,
+						success: false,
+						request: params,
+					},
 				};
 			}
 		}
@@ -1009,7 +1106,12 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			const normalizedQuery = query?.trim();
 			if (!normalizedQuery) {
 				return {
-					content: [{ type: "text", text: "Error: query parameter required for workspace symbol search" }],
+					content: [
+						{
+							type: "text",
+							text: "Error: query parameter required for workspace symbol search",
+						},
+					],
 					details: { action, success: false, request: params },
 				};
 			}
@@ -1149,7 +1251,12 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			}
 			return {
 				content: [{ type: "text", text: outputs.join("\n") }],
-				details: { action, serverName: servers.map(([name]) => name).join(", "), success: true, request: params },
+				details: {
+					action,
+					serverName: servers.map(([name]) => name).join(", "),
+					success: true,
+					request: params,
+				},
 			};
 		}
 
@@ -1198,9 +1305,13 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				);
 			}
 			const uri = targetFile ? fileToUri(targetFile) : "";
-			const resolvedLine = line ?? 1;
-			const resolvedCharacter = targetFile ? await resolveSymbolColumn(targetFile, resolvedLine, symbol) : 0;
-			const position = { line: resolvedLine - 1, character: resolvedCharacter };
+			const resolvedPosition = targetFile
+				? await resolveSemanticSymbolPosition(client, targetFile, uri, line ?? 1, symbol, signal)
+				: { line: 1, character: 0, recovered: false };
+			const position = {
+				line: resolvedPosition.line - 1,
+				character: resolvedPosition.character,
+			};
 
 			let output: string;
 			// Set on bare empty-lookup outcomes (no definition/references/…): the
@@ -1482,7 +1593,12 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				case "rename": {
 					if (!new_name) {
 						return {
-							content: [{ type: "text", text: "Error: new_name parameter required for rename" }],
+							content: [
+								{
+									type: "text",
+									text: "Error: new_name parameter required for rename",
+								},
+							],
 							details: { action, serverName, success: false, request: params },
 						};
 					}
@@ -1520,6 +1636,10 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 
 				default:
 					output = `Unknown action: ${action}`;
+			}
+
+			if (resolvedPosition.recovered && symbol) {
+				output = `Resolved "${symbol}" from line ${line ?? 1} to its unique occurrence at line ${resolvedPosition.line}.\n${output}`;
 			}
 
 			return {
