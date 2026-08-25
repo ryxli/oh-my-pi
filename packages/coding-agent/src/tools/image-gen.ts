@@ -1352,11 +1352,11 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 										? DEFAULT_XAI_IMAGE_MODEL
 										: provider === "deepinfra"
 											? DEFAULT_DEEPINFRA_IMAGE_MODEL
-										: provider === "bfl"
-											? resolvedImages.length > 0
-												? DEFAULT_BFL_EDIT_MODEL
-												: DEFAULT_BFL_IMAGE_MODEL
-											: DEFAULT_MODEL;
+											: provider === "bfl"
+												? resolvedImages.length > 0
+													? DEFAULT_BFL_EDIT_MODEL
+													: DEFAULT_BFL_IMAGE_MODEL
+												: DEFAULT_MODEL;
 					const resolvedModel = provider === "openrouter" ? resolveOpenRouterModel(model) : model;
 					if (
 						params.aspect_ratio &&

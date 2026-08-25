@@ -485,7 +485,7 @@ describe("TanCommandController", () => {
 		expect(appendSessionInit).toHaveBeenCalledWith({
 			systemPrompt: "system prompt",
 			task: "park me",
-			tools: ["read", "bash", "lsp"],
+			tools: ["read", "bash"],
 		});
 		// Parked (not unregistered) before dispose, then the disposed session is nulled
 		// out — the hub keeps the ref and reads its transcript from the session file.

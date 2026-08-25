@@ -212,7 +212,9 @@ describe("AgentSession handoff", () => {
 			},
 			timestamp: Date.now() - 1,
 		});
-		const handoffSpy = vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue");
+		const handoffSpy = vi
+			.spyOn(compactionModule, "generateHandoffFromContext")
+			.mockResolvedValue("## Goal\nContinue");
 		const resultGate = Promise.withResolvers<string>();
 		jobs.register("task", "preserved work", () => resultGate.promise, { id: "preserved-work", ownerId: "Main" });
 		const sessionId = session.sessionId;
@@ -231,11 +233,9 @@ describe("AgentSession handoff", () => {
 		const deliveries = mock.calls.filter(call =>
 			call.context.messages.some(message => {
 				const content = message.content;
-				return (
-					typeof content === "string"
-						? content.includes("preserved work completed")
-						: content.some(block => block.type === "text" && block.text.includes("preserved work completed"))
-				);
+				return typeof content === "string"
+					? content.includes("preserved work completed")
+					: content.some(block => block.type === "text" && block.text.includes("preserved work completed"));
 			}),
 		);
 		expect(deliveries).toHaveLength(1);

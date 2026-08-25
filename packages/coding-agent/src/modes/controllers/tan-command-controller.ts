@@ -75,6 +75,7 @@ export class TanCommandController {
 		const parentPromptCacheKey = session.agent.promptCacheKey ?? parentSessionId;
 		const thinkingLevel = session.configuredThinkingLevel();
 		const systemPrompt = [...session.systemPrompt];
+		const enableLsp = this.ctx.settings.get("task.enableLsp") !== false;
 		const toolNames = session.getEnabledToolNames();
 		const modelRegistry = session.modelRegistry;
 		// Snapshot the parent's rebindable extensions and root policy at dispatch.
