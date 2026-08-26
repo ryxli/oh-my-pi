@@ -1013,6 +1013,106 @@ describe("AgentSession message pipeline", () => {
 			authStorage.close();
 		}
 	});
+	it("cuts to one persisted scene and starts its continuation from canonical context", async () => {
+		using tempDir = TempDir.createSync("@pi-scene-cut-");
+		const api = "test-scene-cut";
+		const contexts: Context[] = [];
+		registerCustomApi(api, (_model, context) => {
+			contexts.push(context);
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				if (contexts.length === 1) {
+					const message = createAssistantMessage("");
+					const toolCall = {
+						type: "toolCall",
+						id: "call-cut-1",
+						name: "cut",
+						arguments: {
+							label: "Verification",
+							state: ["The source change is complete"],
+							objective: "Run the focused proof",
+							exit: "The contract is observed",
+						},
+					} as const;
+					message.content = [toolCall];
+					message.stopReason = "toolUse";
+					stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
+					stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: toolCall as never, partial: message });
+					stream.push({ type: "done", reason: "toolUse", message });
+					return;
+				}
+				const message = createAssistantMessage("scene complete");
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		});
+		const model = buildModel({
+			id: "local-scene-cut-model",
+			name: "Local Scene Cut Model",
+			api,
+			provider: "ollama",
+			baseUrl: "http://127.0.0.1:11434",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		const sessionManager = SessionManager.inMemory(tempDir.path());
+		const { session } = await createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			sessionManager,
+			authStorage,
+			modelRegistry,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			model,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			toolNames: ["cut"],
+		});
+		try {
+			const transcriptSessionId = sessionManager.getSessionId();
+			const providerSessionId = session.sessionId;
+			const cwd = sessionManager.getCwd();
+			const activeModel = session.model;
+
+			await session.sendUserMessage("pre-cut dialogue");
+
+			expect(contexts).toHaveLength(2);
+			const sceneRequest = JSON.stringify(contexts[1]?.messages);
+			expect(sceneRequest).toContain("The source change is complete");
+			expect(sceneRequest).toContain("Run the focused proof");
+			expect(sceneRequest).not.toContain("pre-cut dialogue");
+			const transcript = JSON.stringify(sessionManager.buildSessionContext({ transcript: true }).messages);
+			expect(transcript).toContain("pre-cut dialogue");
+			expect(sessionManager.getSessionId()).toBe(transcriptSessionId);
+			expect(session.sessionId).not.toBe(providerSessionId);
+			expect(sessionManager.getCwd()).toBe(cwd);
+			expect(session.model).toBe(activeModel);
+
+			const entries = sessionManager.getEntries();
+			const boundary = entries.findIndex(entry => entry.type === "reset_boundary");
+			const sceneEntry = entries.findIndex(entry => entry.type === "custom" && entry.customType === "scene-cut");
+			const sceneMessage = entries.findIndex(
+				entry => entry.type === "custom_message" && entry.customType === "scene-cut-message",
+			);
+			expect(boundary).toBeGreaterThanOrEqual(0);
+			expect(sceneEntry).toBeGreaterThan(boundary);
+			expect(sceneMessage).toBeGreaterThan(sceneEntry);
+		} finally {
+			await session.dispose();
+			authStorage.close();
+		}
+	});
 	it("applies a tool_call input revision at arg-prep time across events, execution, and history", async () => {
 		// End-to-end wiring for the loop-level tool_call emission (session
 		// #beforeToolCall): the handler fires once per dispatch (the wrapper's

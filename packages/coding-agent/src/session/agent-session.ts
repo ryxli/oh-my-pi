@@ -176,6 +176,7 @@ import planModeActivePrompt from "../prompts/system/plan-mode-active.md" with { 
 import planModeReferencePrompt from "../prompts/system/plan-mode-reference.md" with { type: "text" };
 import planModeToolDecisionReminderPrompt from "../prompts/system/plan-mode-tool-decision-reminder.md" with { type: "text" };
 import rewindReportTemplate from "../prompts/system/rewind-report.md" with { type: "text" };
+import sceneCutTemplate from "../prompts/system/scene-cut.md" with { type: "text" };
 import sideChannelNoToolsReminder from "../prompts/system/side-channel-no-tools.md" with { type: "text" };
 import skillfulNoticePrompt from "../prompts/system/skillful-notice.md" with { type: "text" };
 import vibeModeActivePrompt from "../prompts/system/vibe-mode-active.md" with { type: "text" };
@@ -337,6 +338,7 @@ import {
 	toRestoredQueuedMessage,
 } from "./queued-messages";
 import type { ServingModel } from "./retry-fallback-chains";
+import { SCENE_CUT_CUSTOM_TYPE, SCENE_CUT_MESSAGE_TYPE, type SceneCut, SceneCutCoordinator } from "./scene-cut";
 import {
 	type AdvisorStats,
 	type AdvisorStatusOverviewEntry,
@@ -782,6 +784,7 @@ export class AgentSession {
 	#checkpointState: CheckpointState | undefined = undefined;
 	#pendingRewindReport: string | undefined = undefined;
 	#lastCompletedRewind: CompletedRewindState | undefined = undefined;
+	readonly #sceneCut = new SceneCutCoordinator();
 	#rewoundToolResultIds = new Set<string>();
 	#lastSuccessfulYieldToolCallId: string | undefined = undefined;
 	/**
@@ -3195,6 +3198,11 @@ export class AgentSession {
 			// repeatedly on provider errors otherwise leaves no actionable trace
 			// outside the session transcript (issue #6177).
 			logProviderTurnError(msg);
+			if (this.#sceneCut.hasStaged) {
+				maintenanceRoute("scene-cut-staged");
+				await emitAgentEndNotification();
+				return;
+			}
 
 			// Invalidate GitHub Copilot credentials on a hard auth failure (401, or an
 			// expired/revoked token) so stale tokens aren't reused on the next request.
@@ -3547,6 +3555,18 @@ export class AgentSession {
 		})();
 		this.#trackPostPromptTask(scheduled);
 	}
+	#scheduleSceneCutApplication(): void {
+		void (async () => {
+			await Bun.sleep(0);
+			if (this.#isDisposed || !this.#sceneCut.hasStaged) return;
+			await this.#drainInFlightEventHandlers();
+			await this.#applyPendingSceneCut();
+		})().catch(error => {
+			logger.warn("Failed to apply staged scene cut", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+	}
 
 	#skipAgentContinue(reason: AgentContinueSkipReason, request: ScheduledAgentContinueRequest): void {
 		logger.debug("agent.continue skipped after scheduling", {
@@ -3594,6 +3614,7 @@ export class AgentSession {
 			for (;;) {
 				try {
 					await this.agent.continue(signal);
+					if (this.#sceneCut.hasStaged) this.#scheduleSceneCutApplication();
 					return { status: "completed" };
 				} catch (error) {
 					if (!(error instanceof AgentBusyError)) throw error;
@@ -3729,7 +3750,7 @@ export class AgentSession {
 			// at invocation (past the abort check below), so an aborted continuation queues
 			// nothing; scoped to this request via prependMessages, never the shared queue.
 			const eagerNudges = this.#todo.buildPostCompactionEagerNudges();
-			await this.#promptWithMessage(
+			const dispatched = await this.#promptWithMessage(
 				{
 					role: "developer",
 					content: [{ type: "text", text: autoContinuePrompt }],
@@ -3746,6 +3767,7 @@ export class AgentSession {
 					prependMessages: eagerNudges.length > 0 ? eagerNudges : undefined,
 				},
 			);
+			if (dispatched && this.#sceneCut.hasStaged) this.#scheduleSceneCutApplication();
 		};
 		this.#schedulePostPromptTask(
 			async signal => {
@@ -3831,6 +3853,9 @@ export class AgentSession {
 			this.#advisors.prepareForTerminalYieldAdvisorDrain();
 			this.#markTerminalYieldToolCall(ctx.toolCall.id);
 			this.#synchronouslyTerminatedYieldToolCallIds.add(ctx.toolCall.id);
+			this.agent.abort(TERMINAL_TOOL_RESULT_ABORT_REASON);
+		}
+		if (ctx.toolCall.name === "cut" && !ctx.isError && this.#sceneCut.hasStaged) {
 			this.agent.abort(TERMINAL_TOOL_RESULT_ABORT_REASON);
 		}
 		return this.#ttsr.afterToolCall(ctx);
@@ -4664,6 +4689,61 @@ export class AgentSession {
 			closedProviderSessions,
 		};
 	}
+	/** Stage a scene cut for application only after the current model turn settles. */
+	stageSceneCut(cut: SceneCut): void {
+		this.#sceneCut.stage(cut);
+	}
+
+	async #applyPendingSceneCut(): Promise<void> {
+		const cut = this.#sceneCut.beginApply();
+		if (!cut) return;
+
+		try {
+			const reset = await this.resetSessionContext({ preserveAsyncJobs: true });
+			if (!reset) return;
+
+			const content = prompt.render(sceneCutTemplate, { ...cut });
+			const message: CustomMessage<SceneCut> = {
+				role: "custom",
+				customType: SCENE_CUT_MESSAGE_TYPE,
+				content,
+				display: true,
+				details: cut,
+				attribution: "agent",
+				timestamp: Date.now(),
+			};
+			this.sessionManager.appendCustomEntry(SCENE_CUT_CUSTOM_TYPE, cut);
+			this.sessionManager.appendCustomMessageEntry(
+				message.customType,
+				message.content,
+				message.display,
+				message.details,
+				message.attribution,
+			);
+			this.agent.appendMessage(message);
+			this.#sceneCut.completeApply();
+
+			this.#beginInFlight();
+			try {
+				if (await this.#runUsageAwarePreflightForNextModelCall()) {
+					await this.agent.continue();
+					if (!this.#sceneCut.hasStaged) {
+						await this.#waitForPostPromptRecovery();
+					}
+					if (this.#sceneCut.hasStaged) {
+						await this.#drainInFlightEventHandlers();
+						await this.#applyPendingSceneCut();
+					}
+				}
+			} finally {
+				this.#usagePreflightReadyForNextModelCall = false;
+				this.#endInFlight();
+			}
+		} finally {
+			this.#sceneCut.completeApply();
+			this.yieldQueue.requestIdleFlush();
+		}
+	}
 
 	/**
 	 * Reset the current conversation in place: drop every message, queued turn,
@@ -4683,7 +4763,10 @@ export class AgentSession {
 	 * Returns `undefined` without mutating anything while a response is
 	 * streaming or a foreground bash/python execution is in flight.
 	 */
-	async resetSessionContext(): Promise<ResetSessionContextResult | undefined> {
+	async resetSessionContext(options?: {
+		preserveAsyncJobs?: boolean;
+	}): Promise<ResetSessionContextResult | undefined> {
+		const preserveAsyncJobs = options?.preserveAsyncJobs === true;
 		// Refuse while a response streams OR a foreground user bash/python
 		// execution is in flight: those complete via recordBashResult()/
 		// recordPythonResult(), which append directly to agent.state when not
@@ -4694,18 +4777,11 @@ export class AgentSession {
 		const droppedCount = this.agent.state.messages.length;
 
 		// Tear down the same per-turn runtime state that newSession() resets across
-		// a conversation boundary, so work scheduled from the pre-reset turn cannot
-		// re-enter the cleared context:
-		//   - bump #promptGeneration + drain post-prompt tasks so an already-queued
-		//     post-prompt continuation (recovery can be scheduled after agent_end
-		//     while isStreaming is false) sees a stale generation and skips
-		//     (mirrors abort()).
-		//   - cancel this agent's async bash/task jobs so their completions can't
-		//     re-deliver stale tool output into the cleared conversation
-		//     (mirrors newSession()).
+		// a conversation boundary. A scene cut retains owner-scoped asynchronous
+		// work and its delivery epoch, but still invalidates obsolete continuations.
 		this.#promptGeneration++;
 		await this.#cancelPostPromptTasks();
-		this.#cancelOwnAsyncJobs();
+		if (!preserveAsyncJobs) this.#cancelOwnAsyncJobs();
 
 		// Drop the conversation: messages, queued steers/follow-ups, pending tool
 		// calls, and error state. agent.reset() keeps the model and system prompt.
@@ -6110,6 +6186,10 @@ export class AgentSession {
 			this.#toolChoiceQueue.removeByLabel("eager-todo");
 			this.#toolChoiceQueue.removeByLabel("external-thinking");
 		}
+		if (dispatched && this.#sceneCut.hasStaged) {
+			await this.#drainInFlightEventHandlers();
+			await this.#applyPendingSceneCut();
+		}
 		if (!dispatched && message.role === "user") {
 			// An abort (Esc) or preflight denial raced turn setup: the prompt never
 			// reached the agent or the session file. Hand it back to the host so the
@@ -6192,10 +6272,15 @@ export class AgentSession {
 			timestamp: Date.now(),
 		};
 
-		return this.#promptWithMessage(customMessage, textContent, {
+		const dispatched = await this.#promptWithMessage(customMessage, textContent, {
 			...options,
 			prependMessages: keywordNotices.length > 0 ? keywordNotices : undefined,
 		});
+		if (dispatched && this.#sceneCut.hasStaged) {
+			await this.#drainInFlightEventHandlers();
+			await this.#applyPendingSceneCut();
+		}
+		return dispatched;
 	}
 
 	async #promptWithMessage(
@@ -6435,7 +6520,7 @@ export class AgentSession {
 			} finally {
 				this.#stats.setPendingSnapshot(undefined);
 			}
-			if (!options?.skipPostPromptRecoveryWait) {
+			if (!this.#sceneCut.hasStaged && !options?.skipPostPromptRecoveryWait) {
 				await this.#waitForPostPromptRecovery(generation);
 			}
 			return true;
@@ -6889,10 +6974,11 @@ export class AgentSession {
 		const prependMessages = queuedMessages.slice(0, -1);
 		const textContent = this.#getCustomMessageTextContent(message);
 		try {
-			await this.#promptWithMessage(message, textContent, {
+			const dispatched = await this.#promptWithMessage(message, textContent, {
 				prependMessages,
 				skipPostPromptRecoveryWait: true,
 			});
+			if (dispatched && this.#sceneCut.hasStaged) this.#scheduleSceneCutApplication();
 		} catch (error) {
 			this.#pendingNextTurnMessages = [...queuedMessages, ...this.#pendingNextTurnMessages];
 			throw error;

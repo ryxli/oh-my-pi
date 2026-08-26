@@ -452,6 +452,60 @@ describe("AgentSession owner-routed async delivery", () => {
 		expect(session.hasPendingAsyncWork()).toBe(false);
 	});
 
+	it("preserves owner async work across a scene reset while ordinary reset cancels it", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const manager = new AsyncJobManager({ retentionMs: 60_000 });
+		AsyncJobManager.setInstance(manager);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage),
+			agentId: "Main",
+			ownedAsyncJobManager: manager,
+		});
+
+		const preserved = Promise.withResolvers<string>();
+		manager.register("task", "scene work", () => preserved.promise, {
+			id: "scene-job",
+			ownerId: "Main",
+		});
+		expect(await session.resetSessionContext({ preserveAsyncJobs: true })).toBeTruthy();
+		expect(manager.getJob("scene-job")?.status).toBe("running");
+
+		preserved.resolve("SCENE ASYNC RESULT");
+		await session.settleAsyncWork();
+		expect(
+			mock.calls.some(call =>
+				call.context.messages.some(message =>
+					typeof message.content === "string"
+						? message.content.includes("SCENE ASYNC RESULT")
+						: message.content.some(
+								content => content.type === "text" && content.text.includes("SCENE ASYNC RESULT"),
+							),
+				),
+			),
+		).toBe(true);
+
+		const cancelled = Promise.withResolvers<string>();
+		manager.register("task", "ordinary reset work", () => cancelled.promise, {
+			id: "clear-job",
+			ownerId: "Main",
+		});
+		expect(await session.resetSessionContext()).toBeTruthy();
+		expect(manager.getJob("clear-job")?.status).toBe("cancelled");
+	});
+
 	it("keeps delivery pending until the queued follow-up is injected", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });

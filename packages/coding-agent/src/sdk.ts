@@ -1812,6 +1812,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			requireYieldTool: options.requireYieldTool,
 			prewalkArmed: options.prewalk !== undefined,
 			taskDepth: options.taskDepth ?? 0,
+			stageSceneCut: cut => session.stageSceneCut(cut),
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
 			sessionManager,
 			getEvalKernelOwnerId: () => evalKernelOwnerId,
