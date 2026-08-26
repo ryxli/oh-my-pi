@@ -9,7 +9,7 @@ import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
 import { EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
-import { logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
+import { isEnoent, logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobManager } from "../async";
 import type { Rule } from "../capability/rule";
 import type { EffectiveExtensionRoots } from "../capability/types";
@@ -41,6 +41,7 @@ import type { MCPManager } from "../mcp/manager";
 import type { MnemopiSessionState } from "../mnemopi/state";
 import { initializeExtensions } from "../modes/runtime-init";
 import subagentAsyncPendingTemplate from "../prompts/system/subagent-async-pending.md" with { type: "text" };
+import subagentExecuteWriteReminderTemplate from "../prompts/system/subagent-execute-write-reminder.md" with { type: "text" };
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
 import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-lifecycle";
@@ -398,6 +399,10 @@ export interface ExecutorOptions {
 	assignment?: string;
 	/** Shared background from the task call (`task.batch`), rendered into the subagent's system prompt. */
 	context?: string;
+	/** Frozen execution mode rejects a successful terminal yield unless a declared target changes. */
+	mode?: "execute";
+	/** Workspace-relative files a frozen execution task must change. */
+	writes?: string[];
 	/**
 	 * The session's active overall plan, handed off so subagents spawned during
 	 * plan execution share the same plan context as the main agent. Omitted when
@@ -559,6 +564,91 @@ export interface ExecutorOptions {
 	cleanupGraceMs?: number;
 }
 
+interface ExecuteWriteSnapshot {
+	declaredPath: string;
+	filePath: string;
+	existed: boolean;
+	digest?: string;
+}
+
+function isWithinDirectory(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+async function resolveExecuteWritePath(
+	cwd: string,
+	declaredPath: string,
+): Promise<{ filePath: string; existed: boolean }> {
+	if (path.isAbsolute(declaredPath) || path.win32.isAbsolute(declaredPath)) {
+		throw new Error(`Declared execute target \`${declaredPath}\` must be workspace-relative, not absolute.`);
+	}
+	const resolvedCwd = path.resolve(cwd);
+	const filePath = path.resolve(resolvedCwd, declaredPath);
+	if (!isWithinDirectory(resolvedCwd, filePath)) {
+		throw new Error(`Declared execute target \`${declaredPath}\` traverses outside the child workspace.`);
+	}
+	const realCwd = await fs.realpath(resolvedCwd);
+	let existingPath = filePath;
+	let existed = true;
+	try {
+		await fs.lstat(existingPath);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+		existed = false;
+		while (true) {
+			const parent = path.dirname(existingPath);
+			if (parent === existingPath) {
+				throw new Error(`Declared execute target \`${declaredPath}\` has no workspace parent.`);
+			}
+			existingPath = parent;
+			try {
+				await fs.lstat(existingPath);
+				break;
+			} catch (parentError) {
+				if (!isEnoent(parentError)) throw parentError;
+			}
+		}
+	}
+	const realExistingPath = await fs.realpath(existingPath);
+	if (!isWithinDirectory(realCwd, realExistingPath)) {
+		throw new Error(
+			`Declared execute target \`${declaredPath}\` resolves outside the child workspace through a symlink.`,
+		);
+	}
+	if (existed) {
+		const targetStat = await fs.stat(realExistingPath);
+		if (!targetStat.isFile()) {
+			throw new Error(`Declared execute target \`${declaredPath}\` must be a file.`);
+		}
+		return { filePath: realExistingPath, existed: true };
+	}
+	const parentStat = await fs.stat(existingPath);
+	if (!parentStat.isDirectory()) {
+		throw new Error(`Declared execute target \`${declaredPath}\` has a non-directory parent.`);
+	}
+	return { filePath, existed: false };
+}
+
+async function snapshotExecuteWrite(cwd: string, declaredPath: string): Promise<ExecuteWriteSnapshot> {
+	const target = await resolveExecuteWritePath(cwd, declaredPath);
+	if (!target.existed) return { declaredPath, ...target };
+	const digest = new Bun.CryptoHasher("sha256").update(await Bun.file(target.filePath).arrayBuffer()).digest("hex");
+	return { declaredPath, ...target, digest };
+}
+
+async function snapshotExecuteWrites(cwd: string, writes: readonly string[]): Promise<ExecuteWriteSnapshot[]> {
+	return Promise.all(writes.map(write => snapshotExecuteWrite(cwd, write)));
+}
+
+async function executeWritesChanged(cwd: string, initial: readonly ExecuteWriteSnapshot[]): Promise<boolean> {
+	for (const snapshot of initial) {
+		const current = await snapshotExecuteWrite(cwd, snapshot.declaredPath);
+		if (current.existed !== snapshot.existed || current.digest !== snapshot.digest) return true;
+	}
+	return false;
+}
+
 function parseStringifiedJson(value: unknown): unknown {
 	if (typeof value !== "string") return value;
 	const trimmed = value.trim();
@@ -714,9 +804,15 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 					validation && !validation.success
 						? summarizeValidationFailure(validation, completeData, validator?.requiredFields ?? [])
 						: assembled.schemaOverridden
-							? { message: SUBAGENT_WARNING_SCHEMA_OVERRIDDEN, missingRequired: [] }
+							? {
+									message: SUBAGENT_WARNING_SCHEMA_OVERRIDDEN,
+									missingRequired: [],
+								}
 							: schemaError
-								? { message: `invalid output schema: ${schemaError}`, missingRequired: [] }
+								? {
+										message: `invalid output schema: ${schemaError}`,
+										missingRequired: [],
+									}
 								: undefined;
 				if (includeStructuredOutput) {
 					structuredOutput =
@@ -729,7 +825,13 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 									error: schemaError ? `invalid output schema: ${schemaError}` : undefined,
 								}
 							: failure
-								? { source, mode, status: "invalid", data: completeData, error: failure.message }
+								? {
+										source,
+										mode,
+										status: "invalid",
+										data: completeData,
+										error: failure.message,
+									}
 								: { source, mode, status: "valid", data: completeData };
 				}
 				const mustReject =
@@ -768,11 +870,19 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 		if (fallback) {
 			const { validator } = buildOutputValidator(outputSchema);
 			const completeData = parseStringifiedJson(fallback.data ?? null);
-			const result = validator?.validate(completeData) ?? { success: true as const };
+			const result = validator?.validate(completeData) ?? {
+				success: true as const,
+			};
 			if (!result.success) {
 				const summary = summarizeValidationFailure(result, completeData, validator?.requiredFields ?? []);
 				if (includeStructuredOutput) {
-					structuredOutput = { source, mode, status: "invalid", data: completeData, error: summary.message };
+					structuredOutput = {
+						source,
+						mode,
+						status: "invalid",
+						data: completeData,
+						error: summary.message,
+					};
 				}
 				const outcome = buildSchemaViolationOutcome(summary, completeData);
 				rawOutput = outcome.rawOutput;
@@ -809,7 +919,14 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 		}
 	}
 
-	return { rawOutput, exitCode, stderr, abortedViaYield, hasYield, structuredOutput };
+	return {
+		rawOutput,
+		exitCode,
+		stderr,
+		abortedViaYield,
+		hasYield,
+		structuredOutput,
+	};
 }
 
 /**
@@ -905,7 +1022,12 @@ export function createMCPProxyTools(mcpManager: MCPManager): CustomTool[] {
 					.find(t => t.mcpServerName === serverName && t.mcpToolName === mcpToolName);
 				if (!source?.execute) {
 					return {
-						content: [{ type: "text" as const, text: `MCP error: tool ${mcpToolName} no longer available` }],
+						content: [
+							{
+								type: "text" as const,
+								text: `MCP error: tool ${mcpToolName} no longer available`,
+							},
+						],
 						details: { serverName, mcpToolName, isError: true },
 					};
 				}
@@ -1017,6 +1139,8 @@ interface RunMonitorArgs {
 	softRequestBudgetNotice: boolean;
 	/** Wall-clock cap in ms; 0 disables the timer. */
 	maxRuntimeMs: number;
+	/** Execute-mode yields are evaluated by the driver before the session terminates. */
+	executeMode: boolean;
 }
 
 /**
@@ -1031,6 +1155,10 @@ interface SubagentRunMonitor {
 	readonly accumulatedUsage: Usage;
 	hasUsage(): boolean;
 	yieldCalled(): boolean;
+	/** Whether the latest recorded terminal yield is successful. */
+	lastYieldSucceeded(): boolean;
+	/** Unlatch a successful yield so the same live session can receive one correction turn. */
+	invalidateYieldForCorrection(): void;
 	runtimeLimitExceeded(): boolean;
 	/** True once the soft-budget stop fired: the free-running turn was aborted and the run is being driven to a forced final yield. */
 	budgetStopRequested(): boolean;
@@ -1579,7 +1707,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 							// run behind the quiescence barrier instead of completing
 							// it (see requestYieldTurnStop).
 							requestYieldTurnStop();
-						} else {
+						} else if (!(event.toolName === "yield" && args.executeMode)) {
 							requestAbort("terminate");
 						}
 					}
@@ -1699,7 +1827,11 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 								// never take down event processing (which escalates to terminate).
 								const notice = buildBudgetNotice(progress.requests, softRequestBudget);
 								void Promise.resolve()
-									.then(() => steerSession.sendUserMessage(notice, { deliverAs: "steer" }))
+									.then(() =>
+										steerSession.sendUserMessage(notice, {
+											deliverAs: "steer",
+										}),
+									)
 									.catch(err => {
 										logger.warn("Subagent budget steer failed", {
 											error: err instanceof Error ? err.message : String(err),
@@ -1860,6 +1992,23 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		accumulatedUsage,
 		hasUsage: () => hasUsage,
 		yieldCalled: () => yieldCalled,
+		lastYieldSucceeded: () => {
+			const yields = progress.extractedToolData?.yield as YieldItem[] | undefined;
+			const lastYield = yields?.[yields.length - 1];
+			return lastYield?.status === "success" && !Array.isArray(lastYield.type);
+		},
+		invalidateYieldForCorrection: () => {
+			const yields = progress.extractedToolData?.yield as YieldItem[] | undefined;
+			if (yields) {
+				for (let index = yields.length - 1; index >= 0; index--) {
+					if (!Array.isArray(yields[index]?.type)) {
+						yields.splice(index, 1);
+						break;
+					}
+				}
+			}
+			yieldCalled = false;
+		},
 		runtimeLimitExceeded: () => runtimeLimitExceeded,
 		terminalError: () => terminalError,
 		hasExplicitAbortReason: () =>
@@ -1919,6 +2068,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		scheduleProgress,
 		finish: () => {
 			resolved = true;
+
 			listenerController.abort();
 			if (runtimeTimeoutId !== undefined) {
 				clearTimeout(runtimeTimeoutId);
@@ -1932,14 +2082,19 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	};
 }
 
+const MAX_YIELD_RETRIES = 3;
+
+interface ExecuteYieldGuard {
+	cwd: string;
+	initialSnapshots: ExecuteWriteSnapshot[];
+}
+
 interface DriveOutcome {
 	exitCode: number;
 	error?: string;
 	aborted: boolean;
 	abortReasonText?: string;
 }
-
-const MAX_YIELD_RETRIES = 3;
 
 /**
  * Drive one assignment through a live session: send the prompt, wait for idle,
@@ -1952,6 +2107,7 @@ async function driveSessionToYield(
 	session: AgentSession,
 	monitor: SubagentRunMonitor,
 	task: string,
+	executeGuard?: ExecuteYieldGuard,
 ): Promise<DriveOutcome> {
 	using _keepalive = new EventLoopKeepalive();
 	const abortSignal = monitor.abortSignal;
@@ -2081,6 +2237,7 @@ async function driveSessionToYield(
 		// injected turns just multiply the failure noise; the teardown reap
 		// still cancels and awaits their jobs before worktree capture.
 		let asyncPendingNoticeSent = false;
+		let executeCorrectionSent = false;
 		while (!abortSignal.aborted) {
 			if (!monitor.yieldCalled()) {
 				await runYieldLadder();
@@ -2091,7 +2248,36 @@ async function driveSessionToYield(
 			// Let the parked yield's turn-stop session abort settle before
 			// prompting again (mirrors waitForBudgetStop).
 			await awaitAbortable(monitor.waitForYieldTurnStop());
-			if (!session.hasPendingAsyncWork()) break;
+			if (!session.hasPendingAsyncWork()) {
+				if (executeGuard && monitor.lastYieldSucceeded()) {
+					let changed: boolean;
+					try {
+						changed = await executeWritesChanged(executeGuard.cwd, executeGuard.initialSnapshots);
+					} catch (snapshotError) {
+						exitCode = 1;
+						error ??= `Unable to verify declared execute targets: ${snapshotError instanceof Error ? snapshotError.message : String(snapshotError)}`;
+						break;
+					}
+					if (!changed) {
+						if (executeCorrectionSent) {
+							exitCode = 1;
+							error ??= "Execute task yielded successfully twice without changing a declared write target.";
+							break;
+						}
+						executeCorrectionSent = true;
+						monitor.invalidateYieldForCorrection();
+						await awaitAbortable(
+							session.prompt(subagentExecuteWriteReminderTemplate, {
+								attribution: "agent",
+								synthetic: true,
+							}),
+						);
+						await awaitAbortable(session.waitForIdle());
+						continue;
+					}
+				}
+				break;
+			}
 			if (!asyncPendingNoticeSent) {
 				asyncPendingNoticeSent = true;
 				const running = session.getAsyncJobSnapshot()?.running ?? [];
@@ -2194,7 +2380,13 @@ async function driveSessionToYield(
 
 interface FinalizeRunArgs {
 	monitor: SubagentRunMonitor;
-	done: { exitCode: number; error?: string; aborted?: boolean; abortReason?: string; durationMs: number };
+	done: {
+		exitCode: number;
+		error?: string;
+		aborted?: boolean;
+		abortReason?: string;
+		durationMs: number;
+	};
 	index: number;
 	id: string;
 	agent: AgentDefinition;
@@ -2566,6 +2758,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			softRequestBudget: 0,
 			softRequestBudgetNotice: false,
 			maxRuntimeMs,
+			executeMode: false,
 		});
 
 		const startedPayload = {
@@ -2720,9 +2913,14 @@ export async function finalizeSubagentLifecycle(args: {
 				// decision is durable and a restart cannot rediscover the transcript
 				// as a revivable parked agent.
 				try {
-					await AgentLifecycleManager.global().release(args.id, ref, { tombstone: true });
+					await AgentLifecycleManager.global().release(args.id, ref, {
+						tombstone: true,
+					});
 				} catch (error) {
-					logger.warn("runSubagent: failed to persist kill tombstone", { id: args.id, error: String(error) });
+					logger.warn("runSubagent: failed to persist kill tombstone", {
+						id: args.id,
+						error: String(error),
+					});
 					registry.setStatus(args.id, "aborted", ref);
 					registry.detachSession(args.id, ref);
 					await disposeSession();
@@ -2839,6 +3037,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		softRequestBudget: 0,
 		softRequestBudgetNotice: false,
 		maxRuntimeMs: options.maxRuntimeMs ?? 0,
+		executeMode: false,
 	});
 
 	const startedPayload = {
@@ -2873,7 +3072,11 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 
 	return finalizeRunResult({
 		monitor,
-		done: { ...outcome, abortReason: outcome.abortReasonText, durationMs: Date.now() - startTime },
+		done: {
+			...outcome,
+			abortReason: outcome.abortReasonText,
+			durationMs: Date.now() - startTime,
+		},
 		index,
 		id,
 		agent,
@@ -2945,6 +3148,50 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		};
 	}
 
+	let executeGuard: ExecuteYieldGuard | undefined;
+	let executePreparationError: string | undefined;
+	if (options.mode === "execute") {
+		if (
+			!Array.isArray(options.writes) ||
+			options.writes.length === 0 ||
+			options.writes.some(write => typeof write !== "string" || write.trim() === "")
+		) {
+			executePreparationError = "Execute mode requires a non-empty writes list of workspace-relative file paths.";
+		} else {
+			try {
+				executeGuard = {
+					cwd: worktree ?? cwd,
+					initialSnapshots: await snapshotExecuteWrites(worktree ?? cwd, options.writes),
+				};
+			} catch (snapshotError) {
+				executePreparationError = snapshotError instanceof Error ? snapshotError.message : String(snapshotError);
+			}
+		}
+	} else if (options.writes !== undefined) {
+		executePreparationError = 'Declared writes require mode: "execute".';
+	}
+	if (executePreparationError) {
+		return {
+			index,
+			id,
+			agent: agent.name,
+			agentSource: agent.source,
+			task,
+			assignment,
+			description: options.description,
+			exitCode: 1,
+			output: "",
+			stderr: executePreparationError,
+			truncated: false,
+			durationMs: Date.now() - startTime,
+			tokens: 0,
+			requests: 0,
+			modelOverride,
+			modelRole,
+			error: executePreparationError,
+		};
+	}
+
 	// Set up artifact paths and write input file upfront if artifacts dir provided
 	let subtaskSessionFile: string | undefined;
 	if (options.artifactsDir) {
@@ -2970,7 +3217,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			...(worktree !== undefined ? { "workspace.additionalDirectories": [] } : undefined),
 			...(advisorSelection ? { "advisor.enabled": true } : undefined),
 			...(advisorSelection?.model
-				? { modelRoles: { ...settings.getModelRoles(), advisor: advisorSelection.model } }
+				? {
+						modelRoles: {
+							...settings.getModelRoles(),
+							advisor: advisorSelection.model,
+						},
+					}
 				: undefined),
 		},
 		options.parentServiceTier,
@@ -3054,6 +3306,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		softRequestBudget,
 		softRequestBudgetNotice,
 		maxRuntimeMs,
+		executeMode: options.mode === "execute",
 	});
 	const progress = monitor.progress;
 	let unsubscribe: (() => void) | null = null;
@@ -3464,9 +3717,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					// every tool (including `yield`) in the revived agent (issue #8824).
 					await initializeExtensions(revived, {
 						reportSendError: (action, err) =>
-							logger.error("Extension send failed", { action, error: err.message }),
+							logger.error("Extension send failed", {
+								action,
+								error: err.message,
+							}),
 						reportRuntimeError: err =>
-							logger.error("Extension error", { path: err.extensionPath, error: err.error }),
+							logger.error("Extension error", {
+								path: err.extensionPath,
+								error: err.error,
+							}),
 					});
 					AgentRegistry.global().syncSessionStatus(id, revived);
 					installIrcWakeTurnMonitor(revived);
@@ -3592,7 +3851,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					},
 				);
 				extensionRunner.onError(err => {
-					logger.error("Extension error", { path: err.extensionPath, error: err.error });
+					logger.error("Extension error", {
+						path: err.extensionPath,
+						error: err.error,
+					});
 				});
 				await awaitAbortable(extensionRunner.emit({ type: "session_start" }));
 				while (pendingExtensionMessages.length > 0) {
@@ -3620,7 +3882,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 
 			readyAt = performance.now();
-			const outcome = await driveSessionToYield(session, monitor, task);
+			const outcome = await driveSessionToYield(session, monitor, task, executeGuard);
 			exitCode = outcome.exitCode;
 			error = outcome.error;
 			aborted = outcome.aborted;

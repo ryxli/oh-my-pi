@@ -23,6 +23,21 @@ describe("task schema (single-spawn)", () => {
 		expect(parsed instanceof type.errors).toBe(false);
 		if (!(parsed instanceof type.errors)) {
 			expect(parsed.agent).toBe("task");
+			expect(parsed.mode).toBeUndefined();
+			expect(parsed.writes).toBeUndefined();
+		}
+	});
+
+	it("accepts frozen execute mode with declared writes", () => {
+		const parsed = taskSchema({
+			task: "Update the target.",
+			mode: "execute",
+			writes: ["src/target.ts"],
+		});
+		expect(parsed instanceof type.errors).toBe(false);
+		if (!(parsed instanceof type.errors)) {
+			expect(parsed.mode).toBe("execute");
+			expect(parsed.writes).toEqual(["src/target.ts"]);
 		}
 	});
 
@@ -100,5 +115,14 @@ describe("task spawn validation", () => {
 	it("rejects a missing task", async () => {
 		const text = await executeText({ agent: "scout" });
 		expect(text).toContain("Missing `task`");
+	});
+
+	it("requires declared writes only for execute mode", async () => {
+		expect(await executeText({ agent: "task", task: "Work.", mode: "execute" })).toContain(
+			"requires a non-empty `writes`",
+		);
+		expect(await executeText({ agent: "task", task: "Work.", writes: ["src/target.ts"] })).toContain(
+			'provides `writes` without `mode: "execute"`',
+		);
 	});
 });

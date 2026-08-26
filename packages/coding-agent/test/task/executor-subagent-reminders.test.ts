@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { AgentBusyError, type AgentTelemetryConfig, type Tracer } from "@oh-my-pi/pi-agent-core";
 import { type AssistantMessage, Effort } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -14,7 +16,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, TempDir } from "@oh-my-pi/pi-utils";
 
 function createAssistantStopMessage(text: string): AssistantMessage {
 	return {
@@ -34,6 +36,26 @@ function createAssistantStopMessage(text: string): AssistantMessage {
 		stopReason: "stop",
 		timestamp: Date.now(),
 	};
+}
+
+function emitSuccessfulYield(
+	emit: (event: AgentSessionEvent) => void,
+	state: { messages: AssistantMessage[] },
+	data: unknown,
+): void {
+	const assistant = createAssistantStopMessage("Result submitted.");
+	state.messages.push(assistant);
+	emit({ type: "message_end", message: assistant });
+	emit({
+		type: "tool_execution_end",
+		toolCallId: `tool-yield-${state.messages.length}`,
+		toolName: "yield",
+		result: {
+			content: [{ type: "text", text: "Result submitted." }],
+			details: { status: "success", data },
+		},
+		isError: false,
+	});
 }
 
 function createMockSession(
@@ -76,6 +98,7 @@ function createMockSession(
 			await onPrompt({ text, options, promptIndex, emit, state });
 		},
 		waitForIdle: async () => {},
+		hasPendingAsyncWork: () => false,
 		prepareForHeadlessAdvisorDrain: () => {},
 		waitForAdvisorCatchup: async () => true,
 		getLastAssistantMessage: () => state.messages[state.messages.length - 1],
@@ -278,6 +301,103 @@ describe("runSubprocess yield reminders", () => {
 		expect(promptOptions[1]?.attribution).toBe("agent");
 		expect(result.output).toContain('"done": true');
 		expect(result.output.includes("SYSTEM WARNING")).toBe(false);
+	});
+
+	it("keeps ordinary tasks successful after an unchanged yield", async () => {
+		const session = createMockSession(({ emit, state }) => {
+			emitSuccessfulYield(emit, state, { done: true });
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-ordinary-unchanged" });
+
+		expect(result.exitCode).toBe(0);
+		expect(result.output).toContain('"done": true');
+	});
+
+	it("rejects absolute, traversal, directory, and escaping symlink targets before child execution", async () => {
+		using workspace = TempDir.createSync("@pi-execute-write-workspace-");
+		using outside = TempDir.createSync("@pi-execute-write-outside-");
+		await fs.mkdir(workspace.join("directory"));
+		await fs.symlink(outside.path(), workspace.join("escape"));
+		const createSessionSpy = mockCreateAgentSession(createMockSession(() => {}));
+
+		const cases = [
+			{ writes: ["/tmp/outside.ts"], expected: "must be workspace-relative" },
+			{ writes: ["../outside.ts"], expected: "traverses outside" },
+			{ writes: ["directory"], expected: "must be a file" },
+			{ writes: ["escape/created.ts"], expected: "resolves outside" },
+		];
+		for (const [index, testCase] of cases.entries()) {
+			const result = await runSubprocess({
+				...baseOptions,
+				cwd: workspace.path(),
+				id: `subagent-invalid-execute-target-${index}`,
+				mode: "execute",
+				writes: testCase.writes,
+			});
+			expect(result.exitCode).toBe(1);
+			expect(result.stderr).toContain(testCase.expected);
+		}
+		expect(createSessionSpy).not.toHaveBeenCalled();
+	});
+
+	it("accepts each declared-file transition independently", async () => {
+		for (const transition of ["created", "modified", "deleted"] as const) {
+			using workspace = TempDir.createSync(`@pi-execute-write-${transition}-`);
+			const target = workspace.join("target.ts");
+			if (transition !== "created") await Bun.write(target, "before");
+			const session = createMockSession(async ({ emit, state }) => {
+				if (transition === "deleted") await fs.rm(target);
+				else await Bun.write(target, transition === "created" ? "created" : "after");
+				emitSuccessfulYield(emit, state, { transition });
+			});
+			const createSessionSpy = mockCreateAgentSession(session);
+
+			const result = await runSubprocess({
+				...baseOptions,
+				cwd: workspace.path(),
+				id: `subagent-execute-${transition}`,
+				mode: "execute",
+				writes: [path.basename(target)],
+			});
+			createSessionSpy.mockRestore();
+
+			expect(result.exitCode).toBe(0);
+			expect(result.output).toContain(`"transition": "${transition}"`);
+		}
+	});
+
+	it("corrects exactly once when only unrelated files changed and fails on the second unchanged yield", async () => {
+		using workspace = TempDir.createSync("@pi-execute-write-correction-");
+		const target = workspace.join("declared.ts");
+		await Bun.write(target, "unchanged");
+		const prompts: string[] = [];
+		const session = createMockSession(async ({ text, promptIndex, emit, state }) => {
+			prompts.push(text);
+			if (promptIndex === 1) {
+				await Bun.write(workspace.join("unrelated.ts"), "changed");
+				emitSuccessfulYield(emit, state, { attempt: 1 });
+				return;
+			}
+			emitSuccessfulYield(emit, state, { attempt: 2 });
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({
+			...baseOptions,
+			cwd: workspace.path(),
+			id: "subagent-execute-unchanged",
+			mode: "execute",
+			writes: [path.basename(target)],
+		});
+
+		expect(prompts).toHaveLength(2);
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("twice without changing a declared write target");
+		expect(result.output).toContain('"attempt": 2');
+		expect(result.output).not.toContain('"attempt": 1');
+		expect(result.extractedToolData?.yield).toEqual([expect.objectContaining({ data: { attempt: 2 } })]);
 	});
 
 	it("keeps null yield warning when subagent submits success without data", async () => {

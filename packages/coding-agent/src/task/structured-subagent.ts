@@ -93,6 +93,10 @@ export interface StructuredSubagentRequest {
 	schemaMode?: StructuredSubagentSchemaMode;
 	/** Per-spawn thinking effort mapped onto the resolved model's supported range; overrides the agent's default selector. */
 	effort?: TaskEffort;
+	/** Frozen execution mode requires a declared file to change before terminal completion. */
+	mode?: "execute";
+	/** Workspace-relative files an execute-mode task must change. */
+	writes?: string[];
 	identity?: StructuredSubagentIdentity;
 	index?: number;
 	parentToolCallId?: string;
@@ -422,6 +426,7 @@ function buildExecutorOptions(
 		invokedAt: request.invokedAt,
 		acquiredAt: request.acquiredAt,
 		modelOverride: policy.modelOverride,
+		...(request.mode === "execute" ? { mode: request.mode, writes: request.writes } : {}),
 		modelRole: policy.modelRole,
 		parentActiveModelPattern: policy.parentActiveModelPattern,
 		thinkingLevel: policy.effectiveAgent.thinkingLevel,

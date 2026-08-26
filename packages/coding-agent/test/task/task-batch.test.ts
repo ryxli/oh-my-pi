@@ -119,6 +119,8 @@ describe("task.batch schema gating", () => {
 		expect(offProperties.name).toBeDefined();
 		expect(offProperties.outputSchema).toBeDefined();
 		expect(typeof offProperties.outputSchema).toBe("object");
+		expect(offProperties.mode).toBeDefined();
+		expect(offProperties.writes).toBeDefined();
 		expect(offProperties.schemaMode).toBeDefined();
 
 		const on = await TaskTool.create(createSession({ settings: { "task.batch": true } }));
@@ -139,6 +141,8 @@ describe("task.batch schema gating", () => {
 		expect(itemProperties.outputSchema).toBeDefined();
 		expect(typeof itemProperties.outputSchema).toBe("object");
 		expect(itemProperties.schemaMode).toBeDefined();
+		expect(itemProperties.mode).toBeDefined();
+		expect(itemProperties.writes).toBeDefined();
 	});
 
 	it("requires coordination instead of promising same-file auto-resolution", async () => {
@@ -342,6 +346,8 @@ describe("task.batch spawning", () => {
 			context?: string;
 			assignment?: string;
 			parentAgentId?: string;
+			mode?: "execute";
+			writes?: string[];
 			modelOverride?: string | string[];
 			outputSchema?: unknown;
 			outputSchemaMode?: "permissive" | "strict";
@@ -354,6 +360,8 @@ describe("task.batch spawning", () => {
 				context: options.context,
 				assignment: options.assignment,
 				parentAgentId: options.parentAgentId,
+				mode: options.mode,
+				writes: options.writes,
 				modelOverride: options.modelOverride,
 				outputSchema: options.outputSchema,
 				outputSchemaMode: options.outputSchemaMode,
@@ -375,6 +383,8 @@ describe("task.batch spawning", () => {
 				{
 					name: "Alpha",
 					task: "Do A.",
+					mode: "execute",
+					writes: ["src/alpha.ts"],
 					outputSchema: alphaSchema,
 					schemaMode: "strict",
 				},
@@ -405,6 +415,7 @@ describe("task.batch spawning", () => {
 		for (const spawn of seen) {
 			expect(spawn.context).toBe("# Goal\nShared background.");
 			expect(spawn.outputSchemaSource).toBe("caller");
+
 			expect(spawn.outputSchemaOverridesAgent).toBe(true);
 		}
 		const byId = new Map(seen.map(spawn => [spawn.id, spawn]));
@@ -412,8 +423,31 @@ describe("task.batch spawning", () => {
 		expect(byId.get("Alpha")?.outputSchemaMode).toBe("strict");
 		expect(byId.get("Beta")?.outputSchema).toEqual(betaSchema);
 		expect(byId.get("Beta")?.outputSchemaMode).toBe("permissive");
+		expect(byId.get("Alpha")?.mode).toBe("execute");
+		expect(byId.get("Alpha")?.writes).toEqual(["src/alpha.ts"]);
+		expect(byId.get("Beta")?.mode).toBeUndefined();
+		expect(byId.get("Beta")?.writes).toBeUndefined();
 		expect(seen.map(spawn => spawn.assignment).sort()).toEqual(["Do A.", "Do B."]);
 		for (const spawn of seen) expect(spawn.parentAgentId).toBe("ParentA");
+	});
+
+	it("forwards execute mode and writes in the flat form", async () => {
+		mockDiscovery();
+		let captured: { mode?: "execute"; writes?: string[] } | undefined;
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			captured = { mode: options.mode, writes: options.writes };
+			return makeResult(options.id ?? "?");
+		});
+		const tool = await TaskTool.create(createSession({ settings: { "async.enabled": false, "task.batch": false } }));
+
+		const result = await tool.execute("tc-flat-execute", {
+			task: "Update the declared target.",
+			mode: "execute",
+			writes: ["src/target.ts"],
+		} as TaskParams);
+
+		expect(getFirstText(result)).toContain("completed");
+		expect(captured).toEqual({ mode: "execute", writes: ["src/target.ts"] });
 	});
 
 	it("routes each mixed-agent item through its selected definition while preserving caller overrides", async () => {

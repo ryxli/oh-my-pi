@@ -215,6 +215,24 @@ function validateEffort(effort: TaskEffort | undefined, label: string): string |
 	return `${label} has an invalid \`effort\` value ${JSON.stringify(effort)}. Use "lo", "med", or "hi".`;
 }
 
+/** Validate frozen execution mode for wire-bypassing internal and stale calls. */
+function validateExecuteMode(item: Pick<TaskItem, "mode" | "writes">, label: string): string | undefined {
+	if (item.mode !== undefined && item.mode !== "execute") {
+		return `${label} has an invalid \`mode\` value ${JSON.stringify(item.mode)}. Use "execute".`;
+	}
+	if (item.mode !== "execute") {
+		return item.writes === undefined ? undefined : `${label} provides \`writes\` without \`mode: "execute"\`.`;
+	}
+	if (
+		!Array.isArray(item.writes) ||
+		item.writes.length === 0 ||
+		item.writes.some(write => typeof write !== "string" || write.trim() === "")
+	) {
+		return `${label} uses \`mode: "execute"\`, which requires a non-empty \`writes\` list of workspace-relative file paths.`;
+	}
+	return undefined;
+}
+
 function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string | undefined {
 	const hasTask = typeof params.task === "string" && params.task.trim() !== "";
 	const tasks = params.tasks;
@@ -230,8 +248,11 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string 
 			if (!item || typeof item.task !== "string" || item.task.trim() === "") {
 				return `Task ${i + 1}${item?.name ? ` (\`${item.name}\`)` : ""} is missing \`task\`. Every task needs complete, self-contained instructions.`;
 			}
-			const effortError = validateEffort(item.effort, `Task ${i + 1}${item.name ? ` (\`${item.name}\`)` : ""}`);
+			const itemLabel = `Task ${i + 1}${item.name ? ` (\`${item.name}\`)` : ""}`;
+			const effortError = validateEffort(item.effort, itemLabel);
 			if (effortError) return effortError;
+			const executeError = validateExecuteMode(item, itemLabel);
+			if (executeError) return executeError;
 		}
 		const seen = new Map<string, string>();
 		for (const item of tasks) {
@@ -254,7 +275,9 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string 
 			? "Missing `tasks`. Provide a `tasks` array (one subagent per item) with a shared `context`."
 			: "Missing `task`. Provide complete, self-contained instructions for the agent.";
 	}
-	return validateEffort(params.effort, "The call");
+	const effortError = validateEffort(params.effort, "The call");
+	if (effortError) return effortError;
+	return validateExecuteMode(params, "The call");
 }
 
 /**
@@ -272,6 +295,8 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 	if ("schemaMode" in params) item.schemaMode = params.schemaMode;
 	if ("tools" in params) item.tools = params.tools;
 	if ("effort" in params) item.effort = params.effort;
+	if ("mode" in params) item.mode = params.mode;
+	if ("writes" in params) item.writes = params.writes;
 	if ("isolated" in params) item.isolated = params.isolated;
 	return [item];
 }
@@ -294,6 +319,8 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
 	if ("tools" in item) spawn.tools = item.tools;
 	if ("effort" in item) spawn.effort = item.effort;
+	if ("mode" in item) spawn.mode = item.mode;
+	if ("writes" in item) spawn.writes = item.writes;
 	if (item.isolated !== undefined) {
 		spawn.isolated = item.isolated;
 	} else if ("isolated" in params) {
@@ -1465,6 +1492,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				assignment,
 				context,
 				agent: params.agent,
+				...(params.mode === "execute" ? { mode: params.mode, writes: params.writes } : {}),
 				...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
 				...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
 				...(params.effort !== undefined ? { effort: params.effort } : {}),
