@@ -56,10 +56,27 @@ describe("CutTool", () => {
 				state: ["Source change is complete"],
 				objective: "Run the focused proof",
 				exit: "The contract is observed",
+				continue: true,
 				evidence: ["artifact://proof"],
 				artifacts: undefined,
 			},
 		]);
 		expect(result.details).toMatchObject({ staged: true, label: "Verification" });
+	});
+
+	it("can stage a scene that waits for user input", async () => {
+		const { session, staged } = createSession();
+		const tool = CutTool.createIf(session);
+		if (!tool) throw new Error("Expected top-level cut tool");
+
+		await tool.execute("call-wait", {
+			label: "Decision",
+			state: ["The alternatives are fully diagnosed"],
+			objective: "Obtain the user's decision",
+			exit: "The user chooses an alternative",
+			continue: false,
+		});
+
+		expect(staged[0]?.continue).toBe(false);
 	});
 });

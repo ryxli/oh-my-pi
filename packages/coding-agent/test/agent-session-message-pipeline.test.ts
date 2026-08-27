@@ -1013,9 +1013,9 @@ describe("AgentSession message pipeline", () => {
 			authStorage.close();
 		}
 	});
-	it("cuts to one persisted scene and starts its continuation from canonical context", async () => {
-		using tempDir = TempDir.createSync("@pi-scene-cut-");
-		const api = "test-scene-cut";
+	it.each([true, false] as const)("cuts to one persisted canonical scene (continue=%s)", async automatic => {
+		using tempDir = TempDir.createSync(`@pi-scene-cut-${automatic}-`);
+		const api = `test-scene-cut-${automatic}`;
 		const contexts: Context[] = [];
 		registerCustomApi(api, (_model, context) => {
 			contexts.push(context);
@@ -1032,6 +1032,7 @@ describe("AgentSession message pipeline", () => {
 							state: ["The source change is complete"],
 							objective: "Run the focused proof",
 							exit: "The contract is observed",
+							continue: automatic,
 						},
 					} as const;
 					message.content = [toolCall];
@@ -1087,8 +1088,9 @@ describe("AgentSession message pipeline", () => {
 
 			await session.sendUserMessage("pre-cut dialogue");
 
-			expect(contexts).toHaveLength(2);
-			const sceneRequest = JSON.stringify(contexts[1]?.messages);
+			expect(contexts).toHaveLength(automatic ? 2 : 1);
+			const activeSceneMessages = automatic ? contexts[1]?.messages : sessionManager.buildSessionContext().messages;
+			const sceneRequest = JSON.stringify(activeSceneMessages);
 			expect(sceneRequest).toContain("The source change is complete");
 			expect(sceneRequest).toContain("Run the focused proof");
 			expect(sceneRequest).not.toContain("pre-cut dialogue");

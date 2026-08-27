@@ -13,6 +13,7 @@ const cutSchema = type({
 	state: type("string").array().describe("authoritative facts and decisions for the next scene"),
 	objective: type("string").describe("next bounded objective"),
 	exit: type("string").describe("condition that completes the objective"),
+	"continue?": type("boolean").describe("automatically start the next scene; defaults to true"),
 	"evidence?": type("string").array().describe("optional evidence that supports the scene state"),
 	"artifacts?": type("string").array().describe("optional artifact references for the next scene"),
 });
@@ -74,6 +75,7 @@ export class CutTool implements AgentTool<typeof cutSchema, CutToolDetails> {
 			state: authoritativeState(params.state),
 			objective: requiredText(params.objective, "objective"),
 			exit: requiredText(params.exit, "exit"),
+			continue: params.continue ?? true,
 			evidence: optionalList(params.evidence),
 			artifacts: optionalList(params.artifacts),
 		};

@@ -4722,6 +4722,16 @@ export class AgentSession {
 			);
 			this.agent.appendMessage(message);
 			this.#sceneCut.completeApply();
+			const continuation = this.#sceneCut.claimAutomaticContinuation(cut);
+			if (continuation === "limit") {
+				this.emitNotice(
+					"warning",
+					"Scene cut applied, but the automatic continuation limit was reached. Waiting for user input.",
+					"scene-cut",
+				);
+				return;
+			}
+			if (continuation === "wait") return;
 
 			this.#beginInFlight();
 			try {
@@ -6060,6 +6070,7 @@ export class AgentSession {
 		// re-enables advisor auto-resume that a prior user interrupt suppressed.
 		// Agent-initiated synthetic prompts (auto-continue, plan, reminders) do not.
 		if (options?.userInitiated ?? !options?.synthetic) {
+			this.#sceneCut.resetAutomaticContinuationChain();
 			this.#advisors.autoResumeSuppressed = false;
 			this.#planModeReminderCount = 0;
 			this.#planModeReminderAwaitingProgress = false;

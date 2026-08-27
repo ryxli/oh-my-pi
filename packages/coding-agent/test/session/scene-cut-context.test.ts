@@ -11,6 +11,7 @@ const cut: SceneCut = {
 	state: ["The source change is complete"],
 	objective: "Run the focused proof",
 	exit: "The contract is observed",
+	continue: true,
 };
 
 describe("scene cut persistence boundary", () => {
