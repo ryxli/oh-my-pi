@@ -55,7 +55,9 @@ function createCloneStub(overrides?: {
 	prompt?: () => Promise<void>;
 	abort?: () => void;
 	sessionManager?: { appendSessionInit: (init: unknown) => void };
-	lastAssistantText?: string;
+	lastAssistantText?: string | (() => string);
+	hasPendingAsyncWork?: () => boolean;
+	settleAsyncWork?: () => Promise<void>;
 	activeToolNames?: string[];
 	enabledToolNames?: string[];
 }) {
@@ -75,7 +77,15 @@ function createCloneStub(overrides?: {
 		}),
 		prompt: vi.fn(overrides?.prompt ?? (async () => {})),
 		waitForIdle: vi.fn(async () => {}),
-		getLastAssistantMessage: vi.fn(() => assistantText(overrides?.lastAssistantText ?? "done")),
+		hasPendingAsyncWork: vi.fn(overrides?.hasPendingAsyncWork ?? (() => false)),
+		settleAsyncWork: vi.fn(overrides?.settleAsyncWork ?? (async () => {})),
+		getLastAssistantMessage: vi.fn(() => {
+			const text =
+				typeof overrides?.lastAssistantText === "function"
+					? overrides.lastAssistantText()
+					: (overrides?.lastAssistantText ?? "done");
+			return assistantText(text);
+		}),
 		abort: vi.fn(overrides?.abort ?? (() => {})),
 		dispose: vi.fn(async () => {}),
 	};
@@ -272,6 +282,37 @@ describe("TanCommandController", () => {
 
 		expect(capturedOptions?.enableLsp).toBe(true);
 		expect(capturedOptions?.toolNames).toEqual(["read", "bash", "lsp"]);
+	});
+
+	it("returns only after descendant async work and its follow-up turns settle", async () => {
+		const harness = createContext();
+		vi.spyOn(SessionManager, "forkFrom").mockResolvedValue(harness.cloneManager);
+		let pendingGenerations = 2;
+		let assistantResult = "premature terminal state";
+		const { clone } = createCloneStub({
+			lastAssistantText: () => assistantResult,
+			hasPendingAsyncWork: () => pendingGenerations > 0,
+			settleAsyncWork: async () => {
+				pendingGenerations--;
+				if (pendingGenerations === 0) assistantResult = "descendant results integrated";
+			},
+		});
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
+			session: clone,
+		} as unknown as CreateAgentSessionResult);
+		const controller = new TanCommandController(harness.ctx);
+
+		await controller.start("implement with child agents");
+		const run = harness.capturedRun;
+		if (!run) throw new Error("run function was not captured");
+		const result = await run({
+			jobId: "job-children",
+			signal: new AbortController().signal,
+			reportProgress: async () => {},
+		});
+
+		expect(result).toBe("descendant results integrated");
+		expect(clone.settleAsyncWork).toHaveBeenCalledTimes(2);
 	});
 
 	it("keeps the dispatching session's local:// root after the interactive session switches", async () => {
