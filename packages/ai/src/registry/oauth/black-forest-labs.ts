@@ -1,6 +1,6 @@
 import * as AIError from "../../error";
 import { ProviderHttpError } from "../../error/classes";
-import { createApiKeyLogin } from "../api-key-login";
+import { createApiKeyLogin } from "../engine/api-key";
 import type { OAuthController } from "./types";
 
 const VALIDATION_TIMEOUT_MS = 10_000;
@@ -41,14 +41,16 @@ async function validateBflApiKey(apiKey: string, options: OAuthController): Prom
 	throw new ProviderHttpError(message, response.status, { headers: response.headers });
 }
 
-const pasteBflKey = createApiKeyLogin({
-	providerLabel: "Black Forest Labs",
-	authUrl: "https://dashboard.bfl.ai/keys",
-	instructions: "Create or copy an API key in the BFL dashboard, then paste it here.",
-	promptMessage: "Paste your BFL API key",
-	placeholder: "API key from dashboard.bfl.ai/keys",
-	validation: null,
-});
+const pasteBflKey = createApiKeyLogin(
+	{
+		kind: "api-key",
+		authUrl: "https://dashboard.bfl.ai/keys",
+		instructions: "Create or copy an API key in the BFL dashboard, then paste it here.",
+		prompt: "Paste your BFL API key",
+		placeholder: "API key from dashboard.bfl.ai/keys",
+	},
+	"Black Forest Labs",
+);
 
 export async function loginBfl(options: OAuthController): Promise<string> {
 	const key = await pasteBflKey(options);
