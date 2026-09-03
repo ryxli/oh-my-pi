@@ -50,7 +50,29 @@ interface PollEscalationState {
 }
 
 /** Kind of work a managed job runs; drives job-row badges and delivery labels. */
-export type AsyncJobType = "bash" | "task" | "eval";
+export type AsyncJobType = "bash" | "task" | "eval" | "tool";
+
+/**
+ * Work body for a background job registered by a tool. The resolved string is
+ * the text delivered to the owning agent once the job settles, so a tool
+ * controls exactly what its completion puts back into the conversation.
+ *
+ * Narrower than {@link AsyncJobManager.register}'s own run context on purpose:
+ * `markRunning` exists for caller-gated batches (the task tool's semaphore) and
+ * has no meaning for a tool that starts executing immediately.
+ */
+export type BackgroundJobRun = (ctx: {
+	jobId: string;
+	signal: AbortSignal;
+	reportProgress: (text: string, details?: Record<string, unknown>) => Promise<void>;
+}) => Promise<string>;
+
+/**
+ * Registers a background job owned by the calling session and returns its job
+ * id. Supplied by the runtime, which stamps `ownerId` itself so a tool can
+ * neither mis-scope a job onto another agent nor reach a sibling's jobs.
+ */
+export type RegisterBackgroundJob = (label: string, run: BackgroundJobRun) => string;
 
 /** Settled job-body payload: delivery text plus its parsed structured output. */
 export interface AsyncJobRunResult {

@@ -3,6 +3,15 @@
 ## [Unreleased]
 
 ## [18.1.8] - 2026-09-03
+### Added
+
+- Added `report` field to scout agent definitions for detailed, non-summarized findings
+- Subagents now automatically relay turn results to the originating agent, enabling read-only agents to return data
+- Custom tools can now run work in the background through `ctx.registerBackgroundJob`, delivering the result to the agent when it finishes
+
+### Changed
+
+- Inlined approved plan content directly into agent history to reduce redundant read operations
 
 ### Fixed
 
