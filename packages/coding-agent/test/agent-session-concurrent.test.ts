@@ -93,6 +93,44 @@ describe("AgentSession concurrent prompt guard", () => {
 		AsyncJobManager.resetForTests();
 	});
 
+	it.each([false, true])("applies a staged scene cut after settling (continue=%s)", async shouldContinue => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(tempDir),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		const continuations: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "scene_cut_applied") continuations.push(event.continuation);
+		});
+		session.stageSceneCut({
+			label: "Next task",
+			state: ["The previous task is complete."],
+			objective: "Inspect the retained artifact.",
+			exit: "Artifact inspected.",
+			continue: shouldContinue,
+		});
+		await session.prompt("Obsolete task context");
+		await session.waitForIdle();
+		expect(continuations).toEqual([shouldContinue ? "continue" : "wait"]);
+		expect(mock.calls).toHaveLength(shouldContinue ? 2 : 1);
+		expect(JSON.stringify(session.messages)).not.toContain("Obsolete task context");
+		expect(JSON.stringify(session.messages)).toContain("Inspect the retained artifact.");
+		if (shouldContinue) {
+			expect(JSON.stringify(mock.calls[1].context.messages)).not.toContain("Obsolete task context");
+			expect(JSON.stringify(mock.calls[1].context.messages)).toContain("Inspect the retained artifact.");
+		}
+	});
+
 	it("continues a main session from session_stop feedback before settling", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({

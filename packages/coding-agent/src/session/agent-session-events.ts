@@ -88,7 +88,8 @@ export type AgentSessionEvent =
 	// `AgentSession.getQueuedMessages()`; `liveSteered` counts the leading
 	// `steering` entries already sent into the streaming response, which
 	// `remove_queued_message` cannot reach.
-	| { type: "queue_update"; steering: string[]; followUp: string[]; liveSteered: number };
+	| { type: "queue_update"; steering: string[]; followUp: string[]; liveSteered: number }
+	| { type: "scene_cut_applied"; continuation: "continue" | "wait" | "limit" };
 
 /** Listener function for agent session events. */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
