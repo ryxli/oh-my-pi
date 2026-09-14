@@ -1,6 +1,7 @@
 import type { Component, OverlayHandle, TUI } from "@oh-my-pi/pi-tui";
 import { Container, Spacer, Text } from "@oh-my-pi/pi-tui";
 import type { CollabUiRequestDraft, CollabUiSelectItem } from "@oh-my-pi/pi-wire";
+import type { BackgroundJobRun } from "../../async";
 import type { CollabHost } from "../../collab/host";
 import { KeybindingsManager } from "../../config/keybindings";
 import type {
@@ -216,6 +217,7 @@ export class ExtensionUiController {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
+			registerBackgroundJob: (label, run) => this.#registerBackgroundJob(label, run),
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
@@ -452,6 +454,7 @@ export class ExtensionUiController {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
+			registerBackgroundJob: (label, run) => this.#registerBackgroundJob(label, run),
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
@@ -1240,6 +1243,17 @@ export class ExtensionUiController {
 
 	async #updateSessionName(name: string): Promise<void> {
 		await this.ctx.sessionManager.setSessionName(name, "user");
+	}
+
+	/**
+	 * Owner-stamp a tool's background job against the *current* session. The
+	 * session object is replaced on reload/switch, so the manager is resolved
+	 * per call rather than captured when the action set is built.
+	 */
+	#registerBackgroundJob(label: string, run: BackgroundJobRun): string {
+		const manager = this.ctx.session.asyncJobManager;
+		if (!manager) throw new Error("Background job manager unavailable for this session.");
+		return manager.register("tool", label, run, { ownerId: this.ctx.session.getAgentId() });
 	}
 
 	#sendExtensionUserMessage: SendUserMessageHandler = (content, options) => {

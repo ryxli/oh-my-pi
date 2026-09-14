@@ -20,6 +20,7 @@ import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { FetchImpl, Model, Static, TSchema } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
+import type { RegisterBackgroundJob } from "../../async";
 import type { Rule } from "../../capability/rule";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { Settings } from "../../config/settings";
@@ -101,6 +102,16 @@ export interface CustomToolContext {
 	fetch?: FetchImpl;
 	/** Calling session's `local://` root mapping for tools that bridge out of the OMP process. */
 	localProtocolOptions?: LocalProtocolOptions;
+	/**
+	 * Register a background job owned by this session and return its job id, or
+	 * `undefined` when the host has no job manager. The runtime stamps the job's
+	 * owner, so a tool cannot mis-scope one onto another agent or reach a
+	 * sibling's jobs. The run body's resolved string is the text delivered to
+	 * the agent when the job settles, and `reportProgress` keeps the tool's own
+	 * renderer live while it runs. Tools MUST degrade to foreground execution
+	 * when this is absent.
+	 */
+	registerBackgroundJob?: RegisterBackgroundJob;
 	/** Whether to auto-approve all destructive tool operations (--auto-approve CLI flag) */
 	autoApprove?: boolean;
 }
