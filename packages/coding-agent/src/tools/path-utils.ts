@@ -414,7 +414,7 @@ function isUnderRootLexical(target: string, root: string): boolean {
 	return !!relative && !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
-function tryRealpath(target: string): string | null {
+export function tryRealpath(target: string): string | null {
 	try {
 		return fs.realpathSync.native(target);
 	} catch {
