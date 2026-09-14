@@ -320,6 +320,7 @@ export class EventController {
 				this.ctx.ui.requestRender(true);
 			},
 			goal_updated: async () => {},
+			scene_cut_applied: async () => {},
 		} satisfies AgentSessionEventHandlers;
 	}
 
