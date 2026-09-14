@@ -85,7 +85,8 @@ export type AgentSessionEvent =
 	// whenever it differs from the last `queue_update` (enqueue, dequeue on
 	// delivery, remove, clear/restore, or session switch), never on a no-op
 	// mutation. Mirrors `AgentSession.getQueuedMessages()`.
-	| { type: "queue_update"; steering: string[]; followUp: string[] };
+	| { type: "queue_update"; steering: string[]; followUp: string[] }
+	| { type: "scene_cut_applied"; continuation: "continue" | "wait" | "limit" };
 
 /** Listener function for agent session events. */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;

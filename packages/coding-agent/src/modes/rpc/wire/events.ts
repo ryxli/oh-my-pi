@@ -156,6 +156,10 @@ export const eventDefs = {
 		{ type: "'queue_update'", steering: "string[]", followUp: "string[]" },
 		"Coalesced snapshot of the displayable steering/follow-up queue, sent whenever it changes.",
 	),
+	SceneCutAppliedEvent: doc(
+		{ type: "'scene_cut_applied'", continuation: "'continue' | 'wait' | 'limit'" },
+		"A scene handoff was applied with its continuation decision.",
+	),
 
 	RpcAgentEvent: doc(
 		[
@@ -190,6 +194,7 @@ export const eventDefs = {
 			"ThinkingLevelChangedEvent",
 			"GoalUpdatedEvent",
 			"QueueUpdateEvent",
+			"SceneCutAppliedEvent",
 		].join(" | "),
 		"A session event, discriminated by `type`; `set_event_filter` selects which are sent.",
 	),

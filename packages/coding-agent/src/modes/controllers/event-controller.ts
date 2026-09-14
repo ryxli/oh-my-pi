@@ -389,6 +389,7 @@ export class EventController {
 			// this event exists for RPC/ACP clients that have no equivalent local
 			// call site to hook, so there is nothing additional to do here.
 			queue_update: async () => {},
+			scene_cut_applied: async () => {},
 		} satisfies AgentSessionEventHandlers;
 	}
 

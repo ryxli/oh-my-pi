@@ -1095,6 +1095,13 @@ class QueueUpdateEvent:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class SceneCutAppliedEvent:
+    """A scene handoff was applied with its continuation decision."""
+    type: Literal["scene_cut_applied"] = "scene_cut_applied"
+    continuation: Literal["continue", "wait", "limit"]
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class ReadyEvent:
     """First frame after startup; transport fields are absent on servers without protocol v2."""
     type: Literal["ready"] = "ready"
@@ -1474,7 +1481,7 @@ AssistantMessageEvent: TypeAlias = AssistantStartEvent | AssistantTextStartEvent
 """Streaming update for one assistant message, discriminated by `type`."""
 
 
-RpcAgentEvent: TypeAlias = AgentStartEvent | AgentEndEvent | TurnStartEvent | TurnEndEvent | MessageStartEvent | MessageUpdateEvent | MessageEndEvent | ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolStreamUpdateEvent | ToolExecutionEndEvent | AutoCompactionStartEvent | AutoCompactionEndEvent | AutoRetryStartEvent | AutoRetryEndEvent | CacheWarmingStartEvent | CacheWarmingEndEvent | RetryFallbackAppliedEvent | RetryFallbackSucceededEvent | ModelChangedEvent | ConfigWarningsChangedEvent | AdvisorCostChangedEvent | AdvisorYieldedEvent | TtsrTriggeredEvent | TodoReminderEvent | TodoAutoClearEvent | IrcMessageEvent | NoticeEvent | ThinkingLevelChangedEvent | GoalUpdatedEvent | QueueUpdateEvent
+RpcAgentEvent: TypeAlias = AgentStartEvent | AgentEndEvent | TurnStartEvent | TurnEndEvent | MessageStartEvent | MessageUpdateEvent | MessageEndEvent | ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolStreamUpdateEvent | ToolExecutionEndEvent | AutoCompactionStartEvent | AutoCompactionEndEvent | AutoRetryStartEvent | AutoRetryEndEvent | CacheWarmingStartEvent | CacheWarmingEndEvent | RetryFallbackAppliedEvent | RetryFallbackSucceededEvent | ModelChangedEvent | ConfigWarningsChangedEvent | AdvisorCostChangedEvent | AdvisorYieldedEvent | TtsrTriggeredEvent | TodoReminderEvent | TodoAutoClearEvent | IrcMessageEvent | NoticeEvent | ThinkingLevelChangedEvent | GoalUpdatedEvent | QueueUpdateEvent | SceneCutAppliedEvent
 """A session event, discriminated by `type`; `set_event_filter` selects which are sent."""
 
 
@@ -2344,6 +2351,14 @@ def parse_queue_update_event(value: object, path: str = "QueueUpdateEvent") -> Q
     )
 
 
+def parse_scene_cut_applied_event(value: object, path: str = "SceneCutAppliedEvent") -> SceneCutAppliedEvent:
+    payload = expect_object(value, path)
+    required(payload, "type", cast('Decoder[Literal["scene_cut_applied"]]', literal(frozenset({"scene_cut_applied"}))), path)
+    return SceneCutAppliedEvent(
+        continuation=required(payload, "continuation", cast('Decoder[Literal["continue", "wait", "limit"]]', literal(frozenset({"continue", "wait", "limit"}))), path),
+    )
+
+
 def parse_ready_event(value: object, path: str = "ReadyEvent") -> ReadyEvent:
     payload = expect_object(value, path)
     required(payload, "type", cast('Decoder[Literal["ready"]]', literal(frozenset({"ready"}))), path)
@@ -2806,6 +2821,7 @@ _RPC_AGENT_EVENT_CASES: Final[dict[str, Decoder[RpcAgentEvent]]] = {
         "thinking_level_changed": parse_thinking_level_changed_event,
         "goal_updated": parse_goal_updated_event,
         "queue_update": parse_queue_update_event,
+        "scene_cut_applied": parse_scene_cut_applied_event,
 }
 
 
@@ -2858,6 +2874,7 @@ _RPC_NOTIFICATION_CASES: Final[dict[str, Decoder[RpcNotification]]] = {
         "thinking_level_changed": parse_rpc_agent_event,
         "goal_updated": parse_rpc_agent_event,
         "queue_update": parse_rpc_agent_event,
+        "scene_cut_applied": parse_rpc_agent_event,
 }
 
 
@@ -3402,6 +3419,10 @@ class WireClient:
         """Subscribe to `queue_update`: Coalesced snapshot of the displayable steering/follow-up queue, sent whenever it changes."""
         return self._listen("queue_update", listener)
 
+    def on_scene_cut_applied(self, listener: Callable[[SceneCutAppliedEvent], None]) -> Callable[[], None]:
+        """Subscribe to `scene_cut_applied`: A scene handoff was applied with its continuation decision."""
+        return self._listen("scene_cut_applied", listener)
+
 
 __all__ = [
     "AdvisorCostChangedEvent",
@@ -3526,6 +3547,7 @@ __all__ = [
     "RpcAgentEvent",
     "RpcFrameErrorEvent",
     "RpcNotification",
+    "SceneCutAppliedEvent",
     "SelectOptionDetail",
     "SelectUiRequest",
     "SessionCredits",
@@ -3684,6 +3706,7 @@ __all__ = [
     "parse_retry_fallback_succeeded_event",
     "parse_rpc_agent_event",
     "parse_rpc_frame_error_event",
+    "parse_scene_cut_applied_event",
     "parse_select_option_detail",
     "parse_select_ui_request",
     "parse_session_credits",

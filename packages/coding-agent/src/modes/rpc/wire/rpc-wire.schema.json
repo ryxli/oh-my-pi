@@ -3821,6 +3821,27 @@
 			],
 			"description": "Coalesced snapshot of the displayable steering/follow-up queue, sent whenever it changes."
 		},
+		"SceneCutAppliedEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "scene_cut_applied"
+				},
+				"continuation": {
+					"enum": [
+						"continue",
+						"wait",
+						"limit"
+					],
+					"type": "string"
+				}
+			},
+			"required": [
+				"type",
+				"continuation"
+			],
+			"description": "A scene handoff was applied with its continuation decision."
+		},
 		"RpcAgentEvent": {
 			"anyOf": [
 				{
@@ -3915,6 +3936,9 @@
 				},
 				{
 					"$ref": "#/$defs/QueueUpdateEvent"
+				},
+				{
+					"$ref": "#/$defs/SceneCutAppliedEvent"
 				}
 			],
 			"description": "A session event, discriminated by `type`; `set_event_filter` selects which are sent."
