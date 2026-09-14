@@ -1510,6 +1510,7 @@ function createCustomToolContext(ctx: ExtensionContext): CustomToolContext {
 		hasQueuedMessages: ctx.hasPendingMessages,
 		abort: ctx.abort,
 		localProtocolOptions: ctx.localProtocolOptions,
+		registerBackgroundJob: ctx.registerBackgroundJob,
 	};
 }
 

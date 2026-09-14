@@ -7,6 +7,7 @@
  * caller-supplied hooks.
  */
 import { toError } from "@oh-my-pi/pi-utils";
+import type { BackgroundJobRun } from "../async";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
 import type { ExtensionError, ExtensionMode, ExtensionUIContext } from "../extensibility/extensions/types";
@@ -71,6 +72,14 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 		wrapSessionChange = change => change(),
 	} = options;
 	const shutdown = onShutdown ?? (() => {});
+	// Captured once, and owner-stamped here rather than at the callsite: a tool's
+	// job must belong to this session so the settled result routes to this
+	// agent's delivery sink and a sibling's teardown cannot cancel it.
+	const asyncJobManager = session.asyncJobManager;
+	const registerBackgroundJob = asyncJobManager
+		? (label: string, run: BackgroundJobRun): string =>
+				asyncJobManager.register("tool", label, run, { ownerId: session.getAgentId() })
+		: undefined;
 
 	runner.initialize(
 		// ExtensionActions
@@ -149,6 +158,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			getContextUsage: () => session.getContextUsage(),
 			getSystemPrompt: () => session.systemPrompt,
 			runEphemeralTurn: args => session.runEphemeralTurn(args),
+			registerBackgroundJob,
 			compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
 		},
 		// ExtensionCommandContextActions — commands invokable via prompt("/command")
