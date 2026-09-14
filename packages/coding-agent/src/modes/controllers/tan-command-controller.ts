@@ -213,6 +213,10 @@ export class TanCommandController {
 							injectContextSwitch();
 							await clone.prompt(trimmedWork, { attribution: "user" });
 							await clone.waitForIdle();
+							while (clone.hasPendingAsyncWork()) {
+								if (signal.aborted) throw new Error("Aborted while settling descendant work");
+								await clone.settleAsyncWork();
+							}
 							return extractAssistantText(clone.getLastAssistantMessage()) || "(no output)";
 						} finally {
 							unsubscribeCompaction();

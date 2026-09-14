@@ -75,6 +75,8 @@ function createCloneStub(overrides?: {
 		}),
 		prompt: vi.fn(overrides?.prompt ?? (async () => {})),
 		waitForIdle: vi.fn(async () => {}),
+		hasPendingAsyncWork: vi.fn(() => false),
+		settleAsyncWork: vi.fn(async () => {}),
 		getLastAssistantMessage: vi.fn(() => assistantText(overrides?.lastAssistantText ?? "done")),
 		abort: vi.fn(overrides?.abort ?? (() => {})),
 		dispose: vi.fn(async () => {}),
