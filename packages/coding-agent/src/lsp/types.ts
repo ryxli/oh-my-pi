@@ -9,6 +9,7 @@ export const lspSchema = type({
 	action:
 		"'diagnostics' | 'definition' | 'references' | 'hover' | 'symbols' | 'rename' | 'rename_file' | 'code_actions' | 'type_definition' | 'implementation' | 'status' | 'reload' | 'capabilities' | 'request'",
 	file: "string?",
+	workspace: "string?",
 	line: "number?",
 	symbol: "string?",
 	query: "string?",

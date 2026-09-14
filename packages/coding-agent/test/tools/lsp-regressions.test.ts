@@ -4436,9 +4436,9 @@ describe("lsp regressions", () => {
 			},
 			idleTimeoutMs: undefined,
 		});
-		vi.spyOn(lspClient, "getActiveClients").mockReturnValue([
-			{ name: "typescript-language-server", status: "ready", fileTypes: [".ts"] },
-		]);
+		vi.spyOn(lspClient, "getActiveOrPendingClient").mockImplementation(async config =>
+			config.command === "typescript-language-server" ? ({ status: "ready" } as LspClient) : undefined,
+		);
 
 		const tool = new LspTool(makeLspSession(process.cwd()));
 		const result = await tool.execute("status-test", { action: "status" });
