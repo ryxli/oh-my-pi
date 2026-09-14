@@ -1,0 +1,20 @@
+// Black Forest Labs task API. Generation submits a task and polls the
+// provider-controlled result endpoint; edits route to FLUX Kontext.
+provider "bfl" {
+	default-model "flux-2-pro"
+	env "BFL_API_KEY"
+
+	seed base-url="https://api.bfl.ai/v1" bundle="always" {
+		model "flux-2-pro" name="FLUX.2 Pro" api="bfl-images" {
+			reasoning #false
+			input "text" "image"
+			cost input=0 output=0 cache-read=0 cache-write=0
+			limits
+			supports-tools #false
+		}
+	}
+
+	models "flux-2-pro" {
+		kind "image"
+	}
+}

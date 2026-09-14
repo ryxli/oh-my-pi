@@ -47,6 +47,7 @@ export const imageGenSchema = type({
 });
 export type ImageGenParams = typeof imageGenSchema.infer;
 
+
 interface ImageGenToolDetails {
 	provider: string;
 	model: string;
