@@ -9,7 +9,16 @@ import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
 import { AgentBusyError, EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
-import { isRecord, logger, popLoopPhase, prompt, pushLoopPhase, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
+import {
+	isEnoent,
+	isRecord,
+	logger,
+	popLoopPhase,
+	prompt,
+	pushLoopPhase,
+	sanitizeText,
+	untilAborted,
+} from "@oh-my-pi/pi-utils";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobError, AsyncJobManager, type AsyncJobRunResult } from "../async";
 import type { Rule } from "../capability/rule";
 import type { EffectiveExtensionRoots } from "../capability/types";
@@ -53,6 +62,7 @@ import type { MCPManager } from "../mcp/manager";
 import type { MnemopiSessionState } from "../mnemopi/state";
 import { initializeExtensions } from "../modes/runtime-init";
 import subagentAsyncPendingTemplate from "../prompts/system/subagent-async-pending.md" with { type: "text" };
+import subagentExecuteWriteReminderTemplate from "../prompts/system/subagent-execute-write-reminder.md" with { type: "text" };
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
 import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-lifecycle";
@@ -388,6 +398,10 @@ export interface ExecutorOptions {
 	assignment?: string;
 	/** Shared background from the task call (`task.batch`), rendered into the subagent's system prompt. */
 	context?: string;
+	/** Frozen execution mode rejects a successful terminal yield unless a declared target changes. */
+	mode?: "execute";
+	/** Workspace-relative files a frozen execution task must change. */
+	writes?: string[];
 	/**
 	 * The session's active overall plan, handed off so subagents spawned during
 	 * plan execution share the same plan context as the main agent. Omitted when
@@ -567,6 +581,92 @@ export interface ExecutorOptions {
 	onRelease?: () => Promise<void>;
 	/** Internal cleanup grace override for deterministic lifecycle tests. */
 	cleanupGraceMs?: number;
+}
+
+interface ExecuteWriteSnapshot {
+	declaredPath: string;
+	filePath: string;
+	existed: boolean;
+	digest?: string;
+}
+
+function isWithinDirectory(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+async function resolveExecuteWritePath(
+	cwd: string,
+	declaredPath: string,
+): Promise<{ filePath: string; existed: boolean }> {
+	if (path.isAbsolute(declaredPath) || path.win32.isAbsolute(declaredPath)) {
+		throw new Error(`Declared execute target \`${declaredPath}\` must be workspace-relative, not absolute.`);
+	}
+	const resolvedCwd = path.resolve(cwd);
+	const filePath = path.resolve(resolvedCwd, declaredPath);
+	if (!isWithinDirectory(resolvedCwd, filePath)) {
+		throw new Error(`Declared execute target \`${declaredPath}\` traverses outside the child workspace.`);
+	}
+	const realCwd = await fs.realpath(resolvedCwd);
+	let existingPath = filePath;
+	let existed = true;
+	try {
+		await fs.lstat(existingPath);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+		existed = false;
+		while (true) {
+			const parent = path.dirname(existingPath);
+			if (parent === existingPath) {
+				throw new Error(`Declared execute target \`${declaredPath}\` has no workspace parent.`);
+			}
+			existingPath = parent;
+			try {
+				await fs.lstat(existingPath);
+				break;
+			} catch (parentError) {
+				if (!isEnoent(parentError)) throw parentError;
+			}
+		}
+	}
+	const realExistingPath = await fs.realpath(existingPath);
+	if (!isWithinDirectory(realCwd, realExistingPath)) {
+		throw new Error(
+			`Declared execute target \`${declaredPath}\` resolves outside the child workspace through a symlink.`,
+		);
+	}
+	if (existed) {
+		const targetStat = await fs.stat(realExistingPath);
+		if (!targetStat.isFile()) {
+			throw new Error(`Declared execute target \`${declaredPath}\` must be a file.`);
+		}
+		return { filePath: realExistingPath, existed: true };
+	}
+	const parentStat = await fs.stat(existingPath);
+	if (!parentStat.isDirectory()) {
+		throw new Error(`Declared execute target \`${declaredPath}\` has a non-directory parent.`);
+	}
+	return { filePath, existed: false };
+}
+
+async function snapshotExecuteWrite(cwd: string, declaredPath: string): Promise<ExecuteWriteSnapshot> {
+	const target = await resolveExecuteWritePath(cwd, declaredPath);
+	if (!target.existed) return { declaredPath, ...target };
+	const digest = new Bun.CryptoHasher("sha256").update(await Bun.file(target.filePath).arrayBuffer()).digest("hex");
+	return { declaredPath, ...target, digest };
+}
+
+async function snapshotExecuteWrites(cwd: string, writes: readonly string[]): Promise<ExecuteWriteSnapshot[]> {
+	return Promise.all(writes.map(write => snapshotExecuteWrite(cwd, write)));
+}
+
+async function executeWritesChanged(cwd: string, initial: readonly ExecuteWriteSnapshot[]): Promise<boolean> {
+	let changed = false;
+	for (const snapshot of initial) {
+		const current = await snapshotExecuteWrite(cwd, snapshot.declaredPath);
+		if (current.existed !== snapshot.existed || current.digest !== snapshot.digest) changed = true;
+	}
+	return changed;
 }
 
 function parseStringifiedJson(value: unknown): unknown {
@@ -1112,6 +1212,8 @@ interface RunMonitorArgs {
 	completionProbe: boolean;
 	/** Fires each time a terminal `yield` is recorded for this run. */
 	onYieldAccepted?: () => void;
+	/** Execute-mode yields are evaluated by the driver before the session terminates. */
+	executeMode: boolean;
 }
 
 /**
@@ -1135,6 +1237,10 @@ interface SubagentRunMonitor {
 	markFinalYieldForced(forced: boolean): void;
 	/** Epoch ms when the run's terminal `yield` was recorded; undefined while none is latched. */
 	yieldAcceptedAt(): number | undefined;
+	/** Whether the latest recorded terminal yield is successful. */
+	lastYieldSucceeded(): boolean;
+	/** Unlatch a successful yield so the same live session can receive one correction turn. */
+	invalidateYieldForCorrection(): void;
 	runtimeLimitExceeded(): boolean;
 	/** True once the soft-budget stop fired: the free-running turn was aborted and the run is being driven to a forced final yield. */
 	budgetStopRequested(): boolean;
@@ -1812,7 +1918,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 							// run behind the quiescence barrier instead of completing
 							// it (see requestYieldTurnStop).
 							requestYieldTurnStop();
-						} else {
+						} else if (!(event.toolName === "yield" && args.executeMode)) {
 							requestAbort("terminate");
 						}
 					}
@@ -2114,6 +2220,24 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			finalYieldForced = forced;
 		},
 		yieldAcceptedAt: () => yieldAcceptedAt,
+		lastYieldSucceeded: () => {
+			const yields = progress.extractedToolData?.yield as YieldItem[] | undefined;
+			const lastYield = yields?.[yields.length - 1];
+			return lastYield?.status === "success" && !Array.isArray(lastYield.type);
+		},
+		invalidateYieldForCorrection: () => {
+			const yields = progress.extractedToolData?.yield as YieldItem[] | undefined;
+			if (yields) {
+				for (let index = yields.length - 1; index >= 0; index--) {
+					if (!Array.isArray(yields[index]?.type)) {
+						yields.splice(index, 1);
+						break;
+					}
+				}
+			}
+			yieldCalled = false;
+			yieldAcceptedAt = undefined;
+		},
 		runtimeLimitExceeded: () => runtimeLimitExceeded,
 		terminalError: () => terminalError,
 		hasExplicitAbortReason: () =>
@@ -2201,6 +2325,11 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	};
 }
 
+interface ExecuteYieldGuard {
+	cwd: string;
+	initialSnapshots: ExecuteWriteSnapshot[];
+}
+
 interface DriveOutcome {
 	exitCode: number;
 	error?: string;
@@ -2235,6 +2364,7 @@ async function driveSessionToYield(
 		 */
 		onPromptBusy?: () => Promise<void>;
 	} = {},
+	executeGuard?: ExecuteYieldGuard,
 ): Promise<DriveOutcome> {
 	const { solutionSpace, onPromptBusy } = options;
 	using _keepalive = new EventLoopKeepalive();
@@ -2434,6 +2564,7 @@ async function driveSessionToYield(
 		// Runs that exhaust the ladder with no pending work, or hit a terminal
 		// model error, skip the barrier; teardown reaps their jobs.
 		let asyncPendingNoticeSent = false;
+		let executeCorrectionSent = false;
 		while (!abortSignal.aborted) {
 			if (!monitor.yieldCalled()) {
 				await runYieldLadder();
@@ -2449,8 +2580,35 @@ async function driveSessionToYield(
 			// prompting again (mirrors waitForBudgetStop).
 			await awaitAbortable(monitor.waitForYieldTurnStop());
 			if (!session.hasPendingAsyncWork()) {
-				if (monitor.yieldCalled()) break;
-				continue;
+				if (!monitor.yieldCalled()) continue;
+				if (executeGuard && monitor.lastYieldSucceeded()) {
+					let changed: boolean;
+					try {
+						changed = await executeWritesChanged(executeGuard.cwd, executeGuard.initialSnapshots);
+					} catch (snapshotError) {
+						exitCode = 1;
+						error ??= `Unable to verify declared execute targets: ${snapshotError instanceof Error ? snapshotError.message : String(snapshotError)}`;
+						break;
+					}
+					if (!changed) {
+						if (executeCorrectionSent) {
+							exitCode = 1;
+							error ??= "Execute task yielded successfully twice without changing a declared write target.";
+							break;
+						}
+						executeCorrectionSent = true;
+						monitor.invalidateYieldForCorrection();
+						await awaitAbortable(
+							session.prompt(subagentExecuteWriteReminderTemplate, {
+								attribution: "agent",
+								synthetic: true,
+							}),
+						);
+						await awaitAbortable(session.waitForIdle());
+						continue;
+					}
+				}
+				break;
 			}
 			if (!monitor.yieldCalled()) {
 				await awaitAbortable(session.settleAsyncWork());
@@ -3063,6 +3221,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			completionProbe: false,
 			signal: jobCancel.signal,
 			onYieldAccepted: registerWakeJob,
+			executeMode: false,
 		});
 
 		const startedPayload = {
@@ -3455,6 +3614,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		softRequestBudgetNotice: false,
 		maxRuntimeMs: options.maxRuntimeMs ?? 0,
 		completionProbe: options.completionProbe ?? false,
+		executeMode: false,
 	});
 
 	const startedPayload = {
@@ -3778,6 +3938,50 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		};
 	}
 
+	let executeGuard: ExecuteYieldGuard | undefined;
+	let executePreparationError: string | undefined;
+	if (options.mode === "execute") {
+		if (
+			!Array.isArray(options.writes) ||
+			options.writes.length === 0 ||
+			options.writes.some(write => typeof write !== "string" || write.trim() === "")
+		) {
+			executePreparationError = "Execute mode requires a non-empty writes list of workspace-relative file paths.";
+		} else {
+			try {
+				executeGuard = {
+					cwd: worktree ?? cwd,
+					initialSnapshots: await snapshotExecuteWrites(worktree ?? cwd, options.writes),
+				};
+			} catch (snapshotError) {
+				executePreparationError = snapshotError instanceof Error ? snapshotError.message : String(snapshotError);
+			}
+		}
+	} else if (options.writes !== undefined) {
+		executePreparationError = 'Declared writes require mode: "execute".';
+	}
+	if (executePreparationError) {
+		return {
+			index,
+			id,
+			agent: agent.name,
+			agentSource: agent.source,
+			task,
+			assignment,
+			description: options.description,
+			exitCode: 1,
+			output: "",
+			stderr: executePreparationError,
+			truncated: false,
+			durationMs: Date.now() - startTime,
+			tokens: 0,
+			requests: 0,
+			modelOverride,
+			modelRole,
+			error: executePreparationError,
+		};
+	}
+
 	// Set up artifact paths and write input file upfront if artifacts dir provided
 	let subtaskSessionFile: string | undefined;
 	if (options.artifactsDir) {
@@ -3895,6 +4099,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		softRequestBudgetNotice,
 		maxRuntimeMs,
 		completionProbe: isCompletionProbeEnabled(settings, parentDepth),
+		executeMode: options.mode === "execute",
 	});
 	const progress = monitor.progress;
 	let unsubscribe: (() => void) | null = null;
@@ -4438,7 +4643,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 
 			readyAt = performance.now();
-			const outcome = await driveSessionToYield(session, monitor, task, { solutionSpace: options.solutionSpace });
+			const outcome = await driveSessionToYield(
+				session,
+				monitor,
+				task,
+				{ solutionSpace: options.solutionSpace },
+				executeGuard,
+			);
 			// Acceptance boundary (#11079): the run's final result is settled, so
 			// stamp the lifecycle and terminalize a ref the run-state mirror left
 			// `running` before the (possibly slow) cleanup below.
