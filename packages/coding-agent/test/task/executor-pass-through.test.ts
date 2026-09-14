@@ -30,7 +30,7 @@ import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { createSessionDefaults } from "../helpers/session-defaults";
 import { manyToolName } from "../fixtures/many-tools-mcp";
-import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
+import { removeSyncWithRetries, TempDir } from "@oh-my-pi/pi-utils";
 
 import { cfgTierAnthropic, cfgTierGoogle, cfgTierOpenai } from "@oh-my-pi/pi-coding-agent/session/settings";
 
@@ -125,6 +125,40 @@ function createModelRegistry(
 describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
+	});
+
+	it.each([1, 2, 0])("enforces declared writes with one correction turn (write on turn %s)", async writeOnTurn => {
+		using tempDir = TempDir.createSync("@omp-execute-write-");
+		let turns = 0;
+		const session = createMockSession(async ({ emit }) => {
+			turns++;
+			if (turns === writeOnTurn) await Bun.write(path.join(tempDir.path(), "output.txt"), "completed");
+			emitYield(emit);
+		});
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const result = await runSubprocess({
+			...baseOptions,
+			cwd: tempDir.path(),
+			mode: "execute",
+			writes: ["output.txt"],
+		});
+		expect(turns).toBe(writeOnTurn === 1 ? 1 : 2);
+		expect(result.exitCode).toBe(writeOnTurn === 0 ? 1 : 0);
+		if (writeOnTurn === 0) expect(result.error).toContain("without changing a declared write target");
+	});
+
+	it("rejects execute targets outside the workspace before starting a session", async () => {
+		using tempDir = TempDir.createSync("@omp-execute-path-");
+		const spy = vi.spyOn(sdkModule, "createAgentSession");
+		const result = await runSubprocess({
+			...baseOptions,
+			cwd: tempDir.path(),
+			mode: "execute",
+			writes: ["../outside.txt"],
+		});
+		expect(result.exitCode).toBe(1);
+		expect(result.error).toContain("outside the child workspace");
+		expect(spy).not.toHaveBeenCalled();
 	});
 
 	it("forwards rules, extension-root policy, prepared extensions, and preloaded source paths to createAgentSession", async () => {
