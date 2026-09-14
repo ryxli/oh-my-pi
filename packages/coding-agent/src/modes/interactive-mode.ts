@@ -1583,6 +1583,9 @@ export class InteractiveMode implements InteractiveModeContext {
 				if (event.type === "config_warnings_changed") {
 					this.#syncConfigWarningHeader();
 				}
+				if (event.type === "scene_cut_applied" && event.continuation !== "continue") {
+					this.pauseLoop();
+				}
 				void this.#handleGoalSessionEvent(event);
 			}),
 			onStatusLineSessionAccentChanged(() => {

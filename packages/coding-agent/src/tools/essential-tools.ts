@@ -23,6 +23,7 @@ import type { ToolLoadMode } from "@oh-my-pi/pi-agent-core";
 export const ESSENTIAL_BUILTIN_TOOL_NAMES: Record<string, true> = {
 	read: true,
 	write: true,
+	cut: true,
 	bash: true,
 	edit: true,
 	glob: true,
