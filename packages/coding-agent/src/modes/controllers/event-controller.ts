@@ -509,6 +509,7 @@ export class EventController {
 			queue_update: async () => {
 				this.ctx.updatePendingMessagesDisplay();
 			},
+			scene_cut_applied: async () => {},
 		} satisfies AgentSessionEventHandlers;
 	}
 

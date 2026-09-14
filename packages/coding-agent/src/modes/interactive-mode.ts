@@ -2955,6 +2955,9 @@ export class InteractiveMode implements InteractiveModeContext {
 						this.#scheduleLoopAutoSubmit();
 					}
 				}
+				if (event.type === "scene_cut_applied" && event.continuation !== "continue") {
+					this.pauseLoop();
+				}
 				void this.#handleGoalSessionEvent(event);
 			}),
 			cfgLiveUiSettings.listen(this.settings, (next, previous) => this.#applyUiSettingChanges(next, previous)),
