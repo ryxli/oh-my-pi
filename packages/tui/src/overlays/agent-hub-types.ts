@@ -7,7 +7,15 @@ export const MAIN_AGENT_ID = "Main";
 export type AgentStatus = "running" | "idle" | "parked" | "aborted";
 /** Usage summary consumed by the roster and inspector. */
 export interface AgentMetricsSummary {
+	/** Input + output + cache-write tokens. Cache reads are held separately. */
 	tokens: number;
+	/**
+	 * Cache-read tokens, tracked apart from {@link tokens} because `cost` prices
+	 * them while `tokens` does not. Without it no cost-per-token is derivable:
+	 * cache reads dominate volume, so dividing `cost` by `tokens` overstates the
+	 * rate by more than an order of magnitude.
+	 */
+	cacheReadTokens?: number;
 	requests: number;
 	tools: number;
 	cost: number;
@@ -23,7 +31,7 @@ export interface AgentHubSession {
 	readonly servingModel?: { selector: string; isFallback: boolean };
 	readonly agent?: { state: { messages: AgentMessage[] } };
 	getSessionStats(): {
-		tokens: { input: number; output: number; cacheWrite: number };
+		tokens: { input: number; output: number; cacheWrite: number; cacheRead: number };
 		assistantMessages: number;
 		toolCalls: number;
 		cost: number;
