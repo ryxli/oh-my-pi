@@ -53,6 +53,7 @@ export const RUNNER_APIS = [
 	"openrouter-decisions",
 	"openai-decisions",
 	"workers-ai-systemone",
+	"bfl-images",
 	"openai-images",
 	"openrouter-images",
 	"xai-tts",
@@ -69,6 +70,7 @@ export const RUNNER_API_KINDS: Record<Exclude<(typeof RUNNER_APIS)[number], "loc
 	"openrouter-decisions": "judge",
 	"openai-decisions": "judge",
 	"workers-ai-systemone": "judge",
+	"bfl-images": "image",
 	"openai-images": "image",
 	"openrouter-images": "image",
 	"xai-tts": "tts",
@@ -88,6 +90,7 @@ export function runnerApiKind(api: Api): ModelKind | undefined {
 
 /** Catalog APIs `generate_image` runs through a pi-ai image client; the hosted Responses pair needs a carrier model. */
 export const IMAGE_GENERATION_APIS = [
+	"bfl-images",
 	"openai-images",
 	"openrouter-images",
 	"google-generative-ai",
