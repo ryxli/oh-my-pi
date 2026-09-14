@@ -33,6 +33,7 @@ import type { ArtifactManager } from "../session/artifacts";
 import type { ClientBridge } from "../session/client-bridge";
 import type { CostGate } from "../session/cost-gate";
 import type { CustomMessage } from "../session/messages";
+import type { SceneCut } from "../session/scene-cut";
 import type { UsageStatistics } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
@@ -51,6 +52,7 @@ import { BashTool } from "./bash";
 import { type BuiltinToolName, type HiddenToolName, normalizeToolNames } from "./builtin-names";
 import { type CheckpointState, CheckpointTool, type CompletedRewindState, RewindTool } from "./checkpoint";
 import { ContextNotesTool, NewContextTool } from "./context-notes";
+import { CutTool } from "./cut";
 import { DebugTool } from "./debug";
 import { cfgIdaAvailable } from "../ida/install";
 import { EvalTool } from "./eval";
@@ -126,6 +128,7 @@ export * from "./checkpoint";
 export * from "./computer";
 export * from "./computer/supervisor";
 export * from "./context-notes";
+export * from "./cut";
 export * from "./debug";
 export * from "./ida";
 export * from "./essential-tools";
@@ -537,6 +540,8 @@ export interface ToolSession {
 	 *  model for each file. Lazily initialized by `getDiagnosticsLedger`. */
 	diagnosticsLedger?: import("../lsp/diagnostics-ledger").DiagnosticsLedger;
 
+	/** Stage the one scene cut that may apply after the current model turn completes. */
+	stageSceneCut?(cut: SceneCut): void;
 	/** Queue a hidden message to be injected at the next agent turn. */
 	queueDeferredMessage?(message: CustomMessage): void;
 	/** Queue a broker supervised-process completion for the owning session. */
@@ -587,6 +592,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	rewind: RewindTool.createIf,
 	context_notes: ContextNotesTool.createIf,
 	new_context: NewContextTool.createIf,
+	cut: CutTool.createIf,
 	task: s => TaskTool.create(s),
 	wait: s => new WaitTool(s),
 	todo: s => new TodoTool(s),

@@ -4508,6 +4508,53 @@ func (v QueueUpdateEvent) MarshalJSON() ([]byte, error) {
 	return encodeObject(plain(v), `"type":"queue_update"`, nil)
 }
 
+// A scene handoff was applied with its continuation decision.
+type SceneCutAppliedEvent struct {
+	Continuation SceneCutAppliedEventContinuation `json:"continuation"`
+}
+
+func (v *SceneCutAppliedEvent) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "SceneCutAppliedEvent", v.decodeFrom)
+}
+
+func (v *SceneCutAppliedEvent) decodeFrom(raw map[string]json.RawMessage) error {
+	var out SceneCutAppliedEvent
+	d := fieldDecoder{raw: raw, owner: "SceneCutAppliedEvent"}
+	d.constant("type", "scene_cut_applied")
+	d.required("continuation", &out.Continuation)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v SceneCutAppliedEvent) MarshalJSON() ([]byte, error) {
+	type plain SceneCutAppliedEvent
+	return encodeObject(plain(v), `"type":"scene_cut_applied"`, nil)
+}
+
+type SceneCutAppliedEventContinuation string
+
+const (
+	SceneCutAppliedEventContinuationContinue SceneCutAppliedEventContinuation = "continue"
+	SceneCutAppliedEventContinuationWait     SceneCutAppliedEventContinuation = "wait"
+	SceneCutAppliedEventContinuationLimit    SceneCutAppliedEventContinuation = "limit"
+)
+
+func (v *SceneCutAppliedEventContinuation) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "SceneCutAppliedEventContinuation")
+	if err != nil {
+		return err
+	}
+	switch value := SceneCutAppliedEventContinuation(s); value {
+	case SceneCutAppliedEventContinuationContinue, SceneCutAppliedEventContinuationWait, SceneCutAppliedEventContinuationLimit:
+		*v = value
+		return nil
+	}
+	return unknownValue("SceneCutAppliedEventContinuation", s)
+}
+
 // A session event, discriminated by `type`; `set_event_filter` selects which are sent.
 type RpcAgentEvent struct {
 	// Value holds one variant, chosen by "type" on decode.
@@ -4553,6 +4600,7 @@ func (NoticeEvent) isRpcAgentEvent()                 {}
 func (ThinkingLevelChangedEvent) isRpcAgentEvent()   {}
 func (GoalUpdatedEvent) isRpcAgentEvent()            {}
 func (QueueUpdateEvent) isRpcAgentEvent()            {}
+func (SceneCutAppliedEvent) isRpcAgentEvent()        {}
 func (UnknownNotification) isRpcAgentEvent()         {}
 
 func (v RpcAgentEvent) MarshalJSON() ([]byte, error) {
@@ -4640,6 +4688,8 @@ func (v *RpcAgentEvent) decodeFrom(raw map[string]json.RawMessage) error {
 		value, err = decodeVariant[GoalUpdatedEvent](raw)
 	case "queue_update":
 		value, err = decodeVariant[QueueUpdateEvent](raw)
+	case "scene_cut_applied":
+		value, err = decodeVariant[SceneCutAppliedEvent](raw)
 	default:
 		return unknownValue("RpcAgentEvent.type", tag)
 	}
@@ -6729,6 +6779,7 @@ func (NoticeEvent) isRpcNotification()                  {}
 func (ThinkingLevelChangedEvent) isRpcNotification()    {}
 func (GoalUpdatedEvent) isRpcNotification()             {}
 func (QueueUpdateEvent) isRpcNotification()             {}
+func (SceneCutAppliedEvent) isRpcNotification()         {}
 func (UnknownNotification) isRpcNotification()          {}
 
 func (v RpcNotification) MarshalJSON() ([]byte, error) {
@@ -6853,6 +6904,8 @@ func (v *RpcNotification) UnmarshalJSON(data []byte) error {
 		value, err = decodeVariant[GoalUpdatedEvent](raw)
 	case "queue_update":
 		value, err = decodeVariant[QueueUpdateEvent](raw)
+	case "scene_cut_applied":
+		value, err = decodeVariant[SceneCutAppliedEvent](raw)
 	default:
 		value = newUnknownNotification(tag, data)
 	}
@@ -6934,6 +6987,7 @@ func (NoticeEvent) isRpcServerFrame()                  {}
 func (ThinkingLevelChangedEvent) isRpcServerFrame()    {}
 func (GoalUpdatedEvent) isRpcServerFrame()             {}
 func (QueueUpdateEvent) isRpcServerFrame()             {}
+func (SceneCutAppliedEvent) isRpcServerFrame()         {}
 func (UnknownNotification) isRpcServerFrame()          {}
 
 func (v RpcServerFrame) MarshalJSON() ([]byte, error) {
@@ -7068,6 +7122,8 @@ func (v *RpcServerFrame) UnmarshalJSON(data []byte) error {
 		value, err = decodeVariant[GoalUpdatedEvent](raw)
 	case "queue_update":
 		value, err = decodeVariant[QueueUpdateEvent](raw)
+	case "scene_cut_applied":
+		value, err = decodeVariant[SceneCutAppliedEvent](raw)
 	default:
 		value = newUnknownNotification(tag, data)
 	}
