@@ -50,7 +50,7 @@ import {
 	hasGlobPattern,
 	readLocationContext,
 	resolveDiagnosticTargets,
-	resolveSymbolColumn,
+	resolveSymbolPosition,
 	uriToFile,
 } from "@oh-my-pi/pi-coding-agent/lsp/utils";
 import { getThemeByName, initTheme } from "@oh-my-pi/pi-tui/theme";
@@ -564,7 +564,7 @@ describe("lsp regressions", () => {
 			const fifo = path.join(tempDir.path(), "input.ts");
 			try {
 				expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
-				const outcome = await raceFifoRead(resolveSymbolColumn(fifo, 1), fifo);
+				const outcome = await raceFifoRead(resolveSymbolPosition(fifo, 1), fifo);
 				expect(outcome).toBeInstanceOf(Error);
 				expect(outcome).toHaveProperty("message", fifoRefusal(fifo));
 			} finally {
@@ -1605,8 +1605,8 @@ describe("lsp regressions", () => {
 			const filePath = path.join(tempDir.path(), "symbol.ts");
 			await Bun.write(filePath, "foo(bar(foo));\n");
 
-			expect(await resolveSymbolColumn(filePath, 1, "foo")).toBe(0);
-			expect(await resolveSymbolColumn(filePath, 1, "foo#2")).toBe(8);
+			expect(await resolveSymbolPosition(filePath, 1, "foo")).toEqual({ line: 1, character: 0, recovered: false });
+			expect(await resolveSymbolPosition(filePath, 1, "foo#2")).toEqual({ line: 1, character: 8, recovered: false });
 		} finally {
 			tempDir.removeSync();
 		}
@@ -1618,7 +1618,7 @@ describe("lsp regressions", () => {
 			const filePath = path.join(tempDir.path(), "symbol.ts");
 			await Bun.write(filePath, "winston.info('x');\n");
 
-			expect(resolveSymbolColumn(filePath, 1, "nonexistent_symbol")).rejects.toThrow(
+			await expect(resolveSymbolPosition(filePath, 1, "nonexistent_symbol")).rejects.toThrow(
 				'Symbol "nonexistent_symbol" not found on line 1',
 			);
 		} finally {
@@ -1632,12 +1632,25 @@ describe("lsp regressions", () => {
 			const filePath = path.join(tempDir.path(), "symbol.ts");
 			await Bun.write(filePath, "foo();\n");
 
-			expect(resolveSymbolColumn(filePath, 1, "foo#2")).rejects.toThrow(
+			await expect(resolveSymbolPosition(filePath, 1, "foo#2")).rejects.toThrow(
 				'Symbol "foo" occurrence 2 is out of bounds on line 1 (found 1)',
 			);
 		} finally {
 			tempDir.removeSync();
 		}
+	});
+
+	it("returns the recovered line together with its column", async () => {
+		using tempDir = TempDir.createSync("@omp-lsp-recovered-symbol-");
+		const filePath = path.join(tempDir.path(), "symbol.ts");
+		await Bun.write(filePath, "\n  uniqueSymbol();\n");
+		expect(await resolveSymbolPosition(filePath, 1, "uniqueSymbol")).toEqual({
+			line: 2,
+			character: 2,
+			recovered: true,
+		});
+		await Bun.write(filePath, "\n  uniqueSymbol();\nuniqueSymbol();\n");
+		await expect(resolveSymbolPosition(filePath, 1, "uniqueSymbol")).rejects.toThrow("found 2 occurrences");
 	});
 
 	it("filters and deduplicates workspace symbols by query", () => {
@@ -4091,7 +4104,7 @@ describe("lsp regressions", () => {
 
 	it("resolves $-prefixed identifiers past compound matches", async () => {
 		// Pre-fix, BARE_IDENTIFIER_RE rejected leading `$`, so requireWordBoundary
-		// was false and `resolveSymbolColumn(_, _, "$store")` returned the column
+		// was false and symbol resolution returned the column
 		// inside `bar$store` rather than the standalone occurrence, feeding the
 		// LSP server the wrong column. The new regex `/^[$A-Za-z_][\w$]*$/` plus
 		// IDENTIFIER_CHAR_RE's existing `$` membership enforces the boundary.
@@ -4103,13 +4116,13 @@ describe("lsp regressions", () => {
 			// returns 16.
 			await Bun.write(filePath, "let bar$store = $store + 1;\n");
 
-			const column = await resolveSymbolColumn(filePath, 1, "$store");
-			expect(column).toBe(16);
+			const position = await resolveSymbolPosition(filePath, 1, "$store");
+			expect(position.character).toBe(16);
 
 			// `bar$store` is itself a valid `$`-bearing identifier and resolves
 			// to its own start, not into either fragment.
-			const compoundColumn = await resolveSymbolColumn(filePath, 1, "bar$store");
-			expect(compoundColumn).toBe(4);
+			const compoundPosition = await resolveSymbolPosition(filePath, 1, "bar$store");
+			expect(compoundPosition.character).toBe(4);
 		} finally {
 			tempDir.removeSync();
 		}
@@ -5043,9 +5056,9 @@ describe("lsp regressions", () => {
 			},
 			idleTimeoutMs: undefined,
 		});
-		vi.spyOn(lspClient, "getActiveClients").mockReturnValue([
-			{ name: "typescript-language-server", status: "ready", fileTypes: [".ts"] },
-		]);
+		vi.spyOn(lspClient, "getActiveOrPendingClient").mockImplementation(async config =>
+			config.command === "typescript-language-server" ? ({ status: "ready" } as LspClient) : undefined,
+		);
 
 		const tool = new LspTool(makeLspSession(process.cwd()));
 		const result = await tool.execute("status-test", { action: "status" });
