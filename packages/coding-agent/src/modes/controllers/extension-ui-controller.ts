@@ -2,6 +2,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { Component, OverlayHandle, TUI } from "@oh-my-pi/pi-tui";
 import { Container, Spacer, Text } from "@oh-my-pi/pi-tui";
 import type { CollabUiRequestDraft, CollabUiSelectItem } from "@oh-my-pi/pi-wire";
+import type { BackgroundJobRun } from "../../async";
 import type { CollabHost } from "../../collab/host";
 import { formatKeyHint, formatKeyHints, KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import type {
@@ -302,6 +303,7 @@ export class ExtensionUiController {
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
 			runEphemeralTurn: args => this.ctx.session.runEphemeralTurn(args),
 			startLive: options => this.ctx.startRemoteLive(options),
+			registerBackgroundJob: (label, run) => this.#registerBackgroundJob(label, run),
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
@@ -527,6 +529,7 @@ export class ExtensionUiController {
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
 			runEphemeralTurn: args => this.ctx.session.runEphemeralTurn(args),
 			startLive: options => this.ctx.startRemoteLive(options),
+			registerBackgroundJob: (label, run) => this.#registerBackgroundJob(label, run),
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
@@ -1721,6 +1724,17 @@ export class ExtensionUiController {
 				this.ctx.showError(`Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`);
 			});
 	};
+
+	/**
+	 * Owner-stamp a tool's background job against the *current* session. The
+	 * session object is replaced on reload/switch, so the manager is resolved
+	 * per call rather than captured when the action set is built.
+	 */
+	#registerBackgroundJob(label: string, run: BackgroundJobRun): string {
+		const manager = this.ctx.session.asyncJobManager;
+		if (!manager) throw new Error("Background job manager unavailable for this session.");
+		return manager.register("tool", label, run, { ownerId: this.ctx.session.getAgentId() });
+	}
 
 	/** Every `sendUserMessage` form prompts or queues a user turn (see `AgentSession.sendUserMessage`). */
 	#sendExtensionUserMessage: SendUserMessageHandler = (content, options) => {
