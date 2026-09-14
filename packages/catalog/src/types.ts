@@ -51,6 +51,7 @@ export const RUNNER_APIS = [
 	"web-search",
 	"typesafe",
 	"openrouter-decisions",
+	"bfl-images",
 	"openai-images",
 	"openrouter-images",
 	"xai-tts",
