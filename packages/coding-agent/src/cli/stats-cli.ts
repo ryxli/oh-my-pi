@@ -61,6 +61,8 @@ export interface StatsCommandArgs {
 	host: string;
 	json: boolean;
 	summary: boolean;
+	/** Window for `--summary` / `--json`: 1h, 24h, 7d, 30d, 90d, all. Default 24h. */
+	range?: string;
 }
 
 // =============================================================================
@@ -90,9 +92,9 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 		const total = await getTotalMessageCount();
 		process.stderr.write(`Synced ${processed} new entries from ${files} files (${total} total)\n\n`);
 		if (cmd.json) {
-			console.log(JSON.stringify(await getDashboardStats(), null, 2));
+			console.log(JSON.stringify(await getDashboardStats(cmd.range), null, 2));
 		} else {
-			await printStatsSummary();
+			await printStatsSummary(cmd.range);
 		}
 		return;
 	}
