@@ -45,6 +45,7 @@ export interface LspParams {
 		| "capabilities"
 		| "request";
 	file?: string;
+	workspace?: string;
 	line?: number;
 	symbol?: string;
 	query?: string;
