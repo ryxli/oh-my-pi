@@ -685,41 +685,109 @@ function findSymbolMatchIndexes(lineText: string, symbol: string, caseInsensitiv
  * Greedy match on `.+` so `#name#2` parses as symbol=`#name` (TS private field)
  * with occurrence 2. Specs without a trailing `#\d+` are treated as literal.
  */
-function parseSymbolSpec(spec: string): { symbol: string; occurrence: number } {
+export function parseSymbolSpec(spec: string): { symbol: string; occurrence: number } {
 	const match = spec.match(/^(.+)#(\d+)$/);
 	if (!match) return { symbol: spec, occurrence: 1 };
 	const occurrence = Math.max(1, Number.parseInt(match[2], 10));
 	return { symbol: match[1], occurrence };
 }
 
-export async function resolveSymbolColumn(filePath: string, line: number, symbolSpec?: string): Promise<number> {
+export interface SymbolPosition {
+	/** One-based file line, matching the LSP tool's public input. */
+	line: number;
+	character: number;
+	/** True when a unique file-wide match repaired a stale or approximate line hint. */
+	recovered: boolean;
+}
+
+export class AmbiguousSymbolPositionError extends Error {
+	readonly matches: ReadonlyArray<Pick<SymbolPosition, "line" | "character">>;
+
+	constructor(
+		readonly symbol: string,
+		readonly requestedLine: number,
+		matches: ReadonlyArray<Pick<SymbolPosition, "line" | "character">>,
+	) {
+		const matchLines = Array.from(new Set(matches.map(match => match.line)));
+		const preview = matchLines.slice(0, 8).join(", ");
+		const suffix = matchLines.length > 8 ? ", …" : "";
+		super(
+			`Symbol "${symbol}" not found on line ${requestedLine}; found ${matches.length} occurrences at lines ${preview}${suffix}. Use one of those lines.`,
+		);
+		this.name = "AmbiguousSymbolPositionError";
+		this.matches = matches;
+	}
+}
+
+/**
+ * Resolve an LSP position from an agent's line hint and symbol.
+ *
+ * Agents often know a symbol but only have an approximate line from a summary,
+ * diagnostic, or previously edited file. A unique file-wide occurrence is safe
+ * to recover. Multiple occurrences remain an error: silently choosing one
+ * would send plausible-looking requests for the wrong declaration.
+ */
+export async function resolveSymbolPosition(
+	filePath: string,
+	line: number,
+	symbolSpec?: string,
+): Promise<SymbolPosition> {
 	const lineNumber = Math.max(1, line);
 	try {
 		const fileText = await Bun.file(filePath).text();
 		const lines = fileText.split("\n");
 		const targetLine = lines[lineNumber - 1] ?? "";
 		if (!symbolSpec) {
-			return firstNonWhitespaceColumn(targetLine);
+			return { line: lineNumber, character: firstNonWhitespaceColumn(targetLine), recovered: false };
 		}
 
 		const { symbol, occurrence } = parseSymbolSpec(symbolSpec);
 		const exactIndexes = findSymbolMatchIndexes(targetLine, symbol);
-		const fallbackIndexes = exactIndexes.length > 0 ? exactIndexes : findSymbolMatchIndexes(targetLine, symbol, true);
-		if (fallbackIndexes.length === 0) {
+		const targetIndexes = exactIndexes.length > 0 ? exactIndexes : findSymbolMatchIndexes(targetLine, symbol, true);
+		if (targetIndexes.length > 0) {
+			if (occurrence > targetIndexes.length) {
+				throw new Error(
+					`Symbol "${symbol}" occurrence ${occurrence} is out of bounds on line ${lineNumber} (found ${targetIndexes.length})`,
+				);
+			}
+			return { line: lineNumber, character: targetIndexes[occurrence - 1], recovered: false };
+		}
+
+		// `symbol#N` explicitly selects one occurrence on the supplied line.
+		// A file-wide repair would change that meaning, so leave it strict.
+		if (occurrence !== 1) {
 			throw new Error(`Symbol "${symbol}" not found on line ${lineNumber}`);
 		}
-		if (occurrence > fallbackIndexes.length) {
-			throw new Error(
-				`Symbol "${symbol}" occurrence ${occurrence} is out of bounds on line ${lineNumber} (found ${fallbackIndexes.length})`,
-			);
+
+		const collect = (caseInsensitive: boolean): Array<{ line: number; character: number }> => {
+			const matches: Array<{ line: number; character: number }> = [];
+			for (let index = 0; index < lines.length; index++) {
+				for (const character of findSymbolMatchIndexes(lines[index] ?? "", symbol, caseInsensitive)) {
+					matches.push({ line: index + 1, character });
+				}
+			}
+			return matches;
+		};
+		const exactMatches = collect(false);
+		const matches = exactMatches.length > 0 ? exactMatches : collect(true);
+		if (matches.length === 1) {
+			return { ...matches[0], recovered: true };
 		}
-		return fallbackIndexes[occurrence - 1];
+		if (matches.length === 0) {
+			throw new Error(`Symbol "${symbol}" not found on line ${lineNumber}`);
+		}
+		throw new AmbiguousSymbolPositionError(symbol, lineNumber, matches);
 	} catch (error) {
 		if (isEnoent(error)) {
 			throw new Error(`File not found: ${filePath}`);
 		}
 		throw error;
 	}
+}
+
+/** Backward-compatible column-only view for callers that already own the line. */
+export async function resolveSymbolColumn(filePath: string, line: number, symbolSpec?: string): Promise<number> {
+	return (await resolveSymbolPosition(filePath, line, symbolSpec)).character;
 }
 
 export async function readLocationContext(filePath: string, line: number, contextLines = 1): Promise<string[]> {
