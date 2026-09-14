@@ -403,6 +403,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 	#observedById = new Map<string, ObservableSession>();
 	#aggregate: AggregateMetrics = {
 		tokens: 0,
+		cacheReadTokens: 0,
 		requests: 0,
 		tools: 0,
 		cost: 0,
@@ -2009,6 +2010,7 @@ export class AgentHubOverlayComponent<TRecord extends AgentRecordLike = AgentRec
 			theme.fg("dim", `${formatNumber(metrics.requests)} req`),
 			theme.fg("dim", `${formatNumber(metrics.tools)} tools`),
 			theme.fg("dim", `${formatNumber(metrics.tokens)} tok`),
+			...(metrics.cacheReadTokens ? [theme.fg("dim", `${formatNumber(metrics.cacheReadTokens)} cached`)] : []),
 			theme.fg("dim", `${metrics.activeDurationAgents}/${metrics.reportedAgents} timed`),
 			theme.fg("dim", `${metrics.reportedAgents}/${this.#rows.length} measured`),
 		].join(theme.fg("dim", theme.sep.dot));

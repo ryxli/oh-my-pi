@@ -15,6 +15,12 @@ export default class Stats extends Command {
 		host: Flags.string({ description: "Host to bind", default: "127.0.0.1" }),
 		json: Flags.boolean({ char: "j", description: "Output stats as JSON", default: false }),
 		summary: Flags.boolean({ char: "s", description: "Print summary to console", default: false }),
+		range: Flags.string({
+			char: "r",
+			description: "Window for --summary/--json: 1h, 24h, 7d, 30d, 90d, all",
+			options: ["1h", "24h", "7d", "30d", "90d", "all"],
+			default: "24h",
+		}),
 	};
 
 	async run(): Promise<void> {
@@ -25,6 +31,7 @@ export default class Stats extends Command {
 			host: flags.host ?? "127.0.0.1",
 			json: flags.json,
 			summary: flags.summary,
+			range: flags.range,
 		};
 
 		await theme.initTheme();

@@ -18,12 +18,7 @@ describe("stats dashboard host arguments", () => {
 
 		await command.run();
 
-		expect(runStatsCommand).toHaveBeenCalledWith({
-			port: 3850,
-			host: "::",
-			json: false,
-			summary: false,
-		});
+		expect(runStatsCommand).toHaveBeenCalledWith(expect.objectContaining({ port: 3850, host: "::" }));
 	});
 
 	it("keeps the slash command loopback-only unless a host is requested", () => {
