@@ -72,6 +72,7 @@ import type { MCPManagerApi, MCPToolScope } from "../mcp/manager";
 import type { MnemopiSessionStateApi } from "../mnemopi/state";
 import { initializeExtensions } from "../modes/runtime-init";
 import subagentAsyncPendingTemplate from "../prompts/system/subagent-async-pending.md" with { type: "text" };
+import subagentExecuteWriteReminderTemplate from "../prompts/system/subagent-execute-write-reminder.md" with { type: "text" };
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
 import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-lifecycle";
@@ -117,6 +118,12 @@ import { DEFAULT_PEER_ROSTER_LIMIT } from "@oh-my-pi/pi-tui/tools/irc";
 import { normalizeSchema } from "../tools/jtd-to-json-schema";
 import { buildOutputValidator, summarizeValidationFailure } from "../tools/output-schema-validator";
 import { ToolAbortError } from "../tools/tool-errors";
+import {
+	type ExecuteYieldGuard,
+	executeWritesChanged,
+	snapshotExecuteWrite,
+	validateExecuteMode,
+} from "./execute-mode";
 import { resetYieldTurnState } from "../tools/yield";
 import { type EventBus, emitSubagentFrame } from "../utils/event-bus";
 import { trackLateCleanup } from "../utils/late-cleanup";
@@ -467,6 +474,10 @@ export interface ExecutorOptions {
 	assignment?: string;
 	/** Shared background from the task call (`task.batch`), rendered into the subagent's system prompt. */
 	context?: string;
+	/** Frozen execution mode rejects a successful terminal yield unless a declared target changes. */
+	mode?: "execute";
+	/** Workspace-relative files a frozen execution task must change. */
+	writes?: string[];
 	/**
 	 * The session's active overall plan, handed off so subagents spawned during
 	 * plan execution share the same plan context as the main agent. Omitted when
@@ -1348,6 +1359,8 @@ interface RunMonitorArgs {
 	completionProbe: boolean;
 	/** Fires each time a terminal `yield` is recorded for this run. */
 	onYieldAccepted?: () => void;
+	/** Execute-mode yields are evaluated by the driver before the session terminates. */
+	executeMode: boolean;
 }
 
 /**
@@ -1371,6 +1384,10 @@ interface SubagentRunMonitor {
 	markFinalYieldForced(forced: boolean): void;
 	/** Epoch ms when the run's terminal `yield` was recorded; undefined while none is latched. */
 	yieldAcceptedAt(): number | undefined;
+	/** Whether the latest recorded terminal yield is successful. */
+	lastYieldSucceeded(): boolean;
+	/** Unlatch a successful yield so the same live session can receive one correction turn. */
+	invalidateYieldForCorrection(): void;
 	runtimeLimitExceeded(): boolean;
 	/** True once the soft-budget stop fired: the free-running turn was aborted and the run is being driven to a forced final yield. */
 	budgetStopRequested(): boolean;
@@ -2142,7 +2159,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 							// the quiescence barrier and the next step instead of
 							// completing it (see requestYieldTurnStop).
 							requestYieldTurnStop();
-						} else {
+						} else if (!(event.toolName === "yield" && args.executeMode)) {
 							requestAbort("terminate");
 						}
 					}
@@ -2469,6 +2486,25 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			finalYieldForced = forced;
 		},
 		yieldAcceptedAt: () => yieldAcceptedAt,
+		lastYieldSucceeded: () => {
+			const yields = progress.extractedToolData?.yield as YieldItem[] | undefined;
+			const lastYield = yields?.[yields.length - 1];
+			return lastYield?.status === "success" && !Array.isArray(lastYield.type);
+		},
+		invalidateYieldForCorrection: () => {
+			const yields = progress.extractedToolData?.yield as YieldItem[] | undefined;
+			if (yields) {
+				for (let index = yields.length - 1; index >= 0; index--) {
+					if (!Array.isArray(yields[index]?.type)) {
+						yields.splice(index, 1);
+						break;
+					}
+				}
+			}
+			yieldCalled = false;
+			yieldAcceptedAt = undefined;
+			lastReportTurnText = undefined;
+		},
 		runtimeLimitExceeded: () => runtimeLimitExceeded,
 		terminalError: () => terminalError,
 		hasExplicitAbortReason: () =>
@@ -2625,8 +2661,8 @@ function endsRun(err: unknown): boolean {
  * classify the terminal assistant state. A soft-budget stop short-circuits the
  * reminder ladder into a single forced final yield so partial findings still
  * come back as a real report. Without a `yield` tool (`structured: false`) an
- * idle turn already ended on the final message, so only a budget stop prompts
- * again: one tool-less wrap-up turn.
+ * idle turn already ended on the final message. A budget stop prompts one
+ * tool-less wrap-up turn; execute mode allows one missing-write correction.
  */
 async function driveSessionToResult(
 	session: AgentSession,
@@ -2654,6 +2690,7 @@ async function driveSessionToResult(
 		/** Where what each prompt before the last delivered goes; unset, the reports go nowhere. */
 		stepReports?: StepReportRoute;
 	} = {},
+	executeGuard?: ExecuteYieldGuard,
 ): Promise<DriveOutcome> {
 	const { solutionSpace, onPromptBusy, restore, steps, stepReports } = options;
 	const structured = options.structured !== false;
@@ -2879,16 +2916,23 @@ async function driveSessionToResult(
 		// Runs that exhaust the ladder once their run ended, or hit a terminal
 		// model error, skip the barrier; teardown reaps their jobs. Each step
 		// settles the same way before the next one is sent.
-		const settle = async (): Promise<void> => {
+		const settle = async (checkWrites = false): Promise<void> => {
 			let asyncPendingNoticeSent = false;
+			let executeCorrectionSent = false;
 			while (!abortSignal.aborted) {
 				if (!monitor.yieldCalled()) {
-					await runYieldLadder();
+					const hasCorrectedTextResult =
+						executeCorrectionSent &&
+						!structured &&
+						!session.isRunActive &&
+						resultDelivered({ exitCode, aborted }, monitor, structured);
+					if (!hasCorrectedTextResult) await runYieldLadder();
 					if (
 						!monitor.yieldCalled() &&
-						(monitor.budgetStopRequested() ||
+						((monitor.budgetStopRequested() &&
+							!(executeGuard && !structured && resultDelivered({ exitCode, aborted }, monitor, structured))) ||
 							session.getLastAssistantMessage()?.stopReason === "error" ||
-							!session.isRunActive)
+							(structured && !session.isRunActive))
 					)
 						break;
 				}
@@ -2896,8 +2940,40 @@ async function driveSessionToResult(
 				// prompting again (mirrors waitForBudgetStop).
 				await awaitAbortable(monitor.waitForYieldTurnStop());
 				if (!session.isRunActive) {
-					if (monitor.yieldCalled()) break;
-					continue;
+					if (
+						checkWrites &&
+						executeGuard &&
+						(structured
+							? monitor.lastYieldSucceeded()
+							: session.getLastAssistantMessage()?.stopReason !== "aborted" &&
+								resultDelivered({ exitCode, aborted }, monitor, structured))
+					) {
+						let changed: boolean;
+						try {
+							changed = await executeWritesChanged(executeGuard.cwd, executeGuard.initialSnapshots);
+						} catch (snapshotError) {
+							exitCode = 1;
+							error ??= `Unable to verify declared execute targets: ${snapshotError instanceof Error ? snapshotError.message : String(snapshotError)}`;
+							break;
+						}
+						if (!changed) {
+							if (executeCorrectionSent) {
+								exitCode = 1;
+								error ??= "Execute task completed successfully twice without changing a declared write target.";
+								break;
+							}
+							executeCorrectionSent = true;
+							monitor.invalidateYieldForCorrection();
+							await dispatchPrompt(
+								subagentExecuteWriteReminderTemplate,
+								{ attribution: "agent", synthetic: true },
+								"execute write correction",
+							);
+							await awaitAbortable(session.waitForIdle());
+							continue;
+						}
+					}
+					break;
 				}
 				if (!monitor.yieldCalled()) {
 					await awaitAbortable(session.waitForRunEnd());
@@ -2933,7 +3009,7 @@ async function driveSessionToResult(
 				// recorded yield: the next iteration's ladder demands a fresh one.
 			}
 		};
-		await settle();
+		await settle(!steps || steps.sent >= steps.prompts.length);
 
 		// Send each remaining step once the previous one was delivered: an
 		// accepted yield, or without `yield` a clean final message. A step that
@@ -2957,7 +3033,7 @@ async function driveSessionToResult(
 			await runTurn(() =>
 				dispatchPrompt(stepPrompt, { attribution: "agent", solutionSpace }, `step prompt ${next + 1}`),
 			);
-			await settle();
+			await settle(next + 1 >= steps.prompts.length);
 		}
 
 		if (!monitor.yieldCalled()) {
@@ -3610,6 +3686,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			onProgress: progress => reportJobProgress?.(progress),
 			onToolResult: result => appendToolResult(tools, result),
 			onYieldAccepted: registerWakeJob,
+			executeMode: false,
 		});
 
 		const startedPayload = {
@@ -4122,6 +4199,7 @@ async function driveFollowUpTurn(
 		softRequestBudgetNotice,
 		maxRuntimeMs: options.maxRuntimeMs ?? 0,
 		completionProbe: options.completionProbe ?? false,
+		executeMode: false,
 	});
 
 	const startedPayload = {
@@ -4658,6 +4736,42 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 		};
 	}
 
+	let executeGuard: ExecuteYieldGuard | undefined;
+	let executePreparationError = validateExecuteMode(options);
+	if (!executePreparationError && options.mode === "execute") {
+		try {
+			executeGuard = {
+				cwd: worktree ?? cwd,
+				initialSnapshots: await Promise.all(
+					options.writes!.map(write => snapshotExecuteWrite(worktree ?? cwd, write)),
+				),
+			};
+		} catch (snapshotError) {
+			executePreparationError = snapshotError instanceof Error ? snapshotError.message : String(snapshotError);
+		}
+	}
+	if (executePreparationError) {
+		return {
+			index,
+			id,
+			agent: agent.name,
+			agentSource: agent.source,
+			task,
+			assignment,
+			description: options.description,
+			exitCode: 1,
+			output: "",
+			stderr: executePreparationError,
+			truncated: false,
+			durationMs: Date.now() - startTime,
+			tokens: 0,
+			requests: 0,
+			modelOverride,
+			modelRole,
+			error: executePreparationError,
+		};
+	}
+
 	// Set up artifact paths and write input file upfront if artifacts dir provided
 	let subtaskSessionFile: string | undefined;
 	if (options.artifactsDir) {
@@ -4784,6 +4898,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 		softRequestBudgetNotice,
 		maxRuntimeMs,
 		completionProbe,
+		executeMode: options.mode === "execute",
 	});
 	const progress = monitor.progress;
 	let unsubscribe: (() => void) | null = null;
@@ -5478,7 +5593,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 				structured,
 				steps: options.steps?.length ? { prompts: options.steps, sent: 1 } : undefined,
 				stepReports: options.parentAgentId ? { from: id, to: options.parentAgentId } : undefined,
-			});
+			}, executeGuard);
 			// Acceptance boundary (#11079): the run's final result is settled, so
 			// stamp the lifecycle and terminalize a ref the run-state mirror left
 			// `running` before the (possibly slow) cleanup below.

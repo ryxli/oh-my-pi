@@ -49,6 +49,7 @@ import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
 import { AgentRegistry, isResumable } from "../registry/agent-registry";
 import { type DiscoveryResult, discoverAgents } from "./discovery";
 import { createEvalCustomTools, describeEvalTools, evalToolsEnabled } from "./eval-tools";
+import { validateExecuteMode } from "./execute-mode";
 import { getPerCallModelAdvertisement, type PerCallModelAdvertisement } from "./model-approval";
 import { generateTaskName } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
@@ -308,6 +309,8 @@ function validateSpawnParams(
 			if (effortError) return effortError;
 			const modelError = validateModel(item, label, settings);
 			if (modelError) return modelError;
+			const executeError = validateExecuteMode(item, label);
+			if (executeError) return executeError;
 		}
 		const seen = new Map<string, string>();
 		for (const item of tasks) {
@@ -331,7 +334,8 @@ function validateSpawnParams(
 	return (
 		validateTaskInput(params, "The call", stepsEnabled) ??
 		validateEffort(params.effort, "The call") ??
-		validateModel(params, "The call", settings)
+		validateModel(params, "The call", settings) ??
+		validateExecuteMode(params, "The call")
 	);
 }
 
@@ -361,6 +365,8 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 	if ("schemaMode" in params) item.schemaMode = params.schemaMode;
 	if ("tools" in params) item.tools = params.tools;
 	if ("effort" in params) item.effort = params.effort;
+	if ("mode" in params) item.mode = params.mode;
+	if ("writes" in params) item.writes = params.writes;
 	if ("isolated" in params) item.isolated = params.isolated;
 	if ("model" in params) item.model = params.model;
 	return [item];
@@ -387,6 +393,8 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 	if ("tools" in item) spawn.tools = item.tools;
 	if ("effort" in item) spawn.effort = item.effort;
 	if ("model" in item) spawn.model = item.model;
+	if ("mode" in item) spawn.mode = item.mode;
+	if ("writes" in item) spawn.writes = item.writes;
 	if (item.isolated !== undefined) {
 		spawn.isolated = item.isolated;
 	} else if ("isolated" in params) {
@@ -1861,6 +1869,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				...spawnModelFields(params),
 				...this.#resultParams(params),
 				...this.#effortParams(params),
+				...(params.mode === "execute" ? { mode: params.mode, writes: params.writes } : {}),
 				solutionSpace: params.solutionSpace,
 				...(params.tools?.length
 					? {

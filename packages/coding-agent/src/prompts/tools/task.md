@@ -90,6 +90,7 @@ Run one agent synchronously.
 
 Shared edits need one integration owner; give each task its files{{#unless batchEnabled}} and interfaces{{/unless}}.
 Every task MUST skip build/lint/tests/formatters mid-flight; run once afterward.
+For a settled mutating contract, use `mode: "execute"` with non-empty workspace-relative `writes`. Completion requires a declared file change; OMP prompts once to correct an artifact-free yield, then fails. Never use for research or review.
 
 # Available Agents
 {{#if spawningDisabled}}Agent spawning is currently disabled.
