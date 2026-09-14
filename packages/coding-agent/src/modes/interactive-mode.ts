@@ -2928,6 +2928,9 @@ export class InteractiveMode implements InteractiveModeContext {
 				// A turn the TUI did not submit (an extension message, a background job) leaves
 				// getUserInput pending, so arm the loop's next iteration here instead.
 				if (event.type === "agent_end" && this.onInputCallback) this.#scheduleLoopAutoSubmit();
+				if (event.type === "scene_cut_applied" && event.continuation !== "continue") {
+					this.pauseLoop();
+				}
 				void this.#handleGoalSessionEvent(event);
 			}),
 			cfgLiveUiSettings.listen(this.settings, (next, previous) => this.#applyUiSettingChanges(next, previous)),

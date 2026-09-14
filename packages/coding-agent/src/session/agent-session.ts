@@ -211,6 +211,7 @@ import planModeReferencePrompt from "../prompts/system/plan-mode-reference.md" w
 import planModeToolDecisionReminderPrompt from "../prompts/system/plan-mode-tool-decision-reminder.md" with { type: "text" };
 import rewindReportTemplate from "../prompts/system/rewind-report.md" with { type: "text" };
 import sessionStopBlockedPrompt from "../prompts/system/session-stop-blocked.md" with { type: "text" };
+import sceneCutTemplate from "../prompts/system/scene-cut.md" with { type: "text" };
 import sideChannelNoToolsReminder from "../prompts/system/side-channel-no-tools.md" with { type: "text" };
 import titleCardPrompt from "../prompts/system/title-card.md" with { type: "text" };
 import titleForkPrompt from "../prompts/system/title-fork.md" with { type: "text" };
@@ -455,6 +456,7 @@ import {
 } from "./queued-messages";
 import { checkCodexBalance, readResetMarker, resetLockPath, withResetFence } from "./reset-fence";
 import type { ServingModel } from "./retry-fallback-chains";
+import { SCENE_CUT_MESSAGE_TYPE, type SceneCut, SceneCutCoordinator } from "./scene-cut";
 import {
 	type AdvisorCatchupOptions,
 	type AdvisorStats,
@@ -1332,6 +1334,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#postPromptTasks = new Set<Promise<unknown>>();
 	#postPromptTasksPromise: Promise<void> | undefined = undefined;
 	#postPromptTasksResolve: (() => void) | undefined = undefined;
+	/** Scene application deferred past the run that staged it; idle waits include it. */
+	#scheduledSceneCut: Promise<void> | undefined;
 	#postPromptTasksAbortController = new AbortController();
 	/**
 	 * Cancels the current turn's pre-dispatch setup (memory-backend auto-recall and
@@ -1450,6 +1454,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#checkpointState: CheckpointState | undefined = undefined;
 	#pendingRewindReport: string | undefined = undefined;
 	#lastCompletedRewind: CompletedRewindState | undefined = undefined;
+	readonly #sceneCut = new SceneCutCoordinator();
 	#rewoundToolResultIds = new Set<string>();
 	#lastSuccessfulYieldToolCallId: string | undefined = undefined;
 	/**
@@ -5082,6 +5087,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// repeatedly on provider errors otherwise leaves no actionable trace
 			// outside the session transcript (issue #6177).
 			logProviderTurnError(msg);
+			if (this.#sceneCut.hasStaged) {
+				maintenanceRoute("scene-cut-staged");
+				await emitAgentEndNotification();
+				return;
+			}
 
 			// Invalidate GitHub Copilot credentials on a hard auth failure (401, or an
 			// expired/revoked token) so stale tokens aren't reused on the next request.
@@ -5448,6 +5458,23 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		})();
 		this.#trackPostPromptTask(scheduled);
 	}
+	#scheduleSceneCutApplication(): void {
+		const application = (async () => {
+			await Bun.sleep(0);
+			if (this.#isDisposed || !this.#sceneCut.hasStaged) return;
+			await this.#drainInFlightEventHandlers();
+			await this.#applyPendingSceneCut();
+		})()
+			.catch(error => {
+				logger.warn("Failed to apply staged scene cut", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			})
+			.finally(() => {
+				if (this.#scheduledSceneCut === application) this.#scheduledSceneCut = undefined;
+			});
+		this.#scheduledSceneCut = application;
+	}
 
 	#skipAgentContinue(reason: AgentContinueSkipReason, request: ScheduledAgentContinueRequest): void {
 		logger.debug("agent.continue skipped after scheduling", {
@@ -5507,6 +5534,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				try {
 					if (!this.agent.state.isStreaming) onStart?.();
 					await this.agent.continue(signal);
+					if (this.#sceneCut.hasStaged) this.#scheduleSceneCutApplication();
 					return { status: "completed" };
 				} catch (error) {
 					if (!(error instanceof AgentBusyError)) throw error;
@@ -5683,7 +5711,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// at invocation (past the abort check below), so an aborted continuation queues
 			// nothing; scoped to this request via prependMessages, never the shared queue.
 			const eagerNudges = this.#todo.buildPostCompactionEagerNudges();
-			await this.#promptWithMessage(
+			const dispatched = await this.#promptWithMessage(
 				{
 					role: "developer",
 					content: [{ type: "text", text: autoContinuePrompt }],
@@ -5700,6 +5728,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					prependMessages: eagerNudges.length > 0 ? eagerNudges : undefined,
 				},
 			);
+			if (dispatched && this.#sceneCut.hasStaged) this.#scheduleSceneCutApplication();
 		};
 		this.#schedulePostPromptTask(
 			async signal => {
@@ -5786,6 +5815,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#advisors.prepareForTerminalYieldAdvisorDrain();
 			this.#markTerminalYieldToolCall(ctx.toolCall.id);
 			this.#synchronouslyTerminatedYieldToolCallIds.add(ctx.toolCall.id);
+			this.agent.abort(TERMINAL_TOOL_RESULT_ABORT_REASON);
+		}
+		if (ctx.toolCall.name === "cut" && !ctx.isError && this.#sceneCut.hasStaged) {
 			this.agent.abort(TERMINAL_TOOL_RESULT_ABORT_REASON);
 		}
 		return this.#ttsr.afterToolCall(ctx);
@@ -7018,6 +7050,102 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			closedProviderSessions,
 		};
 	}
+	/** Stage a scene cut for application only after the current model turn settles. */
+	stageSceneCut(cut: SceneCut): void {
+		this.#sceneCut.stage(cut);
+	}
+
+	/**
+	 * Reset the context and insert the scene capsule as one queued session transition.
+	 * Returns false without resetting when a transition queued ahead of the cut (switch,
+	 * new session, branch, abort) replaced the context it was staged for.
+	 */
+	async #replaceContextWithScene(
+		message: CustomMessage<SceneCut>,
+		promptGeneration: number,
+		sessionGeneration: number,
+	): Promise<boolean> {
+		const queued = this.#enterSessionTransition(() =>
+			this.#replaceContextWithScene(message, promptGeneration, sessionGeneration),
+		);
+		if (queued) return queued;
+		using _transition = this.#beginSessionTransition();
+		if (
+			this.#isDisposed ||
+			this.#promptGeneration !== promptGeneration ||
+			this.#sessionGeneration !== sessionGeneration
+		) {
+			return false;
+		}
+		if (!(await this.resetSessionContext({ preserveAsyncJobs: true })) || this.#isDisposed) return false;
+		this.sessionManager.appendCustomMessageEntry(
+			message.customType,
+			message.content,
+			message.display,
+			message.details,
+			message.attribution,
+		);
+		this.agent.appendMessage(message);
+		// Publish the durable capsule through the same live transcript path as
+		// an idle custom message, without persisting it again through agent events.
+		await this.#emitSessionEvent({ type: "message_start", message }, { detachExtensions: true });
+		await this.#emitSessionEvent({ type: "message_end", message }, { detachExtensions: true });
+		return true;
+	}
+
+	async #applyPendingSceneCut(): Promise<void> {
+		if (this.#isDisposed) return;
+		const cut = this.#sceneCut.beginApply();
+		if (!cut) return;
+
+		try {
+			const content = prompt.render(sceneCutTemplate, { ...cut });
+			const message: CustomMessage<SceneCut> = {
+				role: "custom",
+				customType: SCENE_CUT_MESSAGE_TYPE,
+				content,
+				display: true,
+				details: cut,
+				attribution: "agent",
+				timestamp: Date.now(),
+			};
+			const promptGeneration = this.#promptGeneration;
+			if (!(await this.#replaceContextWithScene(message, promptGeneration, this.#sessionGeneration))) return;
+			this.#sceneCut.completeApply();
+			const continuation = this.#sceneCut.claimAutomaticContinuation(cut);
+			this.#emit({ type: "scene_cut_applied", continuation });
+			if (continuation === "limit") {
+				this.emitNotice(
+					"warning",
+					"Scene cut applied, but the automatic continuation limit was reached. Waiting for user input.",
+					"scene-cut",
+				);
+				return;
+			}
+			if (continuation === "wait") return;
+
+			// The reset bumped the prompt generation once; any further bump means an
+			// abort or a newer prompt superseded the continuation.
+			if (
+				this.#isDisposed ||
+				this.#abortInProgress ||
+				this.#promptGeneration !== promptGeneration + 1 ||
+				this.isStreaming
+			) {
+				return;
+			}
+			await this.#promptWithMessage(message, content, { messageAlreadyInContext: true });
+			// The next cut must see this continuation as settled: reset refuses
+			// while an in-flight prompt still contributes to isStreaming.
+			if (this.#sceneCut.hasStaged) {
+				await this.#drainInFlightEventHandlers();
+				await this.#applyPendingSceneCut();
+			}
+		} finally {
+			this.#sceneCut.completeApply();
+			this.yieldQueue.requestIdleFlush();
+		}
+	}
 
 	/**
 	 * Reset the current conversation in place: drop every message, queued turn,
@@ -7037,10 +7165,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * Returns `undefined` without mutating anything while a response is
 	 * streaming or a foreground bash/python execution is in flight.
 	 */
-	async resetSessionContext(): Promise<ResetSessionContextResult | undefined> {
-		const queued = this.#enterSessionTransition(() => this.resetSessionContext());
+	async resetSessionContext(options?: {
+		preserveAsyncJobs?: boolean;
+	}): Promise<ResetSessionContextResult | undefined> {
+		const queued = this.#enterSessionTransition(() => this.resetSessionContext(options));
 		if (queued) return queued;
 		using _transition = this.#beginSessionTransition();
+		const preserveAsyncJobs = options?.preserveAsyncJobs === true;
 		// Refuse while a response streams OR a foreground user bash/python
 		// execution is in flight: those complete via recordBashResult()/
 		// recordPythonResult(), which append directly to agent.state when not
@@ -7051,18 +7182,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const droppedCount = this.agent.state.messages.length;
 
 		// Tear down the same per-turn runtime state that newSession() resets across
-		// a conversation boundary, so work scheduled from the pre-reset turn cannot
-		// re-enter the cleared context:
-		//   - bump #promptGeneration + drain post-prompt tasks so an already-queued
-		//     post-prompt continuation (recovery can be scheduled after agent_end
-		//     while isStreaming is false) sees a stale generation and skips
-		//     (mirrors abort()).
-		//   - cancel this agent's async bash/task jobs so their completions can't
-		//     re-deliver stale tool output into the cleared conversation
-		//     (mirrors newSession()).
+		// a conversation boundary. A scene cut retains owner-scoped asynchronous
+		// work and its delivery epoch, but still invalidates obsolete continuations.
 		this.#promptGeneration++;
 		await this.#cancelPostPromptTasks();
-		this.#cancelOwnAsyncJobs();
+		if (!preserveAsyncJobs) this.#cancelOwnAsyncJobs();
 
 		// Drop the conversation: messages, queued steers/follow-ups, pending tool
 		// calls, and error state. agent.reset() keeps the model and system prompt.
@@ -7337,12 +7461,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// rewriting entries before it publishes auto_retry_end.
 			await this.#drainInFlightEventHandlers();
 			await this.#waitForPostPromptRecovery();
+			await this.#scheduledSceneCut;
 			// An abort can finish (and schedule its drain) after the waits above returned.
 			if (
 				!this.agent.state.isStreaming &&
 				this.#inFlightEventHandlers.size === 0 &&
 				this.#abortUnwinds.size === 0 &&
-				this.#postPromptTasks.size === 0
+				this.#postPromptTasks.size === 0 &&
+				this.#scheduledSceneCut === undefined
 			) {
 				return;
 			}
@@ -8723,6 +8849,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * that a prior user interrupt suppressed and resets plan-mode reminder state.
 	 */
 	#noteUserTurn(): void {
+		this.#sceneCut.resetAutomaticContinuationChain();
 		this.#advisors.autoResumeSuppressed = false;
 		this.#planModeReminderCount = 0;
 		this.#planModeReminderAwaitingProgress = false;
@@ -9034,6 +9161,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 		outcome.sessionClaimed = dispatched;
 		const refusal = this.#costCapRefusal !== refusalBeforeDispatch ? this.#costCapRefusal : undefined;
+		if (dispatched && this.#sceneCut.hasStaged) {
+			await this.#drainInFlightEventHandlers();
+			await this.#applyPendingSceneCut();
+		}
 		if (!dispatched) {
 			// An abort (Esc), preflight denial or the cost cap raced turn setup: the
 			// prompt never reached the agent or the session file. Hand it back to the
@@ -9236,6 +9367,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					: undefined,
 		});
 		if (!outcome.sessionClaimed) this.#reportDroppedCustomPrompt(message, options, followUps);
+		if (outcome.sessionClaimed && this.#sceneCut.hasStaged) {
+			await this.#drainInFlightEventHandlers();
+			await this.#applyPendingSceneCut();
+		}
 		return outcome.sessionClaimed;
 	}
 
@@ -9456,6 +9591,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			acceptTerminalEmptyStop?: boolean;
 			/** Follow-ups held until this run goes live; queued behind it then. */
 			followUpBatch?: PromptFollowUps;
+			/** Prepare a new turn from a capsule already durably appended and displayed. */
+			messageAlreadyInContext?: boolean;
 		},
 	): Promise<boolean> {
 		// Returns false when the prompt was dropped before reaching the agent —
@@ -9564,7 +9701,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// promotion/summary can rebuild the base prompt and clear a roster delta
 			// it subsumes, avoiding a contradictory materialized notice.
 			const xdevMountNoticeIndex = messages.length;
-			messages.push(message);
+			if (!options?.messageAlreadyInContext) messages.push(message);
 			// Inject any pending "nextTurn" messages as context alongside the user message
 			for (const msg of this.#pendingNextTurnMessages) {
 				messages.push(msg);
@@ -9724,7 +9861,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			} finally {
 				this.#stats.setPendingSnapshot(undefined);
 			}
-			if (!options?.skipPostPromptRecoveryWait) {
+			if (!this.#sceneCut.hasStaged && !options?.skipPostPromptRecoveryWait) {
 				await this.#waitForPostPromptRecovery(generation);
 			}
 			return true;
@@ -10604,10 +10741,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const prependMessages = queuedMessages.slice(0, -1);
 		const textContent = this.#getCustomMessageTextContent(message);
 		try {
-			await this.#promptWithMessage(message, textContent, {
+			const dispatched = await this.#promptWithMessage(message, textContent, {
 				prependMessages,
 				skipPostPromptRecoveryWait: true,
 			});
+			if (dispatched && this.#sceneCut.hasStaged) this.#scheduleSceneCutApplication();
 		} catch (error) {
 			this.#pendingNextTurnMessages = [...queuedMessages, ...this.#pendingNextTurnMessages];
 			throw error;
@@ -12138,6 +12276,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// before any await so the post-abort stranded-message drain can't auto-resume the run on
 		// them. They are recorded in the transcript once the agent settles (below).
 		const strandedMessages = this.#extractInterruptedQueuedMessages(userInterrupt);
+		if (userInterrupt) this.#sceneCut.completeApply();
 		// Session switch/compact paths disconnect first; explicit aborts should
 		// leave any queued steer/follow-up visible for the user rather than
 		// auto-starting a fresh turn during cleanup.

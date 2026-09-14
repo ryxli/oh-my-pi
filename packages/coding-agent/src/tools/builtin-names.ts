@@ -17,6 +17,7 @@ export const BUILTIN_TOOL_NAMES = [
 	"rewind",
 	"context_notes",
 	"new_context",
+	"cut",
 	"security_scan",
 	"task",
 	"wait",
