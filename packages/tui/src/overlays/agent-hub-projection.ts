@@ -106,6 +106,7 @@ export function progressMetrics(observed: ObservableSession | undefined): AgentM
 	}
 	return {
 		tokens,
+		cacheReadTokens: finiteMetric(progress.cacheReadTokens),
 		requests,
 		tools,
 		cost,
@@ -155,6 +156,7 @@ function readSessionMetrics(
 		if (!Array.isArray(messages)) {
 			return {
 				tokens: stats.tokens.input + stats.tokens.output + stats.tokens.cacheWrite,
+				cacheReadTokens: stats.tokens.cacheRead,
 				requests: stats.assistantMessages,
 				tools: stats.toolCalls,
 				cost: directCost ?? stats.cost,
@@ -166,6 +168,7 @@ function readSessionMetrics(
 		}
 
 		let tokens = 0;
+		let cacheReadTokens = 0;
 		let requests = 0;
 		let tools = 0;
 		let cost = 0;
@@ -173,11 +176,13 @@ function readSessionMetrics(
 			if (message.role !== "assistant") continue;
 			requests++;
 			tokens += message.usage.input + message.usage.output + message.usage.cacheWrite;
+			cacheReadTokens += message.usage.cacheRead;
 			tools += message.content.filter(content => content.type === "toolCall").length;
 			cost += message.usage.cost.total;
 		}
 		return {
 			tokens,
+			cacheReadTokens,
 			requests,
 			tools,
 			cost: directCost ?? cost,
@@ -241,6 +246,7 @@ export function aggregateMetrics<TRecord extends AgentRecordLike>(args: {
 }): { metrics: AggregateMetrics; hasFallbackLiveSessions: boolean } {
 	const total: AggregateMetrics = {
 		tokens: 0,
+		cacheReadTokens: 0,
 		requests: 0,
 		tools: 0,
 		cost: 0,
@@ -277,6 +283,7 @@ export function aggregateMetrics<TRecord extends AgentRecordLike>(args: {
 		if (fallbackSession) countedFallbackSessions.add(fallbackSession);
 		total.reportedAgents++;
 		total.tokens += finiteMetric(metrics.tokens);
+		total.cacheReadTokens = (total.cacheReadTokens ?? 0) + finiteMetric(metrics.cacheReadTokens ?? 0);
 		total.requests += finiteMetric(metrics.requests);
 		total.tools += finiteMetric(metrics.tools);
 		total.cost += finiteMetric(metrics.cost);

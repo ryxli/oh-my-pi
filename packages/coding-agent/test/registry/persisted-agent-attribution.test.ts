@@ -97,6 +97,42 @@ async function historyFor(dir: string, id: string, records: string[]): Promise<A
 }
 
 describe("persisted agent model attribution", () => {
+	it("excludes inherited assistant and auxiliary usage from a fork's cost", async () => {
+		using tempDir = TempDir.createSync("@omp-attribution-fork-");
+		const inherited = [
+			...transcriptHead().slice(1),
+			assistant("a1", "si", SONNET, "stop", [{ type: "text", text: "parent work" }]),
+			JSON.stringify({
+				type: "model_usage",
+				id: "u1",
+				parentId: "a1",
+				usage: { cost: { total: 2 } },
+			}),
+		];
+		const registry = await historyFor(tempDir.path(), "Fork", [
+			JSON.stringify({
+				type: "session",
+				id: "fork",
+				timestamp: "2026-08-07T10:34:37.300Z",
+				inheritedEntries: inherited.length,
+			}),
+			...inherited,
+			assistant("a2", "u1", SONNET, "stop", [{ type: "text", text: "fork work" }]),
+			JSON.stringify({
+				type: "model_usage",
+				id: "u2",
+				parentId: "a2",
+				usage: { cost: { total: 0.25 } },
+			}),
+		]);
+		const history = registry.get("Fork")?.history;
+		expect(history?.directCost).toBe(0.75);
+		expect(history?.metrics?.requests).toBe(1);
+		expect(history?.metrics?.cost).toBe(0.5);
+		expect(history?.resolvedModel).toBe("anthropic/claude-sonnet-5");
+		expect(history?.modelRole).toBe("task");
+	});
+
 	it("reports the model that produced output, not a fallback that never served", async () => {
 		using tempDir = TempDir.createSync("@omp-attribution-incident-");
 		// The incident: sonnet does the work, a chain candidate errors instantly.

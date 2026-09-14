@@ -56,6 +56,13 @@ export interface SessionHeader {
 	providerPromptCacheKey?: string;
 	/** Local-only Task candidate, gated by the actual request model's cache policy; omitted from shares and HTML. */
 	taskPromptCacheKey?: string;
+	/**
+	 * Count of leading entries copied verbatim from the fork source, so usage
+	 * accounting can tell inherited history from work this session actually did.
+	 * A fork replays its parent's transcript into its own file; summing the whole
+	 * file bills the parent's spend to every descendant. Absent on non-forks.
+	 */
+	inheritedEntries?: number;
 }
 
 export interface NewSessionOptions {

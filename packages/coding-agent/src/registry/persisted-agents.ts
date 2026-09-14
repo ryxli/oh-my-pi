@@ -98,6 +98,7 @@ function usageTokens(usage: Record<string, unknown>): number {
 
 interface AssistantMetrics {
 	tokens: number;
+	cacheReadTokens: number;
 	tools: number;
 	cost: number;
 	contextTokens?: number;
@@ -118,6 +119,7 @@ function assistantMetrics(message: Record<string, unknown>): AssistantMetrics {
 	const model = typeof message.model === "string" ? message.model : undefined;
 	return {
 		tokens: usageTokens(usage),
+		cacheReadTokens: finiteNumber(usage.cacheRead),
 		tools: content.filter(part => recordOf(part)?.type === "toolCall").length,
 		cost: finiteNumber(cost?.total),
 		contextTokens: finiteNumber(usage.totalTokens) || undefined,
@@ -157,12 +159,24 @@ async function readPersistedAgentHistory(
 	let leafTimestamp: number | undefined;
 	let directCost = 0;
 	// Direct cost mirrors lifetime SessionManager usage; legacy metrics below stay leaf-scoped.
+	// A fork's file opens with a verbatim copy of its source's transcript. Those
+	// entries belong to the source. Counting them again attributes each turn to every descendant.
+	let inheritedEntries = 0;
+	let entryOrdinal = 0;
 	try {
 		await visitEntriesFromFileStream(
 			transcript.sessionFile,
 			entry => {
 				const record = recordOf(entry);
 				if (!record) return;
+				if (record.type === "session") {
+					const inherited = record.inheritedEntries;
+					if (typeof inherited === "number" && Number.isFinite(inherited)) {
+						inheritedEntries = Math.max(0, Math.trunc(inherited));
+					}
+					return;
+				}
+				const isInherited = ++entryOrdinal <= inheritedEntries;
 				const id = typeof record.id === "string" ? record.id : undefined;
 				if (!id) return;
 				const parentId = typeof record.parentId === "string" ? record.parentId : undefined;
@@ -173,7 +187,7 @@ async function readPersistedAgentHistory(
 				if (record.type === "model_usage") {
 					const usage = recordOf(record.usage);
 					const cost = recordOf(usage?.cost);
-					directCost += finiteNumber(cost?.total);
+					if (!isInherited) directCost += finiteNumber(cost?.total);
 					if (typeof record.activeLeafId === "string") {
 						leafId = record.activeLeafId;
 					} else if (record.activeLeafId === null) {
@@ -185,6 +199,8 @@ async function readPersistedAgentHistory(
 				}
 				selfSelectedLeafId = id;
 				if (record.type === "model_change" && typeof record.model === "string") {
+					// Model attribution still reads inherited transitions: a fork that
+					// never switched models is still running the one it inherited.
 					modelChangeById.set(id, {
 						model: record.model,
 						role: typeof record.role === "string" ? record.role : undefined,
@@ -192,7 +208,7 @@ async function readPersistedAgentHistory(
 					});
 					return;
 				}
-				if (record.type !== "message") return;
+				if (record.type !== "message" || isInherited) return;
 				const message = recordOf(record.message);
 				if (message?.role === "assistant") {
 					const assistant = assistantMetrics(message);
@@ -224,6 +240,7 @@ async function readPersistedAgentHistory(
 	if (leafId !== undefined && !parents.has(leafId)) leafId = selfSelectedLeafId;
 	const metrics: AgentMetricsSummary = {
 		tokens: 0,
+		cacheReadTokens: 0,
 		requests: 0,
 		tools: 0,
 		cost: 0,
@@ -273,6 +290,7 @@ async function readPersistedAgentHistory(
 		}
 		metrics.requests++;
 		metrics.tokens += assistant.tokens;
+		metrics.cacheReadTokens = (metrics.cacheReadTokens ?? 0) + assistant.cacheReadTokens;
 		metrics.tools += assistant.tools;
 		metrics.cost += assistant.cost;
 		contextTokens ??= assistant.contextTokens;
