@@ -1737,6 +1737,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 						accumulatedUsage.input += getNumberField(messageUsage, "input") ?? 0;
 						accumulatedUsage.output += getNumberField(messageUsage, "output") ?? 0;
 						accumulatedUsage.cacheRead += getNumberField(messageUsage, "cacheRead") ?? 0;
+						progress.cacheReadTokens = accumulatedUsage.cacheRead;
 						accumulatedUsage.cacheWrite += getNumberField(messageUsage, "cacheWrite") ?? 0;
 						accumulatedUsage.totalTokens += getNumberField(messageUsage, "totalTokens") ?? 0;
 						accumulatedUsage.reasoningTokens =

@@ -434,6 +434,8 @@ export interface AgentProgress {
 	requests: number;
 	/** Cumulative input + output + cacheWrite tokens across all turns. Excludes cacheRead (re-reads cached context every turn, making cumulative sum misleading). */
 	tokens: number;
+	/** Cumulative cached input reads, reported separately from newly processed tokens. */
+	cacheReadTokens?: number;
 	/**
 	 * Current per-turn context size: latest assistant message's `usage.totalTokens`.
 	 * This is the number to compare against `contextWindow` — what compaction
