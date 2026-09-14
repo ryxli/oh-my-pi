@@ -43,7 +43,7 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 }
 
 function fakeLiveSession(messages: unknown[]): AgentSession {
-	return { messages } as unknown as AgentSession;
+	return { messages, agent: { state: {} } } as unknown as AgentSession;
 }
 
 function makeToolSession(
