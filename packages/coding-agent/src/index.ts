@@ -36,6 +36,8 @@ export * from "./modes";
 export * from "./modes/components";
 // Theme utilities for custom tools
 export * from "./modes/theme/theme";
+// AgentStatus is referenced by the exported AgentRef.status but not re-exported by sdk.ts.
+export type { AgentStatus } from "./registry/agent-registry";
 // SDK for programmatic usage
 export * from "./sdk";
 export * from "./session/agent-session";
