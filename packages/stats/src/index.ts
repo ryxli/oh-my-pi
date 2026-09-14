@@ -51,11 +51,13 @@ function formatCost(n: number, unpricedRequests = 0): string {
  * Print the dashboard summary to the console. Shared by `omp stats --summary`
  * and the standalone `omp-stats --sync`.
  */
-export async function printStatsSummary(): Promise<void> {
-	const stats = await getDashboardStats();
+export async function printStatsSummary(range?: string): Promise<void> {
+	const stats = await getDashboardStats(range);
 	const { overall, byModel, byFolder } = stats;
 
-	console.log(chalk.bold("\n=== AI Usage Statistics ===\n"));
+	const window = range?.trim().toLowerCase() || "24h";
+	const windowLabel = window === "all" ? "all time" : `last ${window}`;
+	console.log(chalk.bold(`\n=== AI Usage Statistics (${windowLabel}) ===\n`));
 
 	console.log(chalk.bold("Overall:"));
 	console.log(`  Requests: ${formatNumber(overall.totalRequests)} (${formatNumber(overall.failedRequests)} errors)`);
