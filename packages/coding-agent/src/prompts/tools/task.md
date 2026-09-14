@@ -8,6 +8,7 @@
 # Delegation
 Use most specific agent.{{#if scoutAvailable}} Read-only research MUST use `scout` only when files unknown.{{/if}} Prefer one agent to investigate + edit. Omit `agent` only for default (`{{defaultAgent}}`); NEVER specify it.
 Shared edits need one integration owner{{#if ircEnabled}}; siblings coordinate via `write agent://<id>`{{/if}}. Set interfaces in {{#if batchEnabled}}`context`{{else}}the task{{/if}}. Every task MUST skip build/lint/tests/formatters mid-flight; run once afterward.
+For a settled mutating contract, use `mode: "execute"` with non-empty workspace-relative `writes`. Completion requires a declared file change; OMP prompts once to correct an artifact-free yield, then fails. Never use for research or review.
 
 # Inputs
 `name`: CamelCase ≤32, auto-generated if omitted; address agent by name. `outputSchema` overrides agent/session schemas.

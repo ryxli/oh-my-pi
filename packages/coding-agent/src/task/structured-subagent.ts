@@ -113,6 +113,10 @@ export interface StructuredSubagentRequest {
 	effort?: TaskEffort;
 	/** Caller's description of how open-ended the work is; steers the child's `auto` thinking classification. */
 	solutionSpace?: string;
+	/** Frozen execution mode requires a declared file to change before terminal completion. */
+	mode?: "execute";
+	/** Workspace-relative files an execute-mode task must change. */
+	writes?: string[];
 	identity?: StructuredSubagentIdentity;
 	index?: number;
 	parentToolCallId?: string;
@@ -508,6 +512,7 @@ function buildExecutorOptions(
 		invokedAt: request.invokedAt,
 		acquiredAt: request.acquiredAt,
 		modelOverride: policy.modelOverride,
+		...(request.mode === "execute" ? { mode: request.mode, writes: request.writes } : {}),
 		modelRole: policy.modelRole,
 		modelRoute: policy.modelRoute,
 		serviceTierOverride: policy.serviceTierOverride,
