@@ -96,7 +96,7 @@ export interface HubRosterCounts {
 /** Background-job row surfaced by `wait`/`cancel`/`jobs` results. */
 export interface JobSnapshot {
 	id: string;
-	type: "bash" | "task" | "eval";
+	type: "bash" | "task" | "eval" | "tool";
 	status: "running" | "completed" | "failed" | "cancelled";
 	label: string;
 	durationMs: number;
