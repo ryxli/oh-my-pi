@@ -183,15 +183,19 @@ export interface ContextEvent {
 }
 
 /**
- * Fired when an agent loop starts (once per user prompt).
+ * Fired when an agent loop starts, including automatic continuations.
  */
 export interface AgentStartEvent {
 	type: "agent_start";
+	/** Increases with each loop start within the same AgentSession, without resetting on session changes. */
+	runId: number;
 }
 
 /** Fired when an agent loop ends */
 export interface AgentEndEvent {
 	type: "agent_end";
+	/** Identity of the matching agent_start, preserved even when this notification is delayed. */
+	runId: number;
 	messages: AgentMessage[];
 	/**
 	 * When true, the session has already scheduled an automatic continuation

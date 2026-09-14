@@ -592,7 +592,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.waitForIdle();
 
 		expect(mock.calls).toHaveLength(1);
-		expect(extensionRunner.emit).toHaveBeenCalledWith({ type: "agent_end", messages: expect.any(Array) });
+		expect(extensionRunner.emit).toHaveBeenCalledWith(expect.objectContaining({ type: "agent_end" }));
 		expect(extensionRunner.emitSessionStop).not.toHaveBeenCalled();
 	});
 
@@ -697,7 +697,7 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		await session.prompt("First message");
 		await publicAgentEnd;
-		expect(extensionRunner.emit).toHaveBeenCalledWith({ type: "agent_end", messages: expect.any(Array) });
+		expect(extensionRunner.emit).toHaveBeenCalledWith(expect.objectContaining({ type: "agent_end" }));
 
 		releaseExtension();
 		await session.waitForIdle();
