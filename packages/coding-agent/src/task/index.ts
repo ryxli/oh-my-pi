@@ -68,6 +68,7 @@ import {
 	taskFileRestrictionPaths,
 } from "./file-approval";
 import { getPerCallModelAdvertisement, type PerCallModelAdvertisement } from "./model-approval";
+import { validateExecuteMode } from "./execute-mode";
 import { generateTaskName } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
@@ -337,6 +338,8 @@ function validateSpawnParams(
 			if (effortError) return effortError;
 			const modelError = validateModel(item, label, defaultAgent, settings);
 			if (modelError) return modelError;
+			const executeError = validateExecuteMode(item, label);
+			if (executeError) return executeError;
 		}
 		const seen = new Map<string, string>();
 		for (const item of tasks) {
@@ -360,7 +363,8 @@ function validateSpawnParams(
 	return (
 		validateTaskInput(params, "The call", fileEnabled) ??
 		validateEffort(params.effort, "The call") ??
-		validateModel(params, "The call", defaultAgent, settings)
+		validateModel(params, "The call", defaultAgent, settings) ??
+		validateExecuteMode(params, "The call")
 	);
 }
 
@@ -402,6 +406,8 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 	if ("schemaMode" in params) item.schemaMode = params.schemaMode;
 	if ("tools" in params) item.tools = params.tools;
 	if ("effort" in params) item.effort = params.effort;
+	if ("mode" in params) item.mode = params.mode;
+	if ("writes" in params) item.writes = params.writes;
 	if ("isolated" in params) item.isolated = params.isolated;
 	if ("sourceSession" in params) item.sourceSession = params.sourceSession;
 	if ("model" in params) item.model = params.model;
@@ -495,6 +501,8 @@ function spawnParamsFor(params: TaskParams, item: ResolvedTaskItem, defaultAgent
 	if ("effort" in item) spawn.effort = item.effort;
 	if ("sourceSession" in item) spawn.sourceSession = item.sourceSession;
 	if ("model" in item) spawn.model = item.model;
+	if ("mode" in item) spawn.mode = item.mode;
+	if ("writes" in item) spawn.writes = item.writes;
 	if (item.isolated !== undefined) {
 		spawn.isolated = item.isolated;
 	} else if ("isolated" in params) {
@@ -1995,6 +2003,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				...spawnModelFields(params),
 				...this.#resultParams(params),
 				...this.#effortParams(params),
+				...(params.mode === "execute" ? { mode: params.mode, writes: params.writes } : {}),
 				solutionSpace: params.solutionSpace,
 				...(params.tools?.length
 					? {

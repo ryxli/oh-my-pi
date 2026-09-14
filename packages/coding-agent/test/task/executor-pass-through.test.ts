@@ -9,7 +9,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { resolveThresholdTokens, shouldCompact } from "@oh-my-pi/pi-agent-core/compaction";
-import type { Model, ServiceTierByFamily } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Model, ServiceTierByFamily } from "@oh-my-pi/pi-ai";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
@@ -30,7 +30,7 @@ import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { createSessionDefaults } from "../helpers/session-defaults";
 import { manyToolName } from "../fixtures/many-tools-mcp";
-import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
+import { removeSyncWithRetries, TempDir } from "@oh-my-pi/pi-utils";
 
 import { cfgTierAnthropic, cfgTierGoogle, cfgTierOpenai } from "@oh-my-pi/pi-coding-agent/session/settings";
 
@@ -125,6 +125,99 @@ function createModelRegistry(
 describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
+	});
+
+	it.each([1, 2, 0])("enforces declared writes with one correction turn (write on turn %s)", async writeOnTurn => {
+		using tempDir = TempDir.createSync("@omp-execute-write-");
+		let turns = 0;
+		const session = createMockSession(async ({ emit }) => {
+			turns++;
+			if (turns === writeOnTurn) await Bun.write(path.join(tempDir.path(), "output.txt"), "completed");
+			emitYield(emit);
+		});
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const result = await runSubprocess({
+			...baseOptions,
+			cwd: tempDir.path(),
+			mode: "execute",
+			writes: ["output.txt"],
+		});
+		expect(turns).toBe(writeOnTurn === 1 ? 1 : 2);
+		expect(result.exitCode).toBe(writeOnTurn === 0 ? 1 : 0);
+		if (writeOnTurn === 0) expect(result.error).toContain("without changing a declared write target");
+	});
+
+	it.each([
+		{ writeOnTurn: 1, reportCorrection: true },
+		{ writeOnTurn: 2, reportCorrection: true },
+		{ writeOnTurn: 0, reportCorrection: true },
+		{ writeOnTurn: 2, reportCorrection: false },
+		{ writeOnTurn: 3, reportCorrection: true, budgetStop: true },
+	])(
+		"enforces plain-text execute writes (write on turn $writeOnTurn, correction report $reportCorrection)",
+		async ({ writeOnTurn, reportCorrection, budgetStop = false }) => {
+			using tempDir = TempDir.createSync("@omp-execute-prose-");
+			let turns = 0;
+			let lastAssistant: AssistantMessage | undefined;
+			const session = createMockSession(async ({ emit }) => {
+				turns++;
+				if (turns === writeOnTurn) await Bun.write(path.join(tempDir.path(), "output.txt"), "completed");
+				lastAssistant = {
+					role: "assistant",
+					content: turns === 2 && !reportCorrection ? [] : [{ type: "text", text: `Report ${turns}` }],
+					api: "openai-responses",
+					provider: "openai",
+					model: "mock",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: Date.now(),
+				};
+				const requests = budgetStop && (turns === 1 || turns === 3) ? 3 : 1;
+				for (let request = 0; request < requests; request++) {
+					emit({ type: "message_end", message: lastAssistant });
+				}
+			});
+			session.getLastAssistantMessage = () => lastAssistant;
+			const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+			const result = await runSubprocess({
+				...baseOptions,
+				cwd: tempDir.path(),
+				mode: "execute",
+				writes: ["output.txt"],
+				structured: false,
+				settings: Settings.isolated({
+					"task.softRequestBudget": budgetStop ? 2 : 0,
+					"task.softRequestBudgetNotice": false,
+				}),
+			});
+			expect(spy.mock.calls[0]?.[0]?.requireYieldTool).toBe(false);
+			expect(turns).toBe(writeOnTurn === 1 ? 1 : budgetStop ? 3 : 2);
+			expect(result.exitCode).toBe(writeOnTurn === 0 || !reportCorrection ? 1 : 0);
+			if (writeOnTurn === 0) expect(result.error).toContain("without changing a declared write target");
+			else if (reportCorrection) expect(result.output).toBe(`Report ${turns}`);
+			else expect(result.output).not.toContain("Report 1");
+		},
+	);
+
+	it("rejects execute targets outside the workspace before starting a session", async () => {
+		using tempDir = TempDir.createSync("@omp-execute-path-");
+		const spy = vi.spyOn(sdkModule, "createAgentSession");
+		const result = await runSubprocess({
+			...baseOptions,
+			cwd: tempDir.path(),
+			mode: "execute",
+			writes: ["../outside.txt"],
+		});
+		expect(result.exitCode).toBe(1);
+		expect(result.error).toContain("outside the child workspace");
+		expect(spy).not.toHaveBeenCalled();
 	});
 
 	it("forwards rules, extension-root policy, prepared extensions, and preloaded source paths to createAgentSession", async () => {
