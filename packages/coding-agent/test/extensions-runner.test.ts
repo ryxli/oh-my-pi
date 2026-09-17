@@ -2439,7 +2439,7 @@ describe("ExtensionRunner", () => {
 				vi.useRealTimers();
 				presented = Promise.withResolvers();
 				answer = Promise.withResolvers();
-				const notification = runner.emit({ type: "agent_end", messages: [] });
+				const notification = runner.emit({ type: "agent_end", runId: 1, messages: [] });
 				const dialogSignal = await presented.promise;
 				await notification;
 				expect(errors).toHaveLength(1);
@@ -4308,7 +4308,7 @@ describe("ExtensionRunner", () => {
 
 			// No extension subscribes to `agent_start`: no context allocation, and the
 			// handler-timeout machinery is never entered.
-			await runner.emit({ type: "agent_start" });
+			await runner.emit({ type: "agent_start", runId: 1 });
 			expect(createContextSpy).not.toHaveBeenCalled();
 			expect(errors).toHaveLength(0);
 
@@ -4420,7 +4420,7 @@ describe("ExtensionRunner", () => {
 				);
 				runner.onError(error => errors.push(error));
 
-				await runner.emit({ type: "agent_end", messages: [] });
+				await runner.emit({ type: "agent_end", runId: 1, messages: [] });
 				expect(errors).toEqual([]);
 				expect(seen).toEqual([
 					"switcher:session_switch",
@@ -4497,7 +4497,7 @@ describe("ExtensionRunner", () => {
 					sessionManager,
 					modelRegistry,
 				);
-				void runner.emit({ type: "agent_end", messages: [] });
+				void runner.emit({ type: "agent_end", runId: 1, messages: [] });
 				const controller = new AbortController();
 				const startedAt = performance.now();
 				const emission = runner.emit({ type: "session_before_shutdown", signal: controller.signal });
