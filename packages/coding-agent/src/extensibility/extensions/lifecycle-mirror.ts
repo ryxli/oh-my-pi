@@ -80,7 +80,7 @@ function cloneMessageNotification(message: AgentMessage): AgentMessage {
 
 /** Extension events `extensionEventFromSessionEvent` maps onto. */
 export type MappedExtensionEvent =
-	| { type: "agent_start" }
+	| { type: "agent_start"; runId: number }
 	| AgentEndEvent
 	| TurnStartEvent
 	| TurnEndEvent
@@ -113,13 +113,15 @@ export type MappedExtensionEvent =
 export function extensionEventFromSessionEvent(
 	event: AgentSessionEvent,
 	turnIndex: number,
+	runId: number,
 ): MappedExtensionEvent | null {
 	switch (event.type) {
 		case "agent_start":
-			return { type: "agent_start" };
+			return { type: "agent_start", runId };
 		case "agent_pause":
 			return {
 				type: "agent_end",
+				runId,
 				messages: event.messages,
 				willContinue: true,
 				...(event.awaiting ? { awaitingAsyncWork: true } : {}),
@@ -253,6 +255,7 @@ export function extensionEventFromSessionEvent(
  */
 export class GuestLifecycleEmitter {
 	#turnIndex = 0;
+	#runId = 0;
 	#chain: Promise<void> = Promise.resolve();
 	/** True between a mirrored (or synthesized) `agent_start` and the stop of that loop. */
 	#active = false;
@@ -264,13 +267,14 @@ export class GuestLifecycleEmitter {
 	emit(runner: ExtensionRunner, event: AgentSessionEvent): void {
 		if (event.type === "agent_start") {
 			this.#turnIndex = 0;
+			this.#runId++;
 			this.#active = true;
 		} else if (event.type === "agent_end" || event.type === "agent_pause") {
 			this.#active = false;
 		}
 		const handlerType = event.type === "agent_pause" ? "agent_end" : event.type;
 		if (handlerType !== "agent_start" && !runner.hasHandlers(handlerType)) return;
-		const mapped = extensionEventFromSessionEvent(event, this.#turnIndex);
+		const mapped = extensionEventFromSessionEvent(event, this.#turnIndex, this.#runId);
 		if (!mapped) return;
 		if (event.type === "turn_end") this.#turnIndex++;
 		this.#chain = this.#chain

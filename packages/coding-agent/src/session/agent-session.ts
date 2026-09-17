@@ -773,6 +773,7 @@ type LoopEndOptions = { continuing?: boolean };
 /** A model loop's end, held while its run stays open; see {@link AgentSession} `#endLoop`. */
 interface LoopEnd {
 	readonly event: AgentEndEvent;
+	readonly runId: number;
 	/** Session messages at the loop end, for the extension `agent_end`. */
 	readonly activeMessages: AgentMessage[];
 	/** The model finished its turn (`agent_pause.yielded`). */
@@ -4087,11 +4088,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 	}
 
-	#queuedExtensionEvents: AgentSessionEvent[] = [];
+	#queuedExtensionEvents: { event: AgentSessionEvent; runId: number }[] = [];
 	#drainingExtensionEvents = false;
 
-	#queueExtensionEvent(event: AgentSessionEvent): void {
-		this.#queuedExtensionEvents.push(event);
+	#queueExtensionEvent(event: AgentSessionEvent, runId = this.#runEpoch): void {
+		this.#queuedExtensionEvents.push({ event, runId });
 		if (this.#drainingExtensionEvents) return;
 		this.#drainingExtensionEvents = true;
 		queueMicrotask(() => void this.#drainExtensionEvents());
@@ -4102,9 +4103,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			while (this.#queuedExtensionEvents.length > 0) {
 				const batch = this.#queuedExtensionEvents;
 				this.#queuedExtensionEvents = [];
-				for (const event of batch) {
+				for (const { event, runId } of batch) {
 					try {
-						await this.#emitExtensionEvent(event);
+						await this.#emitExtensionEvent(event, runId);
 					} catch {
 						// A failed notification must not hold later updates in the queue.
 					}
@@ -4115,7 +4116,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 	}
 
-	async #emitSessionEvent(event: AgentSessionEvent, options: { detachExtensions?: boolean } = {}): Promise<void> {
+	async #emitSessionEvent(
+		event: AgentSessionEvent,
+		options: { detachExtensions?: boolean } = {},
+		runId = this.#runEpoch,
+	): Promise<void> {
 		if (event.type === "tool_execution_update") {
 			// Returned background calls have no later tool result to persist their
 			// terminal frame. Keep the latest update for future focus rebuilds;
@@ -4128,7 +4133,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#emit(event);
 			// Per-delta hot path: only queue the serialized extension emit when
 			// something listens (`#emitExtensionEvent` would return immediately).
-			if (this.#extensionRunner?.hasHandlers("message_update")) this.#queueExtensionEvent(event);
+			if (this.#extensionRunner?.hasHandlers("message_update")) this.#queueExtensionEvent(event, runId);
 			return;
 		}
 		// Deliver synchronously before awaiting extension notifications. This keeps
@@ -4136,7 +4141,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// unrelated events, mid-turn maintenance, or queued steering. `agent_end` needs
 		// no deferral: #checkRun emits it only once no prompt is in flight.
 		this.#emit(event);
-		const extensionEmit = this.#emitExtensionEvent(event);
+		const extensionEmit = this.#emitExtensionEvent(event, runId);
 		if (options.detachExtensions) {
 			void extensionEmit.catch(error => {
 				logger.warn("Detached session event extension emit failed", {
@@ -4727,6 +4732,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#runEpoch++;
 			this.#maintenance.noteTurnStarted();
 		}
+		const eventRunId = this.#runEpoch;
 		// This must happen before event fan-out awaits: streamed tool-call deltas
 		// can otherwise queue validation that a delayed turn-start reset erases.
 		if (event.type === "turn_start") this.#streamingEditGuard.reset();
@@ -4920,7 +4926,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		if (event.type !== "agent_end") {
 			try {
-				await this.#emitSessionEvent(displayEvent);
+				await this.#emitSessionEvent(displayEvent, undefined, eventRunId);
 			} catch (error) {
 				if (event.type === "message_end") {
 					try {
@@ -6015,13 +6021,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// goes on, so this end folds into the run instead of being announced after it;
 		// extensions, notified per loop, still hear of it.
 		if (loopEpoch !== this.#runEpoch) {
-			void this.#notifyExtensionsLoopEnd(activeMessages, { awaiting: false });
+			void this.#notifyExtensionsLoopEnd(activeMessages, loopEpoch, { awaiting: false });
 			return;
 		}
 		// A loop whose start was never observed (it began while the agent was disconnected)
 		// still belongs to a run that must end.
 		this.#openRun();
-		const end: LoopEnd = { event, activeMessages, yielded: !options?.continuing, paused: false };
+		const end: LoopEnd = { event, runId: loopEpoch, activeMessages, yielded: !options?.continuing, paused: false };
 		this.#loopEnd = end;
 		if (options?.continuing) this.#pauseLoop(end);
 		this.#scheduleRunCheck();
@@ -6044,7 +6050,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			yielded: end.yielded,
 			awaiting,
 		}).catch(error => logger.warn("agent_pause session event emission failed", { error: String(error) }));
-		void this.#notifyExtensionsLoopEnd(end.activeMessages, { awaiting });
+		void this.#notifyExtensionsLoopEnd(end.activeMessages, end.runId, { awaiting });
 	}
 
 	/**
@@ -6052,10 +6058,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * run goes on (`willContinue`, plus `awaitingAsyncWork` when only outside work resumes
 	 * it); without it the notification is the run's end.
 	 */
-	async #notifyExtensionsLoopEnd(messages: AgentMessage[], pause?: { awaiting: boolean }): Promise<void> {
+	async #notifyExtensionsLoopEnd(
+		messages: AgentMessage[],
+		runId: number,
+		pause?: { awaiting: boolean },
+	): Promise<void> {
 		try {
 			await this.#extensionRunner?.emit({
 				type: "agent_end",
+				runId,
 				messages: [...messages],
 				...(pause ? { willContinue: true } : {}),
 				...(pause?.awaiting ? { awaitingAsyncWork: true } : {}),
@@ -6098,6 +6109,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// The live loop ended while the agent was detached, so its `agent_end` never routed.
 		this.#loopEnd ??= {
 			event: { type: "agent_end", messages: [] },
+			runId: this.#runEpoch,
 			activeMessages: [...this.agent.state.messages],
 			yielded: true,
 			paused: false,
@@ -6114,7 +6126,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// A subscriber may queue input from `agent_end` itself (a collab guest's steer racing
 		// the settle): nothing polls the queue any more, so it starts the next run.
 		this.#drainStrandedQueuedMessages();
-		void this.#notifyExtensionsLoopEnd(end.activeMessages);
+		void this.#notifyExtensionsLoopEnd(end.activeMessages, end.runId);
 	}
 
 	/** Close the open run; without a following `agent_end`, a transition or dispose abandons it. */
@@ -6183,11 +6195,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/** Emit extension events based on session events */
-	async #emitExtensionEvent(event: AgentSessionEvent): Promise<void> {
+	async #emitExtensionEvent(event: AgentSessionEvent, runId = this.#runEpoch): Promise<void> {
 		if (!this.#extensionRunner) return;
 		if (event.type === "agent_start") {
 			this.#turnIndex = 0;
-			await this.#extensionRunner.emit({ type: "agent_start" });
+			await this.#extensionRunner.emit({ type: "agent_start", runId });
 			return;
 		}
 
@@ -6196,7 +6208,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// unrelated notification-only work.
 		if (event.type === "agent_end" || event.type === "agent_pause") return;
 		if (!this.#extensionRunner.hasHandlers(event.type)) return;
-		const mapped = extensionEventFromSessionEvent(event, this.#turnIndex);
+		const mapped = extensionEventFromSessionEvent(event, this.#turnIndex, runId);
 		if (!mapped) return;
 		if (event.type === "turn_end") this.#turnIndex++;
 		await this.#extensionRunner.emit(mapped);
