@@ -879,6 +879,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	#fallbackExtensionTimers: ManagedTimers | undefined = undefined;
 	#turnIndex = 0;
+	#agentRunId = 0;
 	#messageEndPersistenceTail: Promise<void> = Promise.resolve();
 	#pendingMessageEndPersistence = new Map<string, Promise<void>>();
 	#persistedMessageKeys: { anchor: string; keys: Set<string> } | undefined;
@@ -3001,11 +3002,11 @@ export class AgentSession implements SettingsScope {
 		}
 	}
 
-	#queuedExtensionEvents: AgentSessionEvent[] = [];
+	#queuedExtensionEvents: { event: AgentSessionEvent; runId: number }[] = [];
 	#drainingExtensionEvents = false;
 
-	#queueExtensionEvent(event: AgentSessionEvent): void {
-		this.#queuedExtensionEvents.push(event);
+	#queueExtensionEvent(event: AgentSessionEvent, runId = this.#agentRunId): void {
+		this.#queuedExtensionEvents.push({ event, runId });
 		if (this.#drainingExtensionEvents) return;
 		this.#drainingExtensionEvents = true;
 		queueMicrotask(() => void this.#drainExtensionEvents());
@@ -3016,9 +3017,9 @@ export class AgentSession implements SettingsScope {
 			while (this.#queuedExtensionEvents.length > 0) {
 				const batch = this.#queuedExtensionEvents;
 				this.#queuedExtensionEvents = [];
-				for (const event of batch) {
+				for (const { event, runId } of batch) {
 					try {
-						await this.#emitExtensionEvent(event);
+						await this.#emitExtensionEvent(event, runId);
 					} catch {
 						// A failed notification must not hold later updates in the queue.
 					}
@@ -3029,7 +3030,11 @@ export class AgentSession implements SettingsScope {
 		}
 	}
 
-	async #emitSessionEvent(event: AgentSessionEvent, options: { detachExtensions?: boolean } = {}): Promise<void> {
+	async #emitSessionEvent(
+		event: AgentSessionEvent,
+		options: { detachExtensions?: boolean } = {},
+		runId = this.#agentRunId,
+	): Promise<void> {
 		if (event.type === "tool_execution_update") {
 			// Returned background calls have no later tool result to persist their
 			// terminal frame. Keep the latest update for future focus rebuilds;
@@ -3042,7 +3047,7 @@ export class AgentSession implements SettingsScope {
 			this.#emit(event);
 			// Per-delta hot path: only queue the serialized extension emit when
 			// something listens (`#emitExtensionEvent` would return immediately).
-			if (this.#extensionRunner?.hasHandlers("message_update")) this.#queueExtensionEvent(event);
+			if (this.#extensionRunner?.hasHandlers("message_update")) this.#queueExtensionEvent(event, runId);
 			return;
 		}
 		// Deliver synchronously before awaiting extension notifications. This keeps
@@ -3055,7 +3060,7 @@ export class AgentSession implements SettingsScope {
 		} else {
 			this.#emit(event);
 		}
-		const extensionEmit = this.#emitExtensionEvent(event);
+		const extensionEmit = this.#emitExtensionEvent(event, runId);
 		if (options.detachExtensions) {
 			void extensionEmit.catch(error => {
 				logger.warn("Detached session event extension emit failed", {
@@ -3156,6 +3161,7 @@ export class AgentSession implements SettingsScope {
 			}
 			return processing;
 		}
+		const eventRunId = this.#agentRunId;
 		const { promise, resolve } = Promise.withResolvers<void>();
 		this.#trackPostPromptTask(promise);
 		try {
@@ -3167,7 +3173,8 @@ export class AgentSession implements SettingsScope {
 			const message = toError(error).message;
 			logger.error("agent_end maintenance failed", { error: message });
 			this.emitNotice("warning", `Post-turn maintenance failed: ${message}`, "agent-end");
-			if (this.#settledAgentEnd !== event) await this.#settleAgentEnd(event, [...this.agent.state.messages]);
+			if (this.#settledAgentEnd !== event)
+				await this.#settleAgentEnd(event, [...this.agent.state.messages], eventRunId);
 		} finally {
 			resolve();
 		}
@@ -3502,6 +3509,8 @@ export class AgentSession implements SettingsScope {
 		if (event.type === "agent_end" && this.#activeAgentContinue) {
 			this.#activeAgentContinue.turnEnded = true;
 		}
+		// Capture before maintenance can start another loop.
+		const eventRunId = event.type === "agent_start" ? ++this.#agentRunId : this.#agentRunId;
 		// A fresh run supersedes the previously settled (and pruned) refusal
 		// turn: state-based lookups take over again.
 		if (event.type === "agent_start") {
@@ -3689,7 +3698,7 @@ export class AgentSession implements SettingsScope {
 
 		if (event.type !== "agent_end") {
 			try {
-				await this.#emitSessionEvent(displayEvent);
+				await this.#emitSessionEvent(displayEvent, undefined, eventRunId);
 			} catch (error) {
 				if (event.type === "message_end") {
 					try {
@@ -3878,7 +3887,7 @@ export class AgentSession implements SettingsScope {
 			// maintenance can emit agent_end, so preserve the state at settle entry.
 			const ttsrAbortPendingAtAgentEnd = this.#ttsr.abortPending;
 			const emitAgentEndNotification = (options?: AgentEndSettleOptions) =>
-				this.#settleAgentEnd(event, activeMessages, options);
+				this.#settleAgentEnd(event, activeMessages, eventRunId, options);
 			const usage = this.getSessionStats().tokens;
 			await this.#goalRuntime.onAgentEnd({
 				currentUsage: {
@@ -4723,6 +4732,7 @@ export class AgentSession implements SettingsScope {
 	async #settleAgentEnd(
 		event: AgentEndEvent,
 		activeMessages: AgentMessage[],
+		runId: number,
 		options?: AgentEndSettleOptions,
 	): Promise<void> {
 		this.#settledAgentEnd = event;
@@ -4740,14 +4750,19 @@ export class AgentSession implements SettingsScope {
 			yielded: !options?.willContinue || awaitingAsyncWork,
 			...(awaitingAsyncWork ? { awaitingAsyncWork } : {}),
 		});
-		void this.#emitAgentEndNotification([...activeMessages], options).catch(err => {
+		void this.#emitAgentEndNotification([...activeMessages], runId, options).catch(err => {
 			logger.error("Agent end extension notification failed", { err });
 		});
 	}
 
-	async #emitAgentEndNotification(messages: AgentMessage[], options?: { willContinue?: boolean }): Promise<void> {
+	async #emitAgentEndNotification(
+		messages: AgentMessage[],
+		runId: number,
+		options?: { willContinue?: boolean },
+	): Promise<void> {
 		await this.#extensionRunner?.emit({
 			type: "agent_end",
+			runId,
 			messages,
 			willContinue: options?.willContinue,
 		});
@@ -4809,11 +4824,11 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/** Emit extension events based on session events */
-	async #emitExtensionEvent(event: AgentSessionEvent): Promise<void> {
+	async #emitExtensionEvent(event: AgentSessionEvent, runId = this.#agentRunId): Promise<void> {
 		if (!this.#extensionRunner) return;
 		if (event.type === "agent_start") {
 			this.#turnIndex = 0;
-			await this.#extensionRunner.emit({ type: "agent_start" });
+			await this.#extensionRunner.emit({ type: "agent_start", runId });
 			return;
 		}
 
@@ -4824,7 +4839,7 @@ export class AgentSession implements SettingsScope {
 			// blocked by unrelated notification-only work.
 			return;
 		}
-		const mapped = extensionEventFromSessionEvent(event, this.#turnIndex);
+		const mapped = extensionEventFromSessionEvent(event, this.#turnIndex, runId);
 		if (!mapped) return;
 		if (event.type === "turn_end") this.#turnIndex++;
 		await this.#extensionRunner.emit(mapped);
