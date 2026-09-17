@@ -869,6 +869,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	#fallbackExtensionTimers: ManagedTimers | undefined = undefined;
 	#turnIndex = 0;
+	#agentRunId = 0;
 	#messageEndPersistenceTail: Promise<void> = Promise.resolve();
 	#pendingMessageEndPersistence = new Map<string, Promise<void>>();
 	#persistedMessageKeys: { anchor: string; keys: Set<string> } | undefined;
@@ -2924,16 +2925,20 @@ export class AgentSession implements SettingsScope {
 
 	#queuedExtensionEvents: Promise<void> = Promise.resolve();
 
-	#queueExtensionEvent(event: AgentSessionEvent): Promise<void> {
+	#queueExtensionEvent(event: AgentSessionEvent, runId = this.#agentRunId): Promise<void> {
 		const emit = async () => {
-			await this.#emitExtensionEvent(event);
+			await this.#emitExtensionEvent(event, runId);
 		};
 		const queued = this.#queuedExtensionEvents.then(emit, emit);
 		this.#queuedExtensionEvents = queued.catch(() => {});
 		return queued;
 	}
 
-	async #emitSessionEvent(event: AgentSessionEvent, options: { detachExtensions?: boolean } = {}): Promise<void> {
+	async #emitSessionEvent(
+		event: AgentSessionEvent,
+		options: { detachExtensions?: boolean } = {},
+		runId = this.#agentRunId,
+	): Promise<void> {
 		if (event.type === "tool_execution_update") {
 			// Returned background calls have no later tool result to persist their
 			// terminal frame. Keep the latest update for future focus rebuilds;
@@ -2944,7 +2949,7 @@ export class AgentSession implements SettingsScope {
 		}
 		if (event.type === "message_update") {
 			this.#emit(event);
-			void this.#queueExtensionEvent(event);
+			void this.#queueExtensionEvent(event, runId);
 			return;
 		}
 		// Deliver synchronously before awaiting extension notifications. This keeps
@@ -2957,7 +2962,7 @@ export class AgentSession implements SettingsScope {
 		} else {
 			this.#emit(event);
 		}
-		const extensionEmit = this.#emitExtensionEvent(event);
+		const extensionEmit = this.#emitExtensionEvent(event, runId);
 		if (options.detachExtensions) {
 			void extensionEmit.catch(error => {
 				logger.warn("Detached session event extension emit failed", {
@@ -3393,6 +3398,8 @@ export class AgentSession implements SettingsScope {
 
 	#processAgentEvent = async (event: AgentEvent): Promise<void> => {
 		const eventPromptGeneration = this.#promptGeneration;
+		// Capture before maintenance can start another loop.
+		const eventRunId = event.type === "agent_start" ? ++this.#agentRunId : this.#agentRunId;
 		// A fresh run supersedes the previously settled (and pruned) refusal
 		// turn: state-based lookups take over again.
 		if (event.type === "agent_start") {
@@ -3576,7 +3583,7 @@ export class AgentSession implements SettingsScope {
 
 		if (event.type !== "agent_end") {
 			try {
-				await this.#emitSessionEvent(displayEvent);
+				await this.#emitSessionEvent(displayEvent, undefined, eventRunId);
 			} catch (error) {
 				if (event.type === "message_end") {
 					try {
@@ -3781,7 +3788,7 @@ export class AgentSession implements SettingsScope {
 					yielded: !options?.willContinue || awaitingAsyncWork,
 					...(awaitingAsyncWork ? { awaitingAsyncWork } : {}),
 				});
-				void this.#emitAgentEndNotification([...activeMessages], options).catch(err => {
+				void this.#emitAgentEndNotification([...activeMessages], eventRunId, options).catch(err => {
 					logger.error("Agent end extension notification failed", { err });
 				});
 			};
@@ -4606,9 +4613,14 @@ export class AgentSession implements SettingsScope {
 		return undefined;
 	}
 
-	async #emitAgentEndNotification(messages: AgentMessage[], options?: { willContinue?: boolean }): Promise<void> {
+	async #emitAgentEndNotification(
+		messages: AgentMessage[],
+		runId: number,
+		options?: { willContinue?: boolean },
+	): Promise<void> {
 		await this.#extensionRunner?.emit({
 			type: "agent_end",
+			runId,
 			messages,
 			willContinue: options?.willContinue,
 		});
@@ -4670,11 +4682,11 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/** Emit extension events based on session events */
-	async #emitExtensionEvent(event: AgentSessionEvent): Promise<void> {
+	async #emitExtensionEvent(event: AgentSessionEvent, runId = this.#agentRunId): Promise<void> {
 		if (!this.#extensionRunner) return;
 		if (event.type === "agent_start") {
 			this.#turnIndex = 0;
-			await this.#extensionRunner.emit({ type: "agent_start" });
+			await this.#extensionRunner.emit({ type: "agent_start", runId });
 			return;
 		}
 
