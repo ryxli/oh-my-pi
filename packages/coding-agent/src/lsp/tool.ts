@@ -20,7 +20,6 @@ import { clampTimeout } from "../tools/tool-timeouts";
 import {
 	applyWorkspaceEditWithLsp,
 	clearInitializationFailure,
-	ensureFileOpen,
 	getActiveOrPendingClient,
 	getOrCreateClient,
 	isRustAnalyzerClient,
