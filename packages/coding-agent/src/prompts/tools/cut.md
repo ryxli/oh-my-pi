@@ -1,7 +1,8 @@
-Stage a visible scene transition after this turn is fully complete.
+Stage a visible fresh-context handoff after a real working-set transition.
 
-Use this only when the next bounded objective should begin with a fresh model context.
-Provide a concise label, authoritative facts or decisions that must survive, the next objective, and its exit condition.
-Set `continue: false` when the scene should be materialized but must wait for the user's next message.
-The current turn is preserved in the transcript, but its dialogue is not carried into the next scene.
-Background jobs remain live across the cut so preparation already in flight can deliver into the next scene.
+A scene boundary is a working-set discontinuity, not a workflow event. Use Cut only when ALL are true:
+- The current user-requested outcome is complete or explicitly superseded.
+- The next objective is already authorized and can begin without another result, retry, decision, or approval.
+- Most current dialogue is irrelevant to executing it, while required facts fit in a concise state capsule.
+
+Otherwise keep the current scene. Blocking, waiting, command completion, recovery, and a new discriminator within the same campaign are not boundaries. `continue: false` only defers an otherwise valid transition; it never creates one.
