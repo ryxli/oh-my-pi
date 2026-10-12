@@ -4,6 +4,7 @@ import * as path from "node:path";
 import type { MnemopiOptions } from "@oh-my-pi/pi-mnemopi";
 import { getMemoriesDir, logger, withLoopPhase } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
+import { loadKnowledgeConfig, type KnowledgeConfig } from "./knowledge";
 
 import {
 	cfgMnemopiAutoRecall,
@@ -64,6 +65,7 @@ export interface MnemopiBackendConfig {
 	llmBaseUrl?: string;
 	llmApiKey?: string;
 	llmModel?: string;
+	knowledge?: KnowledgeConfig;
 }
 
 export function loadMnemopiConfig(settings: Settings, agentDir: string): MnemopiBackendConfig {
@@ -93,6 +95,7 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 		retainBank: scope.retainBank,
 		recallBanks,
 		scoping,
+		knowledge: loadKnowledgeConfig(settings),
 		autoRecall: cfgMnemopiAutoRecall.get(settings),
 		autoRetain: cfgMnemopiAutoRetain.get(settings),
 		polyphonicRecall: cfgMnemopiPolyphonicRecall.get(settings),

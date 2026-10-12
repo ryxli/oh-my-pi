@@ -306,3 +306,24 @@ export const cfgMnemopiInjectionTokenLimit = register({
 });
 
 export const cfgMnemopiDebug = register({ id: "mnemopi.debug", type: "boolean", default: false });
+
+export const cfgMnemopiKnowledgeEnabled = register({
+	id: "mnemopi.knowledge.enabled",
+	type: "boolean",
+	default: false,
+});
+export const cfgMnemopiKnowledgeDomain = register({
+	id: "mnemopi.knowledge.domain",
+	type: "string",
+	default: undefined,
+});
+export const cfgMnemopiKnowledgeTopics = register({
+	id: "mnemopi.knowledge.topics",
+	type: "array",
+	default: [] as string[],
+});
+export const cfgMnemopiKnowledgeSourcePaths = register({
+	id: "mnemopi.knowledge.sourcePaths",
+	type: "array",
+	default: [] as string[],
+});
