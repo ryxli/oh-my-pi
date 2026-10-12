@@ -403,10 +403,10 @@ export class Mnemopi {
 	readonly beam: BeamMemory;
 	readonly conn: Database;
 	readonly db: Database;
-	readonly knowledge: KnowledgeStore;
 	readonly runtimeOptions?: ResolvedMnemopiRuntimeOptions;
 	#ownsDb: boolean;
 	#closed = false;
+	#knowledge: KnowledgeStore | undefined;
 
 	constructor(options: MnemopiOptions = {}) {
 		pushLoopPhase("mnemopi.open");
@@ -445,7 +445,6 @@ export class Mnemopi {
 			}
 			this.conn = this.beam.db;
 			this.db = this.beam.db;
-			this.knowledge = new KnowledgeStore(this.db);
 			// Wipe-and-rebuild stale embeddings when the configured model changed since
 			// the vectors were written. Runs inside the runtime scope so
 			// `currentEmbeddingModel()` reflects this instance's configured model.
@@ -458,6 +457,10 @@ export class Mnemopi {
 		} finally {
 			popLoopPhase();
 		}
+	}
+
+	get knowledge(): KnowledgeStore {
+		return (this.#knowledge ??= new KnowledgeStore(this.db));
 	}
 
 	close(): void {

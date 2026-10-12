@@ -105,6 +105,7 @@ import { cfgExternalThinking } from "../session/settings";
 import { cfgGoalEnabled } from "../goals/settings";
 import { cfgLspEnabled } from "../lsp/settings";
 import { cfgMemoryBackend } from "../memory-backend/settings";
+import { isMnemopiKnowledgeEnabled } from "../mnemopi/settings";
 import { cfgTaskMaxRecursionDepth } from "../task/settings";
 
 export * from "../edit";
@@ -738,7 +739,9 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 			}
 		}
 	}
+	const knowledgeEnabled = isMnemopiKnowledgeEnabled(session.settings);
 	const isToolAllowed = (name: string) => {
+		if (knowledgeEnabled && ["retain", "recall", "reflect", "memory_edit", "learn"].includes(name)) return false;
 		// Never in the default set. Explicitly activatable while goal.enabled and
 		// no goal record exists yet — /guided-goal enables it so the agent can
 		// finish the interview with `goal create`, which turns goal mode on. Once

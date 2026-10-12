@@ -36,6 +36,30 @@ afterEach(() => {
 });
 
 describe("KnowledgeStore", () => {
+	it("marks only knowledge databases and preserves ownership after reopening", () => {
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "mnemopi-knowledge-owner-"));
+		directories.push(directory);
+		const filename = path.join(directory, "memory.sqlite");
+		const memory = new Mnemopi({ dbPath: filename, embeddings: false, llm: false, reconcile: false });
+		try {
+			expect(KnowledgeStore.hasSchema(filename)).toBe(false);
+			const store = memory.knowledge;
+			expect(KnowledgeStore.hasSchema(filename)).toBe(true);
+			const record = store.publish(publication());
+			store.retract("project", record.id);
+			expect(store.list("project", ["runtime"])).toEqual([]);
+		} finally {
+			memory.close();
+		}
+		const reopened = new Mnemopi({ dbPath: filename, embeddings: false, llm: false, reconcile: false });
+		try {
+			expect(KnowledgeStore.hasSchema(filename)).toBe(true);
+			expect(reopened.knowledge.history("project", "runtime")[0]?.state).toBe("retracted");
+		} finally {
+			reopened.close();
+		}
+	});
+
 	it("bounds active records without dropping conflicts and frees capacity on retraction", () => {
 		const store = openStore();
 		const current = store.publish(publication());

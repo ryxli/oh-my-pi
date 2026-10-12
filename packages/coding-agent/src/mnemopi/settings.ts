@@ -327,3 +327,7 @@ export const cfgMnemopiKnowledgeSourcePaths = register({
 	type: "array",
 	default: [] as string[],
 });
+
+export function isMnemopiKnowledgeEnabled(scope: ScopeLike): boolean {
+	return cfgMemoryBackend.get(scope) === "mnemopi" && cfgMnemopiKnowledgeEnabled.get(scope);
+}
