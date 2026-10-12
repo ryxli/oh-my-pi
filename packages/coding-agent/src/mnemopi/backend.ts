@@ -23,6 +23,7 @@ import { memoryToolRefs } from "../memory-backend/tool-names";
 import memoryConsolidationPrompt from "../prompts/system/memory-consolidation-system.md" with { type: "text" };
 import memoryExtractionPrompt from "../prompts/system/memory-extraction-system.md" with { type: "text" };
 import mnemopiInstructions from "../prompts/system/mnemopi-instructions.md" with { type: "text" };
+import knowledgeInstructions from "../prompts/system/mnemopi-knowledge-instructions.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
 import { tinyModelClient } from "../tiny/title-client";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
@@ -45,7 +46,7 @@ import {
 } from "./state";
 
 import { cfgMemoryBackend } from "../memory-backend/settings";
-import { cfgMnemopiInjectionTokenLimit } from "./settings";
+import { cfgMnemopiInjectionTokenLimit, cfgMnemopiKnowledgeEnabled } from "./settings";
 
 // `/diagnose` is the only user of this subpath; load it lazily alongside the
 // loaders in ./state to keep mnemopi off the CLI startup module graph.
@@ -141,7 +142,9 @@ export const mnemopiBackend: MemoryBackend = {
 			const state = getMnemopiSessionState(session);
 			const primary = state?.aliasOf ?? state;
 			const parts = [
-				prompt.render(mnemopiInstructions, { toolRefs: memoryToolRefs(session?.getXdevToolEntries()) }),
+				prompt.render(primary?.config.knowledge ? knowledgeInstructions : mnemopiInstructions, {
+					toolRefs: memoryToolRefs(session?.getXdevToolEntries()),
+				}),
 			];
 			if (primary?.lastRecallSnippet) parts.push(primary.lastRecallSnippet);
 			const rendered = parts.join("\n\n").trim();
@@ -162,9 +165,15 @@ export const mnemopiBackend: MemoryBackend = {
 	},
 
 	async clear(agentDir, _cwd, session): Promise<void> {
+		const current = getMnemopiSessionState(session);
+		const config = current?.config ?? (session ? loadMnemopiConfig(session.settings, agentDir) : undefined);
+		if (config?.knowledge) {
+			throw new Error(
+				"Shared knowledge cannot be cleared while sessions may hold the database. Retract selected records; stop all pilot sessions before offline database deletion.",
+			);
+		}
 		const previous = session ? setMnemopiSessionState(session, undefined) : undefined;
 		await previous?.dispose({ consolidate: false });
-		const config = previous?.config ?? (session ? loadMnemopiConfig(session.settings, agentDir) : undefined);
 		if (!config) return;
 		await loadMnemopiCore();
 		// Close the cached default Mnemopi instance so its SQLite handle doesn't
@@ -186,6 +195,11 @@ export const mnemopiBackend: MemoryBackend = {
 	},
 
 	async enqueue(agentDir, _cwd, session): Promise<void> {
+		if (getMnemopiSessionState(session)?.knowledge || (session && cfgMnemopiKnowledgeEnabled.get(session.settings))) {
+			throw new Error(
+				"Knowledge pilot retains selected evidence only; publish with the knowledge tool instead of /memory enqueue.",
+			);
+		}
 		try {
 			let state = getMnemopiSessionState(session);
 			if (!state && session?.sessionId) {

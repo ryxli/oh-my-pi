@@ -11,6 +11,7 @@ import { BeamMemory, initBeam } from "./beam/index";
 import { reconcileEmbeddingModel } from "./beam/store";
 import type { RecallEnhancedOptions, RecallOptions, RecallResult, SleepResult } from "./beam/types";
 import { EpisodicGraph } from "./episodic-graph";
+import { KnowledgeStore } from "./knowledge";
 import {
 	isPiAiModel,
 	type MnemopiEmbeddingRuntimeOptions,
@@ -402,6 +403,7 @@ export class Mnemopi {
 	readonly beam: BeamMemory;
 	readonly conn: Database;
 	readonly db: Database;
+	readonly knowledge: KnowledgeStore;
 	readonly runtimeOptions?: ResolvedMnemopiRuntimeOptions;
 	#ownsDb: boolean;
 	#closed = false;
@@ -443,6 +445,7 @@ export class Mnemopi {
 			}
 			this.conn = this.beam.db;
 			this.db = this.beam.db;
+			this.knowledge = new KnowledgeStore(this.db);
 			// Wipe-and-rebuild stale embeddings when the configured model changed since
 			// the vectors were written. Runs inside the runtime scope so
 			// `currentEmbeddingModel()` reflects this instance's configured model.

@@ -9,6 +9,7 @@ export {
 	type StandardEmbeddingModel,
 	setLocalModelInitializer,
 } from "./embeddings";
+export * from "./knowledge";
 export * from "./memory";
 export {
 	addMemory,
