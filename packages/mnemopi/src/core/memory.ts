@@ -11,6 +11,7 @@ import { BeamMemory, initBeam } from "./beam/index";
 import { reconcileEmbeddingModel } from "./beam/store";
 import type { RecallEnhancedOptions, RecallOptions, RecallResult, SleepResult } from "./beam/types";
 import { EpisodicGraph } from "./episodic-graph";
+import { KnowledgeStore } from "./knowledge";
 import {
 	isPiAiModel,
 	type MnemopiEmbeddingRuntimeOptions,
@@ -405,6 +406,7 @@ export class Mnemopi {
 	readonly runtimeOptions?: ResolvedMnemopiRuntimeOptions;
 	#ownsDb: boolean;
 	#closed = false;
+	#knowledge: KnowledgeStore | undefined;
 
 	constructor(options: MnemopiOptions = {}) {
 		pushLoopPhase("mnemopi.open");
@@ -455,6 +457,10 @@ export class Mnemopi {
 		} finally {
 			popLoopPhase();
 		}
+	}
+
+	get knowledge(): KnowledgeStore {
+		return (this.#knowledge ??= new KnowledgeStore(this.db));
 	}
 
 	close(): void {

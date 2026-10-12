@@ -12,7 +12,7 @@ import {
 	resolveImageDataUrlSync,
 } from "./blob-store";
 import { buildSessionContext } from "./session-context";
-import type { FileEntry, RawFileEntry, SessionEntry, SessionHeader } from "./session-entries";
+import type { FileEntry, RawFileEntry, SessionEntry, SessionHeader, SessionMessageEntry } from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
 import { isExternalizableImagePosition, isPersistenceTruncatedString } from "./session-persistence";
 import { FileSessionStorage, type SessionStorage } from "./session-storage";
@@ -191,6 +191,32 @@ export async function readSessionHeaderId(filePath: string): Promise<string | un
 		throw err;
 	}
 	return id;
+}
+
+/** Reads one recorded message without opening a writable session or expanding its branch. */
+export async function readSessionMessage(
+	filePath: string,
+	sessionId: string,
+	entryId: string,
+): Promise<SessionMessageEntry | undefined> {
+	let checkedHeader = false;
+	let message: SessionMessageEntry | undefined;
+	try {
+		await visitEntriesFromFileStream(filePath, entry => {
+			if (!checkedHeader) {
+				checkedHeader = true;
+				return isValidSessionHeader(entry) && entry.id === sessionId;
+			}
+			if (entry.type === "message" && entry.id === entryId) {
+				message = entry;
+				return false;
+			}
+		});
+	} catch (error) {
+		if (isEnoent(error) || isEnotdir(error) || isEisdir(error)) return undefined;
+		throw error;
+	}
+	return message;
 }
 
 /** Parse session JSONL and visit each entry without retaining prior entries. */

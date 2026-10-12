@@ -64,6 +64,7 @@ import { isIrcEnabled } from "../irc/messaging";
 import { FindTool, isFindEnabled } from "./jfind";
 import { LearnTool } from "./learn";
 import { ManageSkillTool } from "./manage-skill";
+import { KnowledgeTool } from "./knowledge";
 import { MemoryEditTool } from "./memory-edit";
 import { MemoryRecallTool } from "./memory-recall";
 import { MemoryReflectTool } from "./memory-reflect";
@@ -104,6 +105,7 @@ import { cfgExternalThinking } from "../session/settings";
 import { cfgGoalEnabled } from "../goals/settings";
 import { cfgLspEnabled } from "../lsp/settings";
 import { cfgMemoryBackend } from "../memory-backend/settings";
+import { isMnemopiKnowledgeEnabled } from "../mnemopi/settings";
 import { cfgTaskMaxRecursionDepth } from "../task/settings";
 
 export * from "../edit";
@@ -147,6 +149,7 @@ export * from "./memory-edit";
 export * from "./memory-recall";
 export * from "./memory-reflect";
 export * from "./memory-retain";
+export * from "./knowledge";
 export * from "./read";
 export * from "./report-tool-issue";
 export * from "./resolve";
@@ -583,6 +586,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	web_search: s => new WebSearchTool(s),
 	write: s => new WriteTool(s),
 	memory_edit: MemoryEditTool.createIf,
+	knowledge: KnowledgeTool.createIf,
 	retain: MemoryRetainTool.createIf,
 	recall: MemoryRecallTool.createIf,
 	reflect: MemoryReflectTool.createIf,
@@ -715,6 +719,9 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 		if (cfgMemoryBackend.get(session.settings) === "mnemopi" && !requestedTools.includes("memory_edit")) {
 			requestedTools.push("memory_edit");
 		}
+		if (KnowledgeTool.createIf(session) && !requestedTools.includes("knowledge")) {
+			requestedTools.push("knowledge");
+		}
 		if (externalThinkingActive && !requestedTools.includes("think")) {
 			requestedTools.push("think");
 		}
@@ -734,7 +741,9 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 			}
 		}
 	}
+	const knowledgeEnabled = isMnemopiKnowledgeEnabled(session.settings);
 	const isToolAllowed = (name: string) => {
+		if (knowledgeEnabled && ["retain", "recall", "reflect", "memory_edit", "learn"].includes(name)) return false;
 		// Never in the default set. Explicitly activatable while goal.enabled and
 		// no goal record exists yet — /guided-goal enables it so the agent can
 		// finish the interview with `goal create`, which turns goal mode on. Once
@@ -780,6 +789,7 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 			return ["hindsight", "mnemopi"].includes(cfgMemoryBackend.get(session.settings));
 		}
 		if (name === "memory_edit") return cfgMemoryBackend.get(session.settings) === "mnemopi";
+		if (name === "knowledge") return KnowledgeTool.createIf(session) !== null;
 		if (name === "manage_skill")
 			return (
 				cfgAutolearnEnabled.get(session.settings) &&

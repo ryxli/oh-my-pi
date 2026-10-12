@@ -29,7 +29,14 @@ import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 import { cfgAutolearnEnabled } from "@oh-my-pi/pi-coding-agent/autolearn/settings";
 import { cfgHindsightApiUrl, cfgHindsightMentalModelsEnabled } from "@oh-my-pi/pi-coding-agent/hindsight/settings";
 import { cfgMemoryBackend } from "@oh-my-pi/pi-coding-agent/memory-backend/settings";
-import { cfgMnemopiBank, cfgMnemopiRecallLimit, cfgMnemopiScoping } from "@oh-my-pi/pi-coding-agent/mnemopi/settings";
+import {
+	cfgMnemopiBank,
+	cfgMnemopiDbPath,
+	cfgMnemopiKnowledgeDomain,
+	cfgMnemopiKnowledgeEnabled,
+	cfgMnemopiRecallLimit,
+	cfgMnemopiScoping,
+} from "@oh-my-pi/pi-coding-agent/mnemopi/settings";
 
 function createTool(name: string): AgentTool {
 	return {
@@ -91,7 +98,8 @@ describe("AgentSession memory backend lifecycle", () => {
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: ["initial"], tools: [read] },
-			streamFn: createMockModel({ responses: [{ content: ["ok"] }, { content: ["ok"] }] }).stream,
+			streamFn: createMockModel({ responses: [{ content: ["ok"] }, { content: ["ok"] }, { content: ["ok"] }] })
+				.stream,
 		});
 		const toolRegistry = new Map<string, AgentTool>([[read.name, read]]);
 		session = new AgentSession({
@@ -308,6 +316,74 @@ describe("AgentSession memory backend lifecycle", () => {
 		expect(current.getHindsightSessionState()).toBeDefined();
 		expect(current.getActiveToolNames()).toEqual(expect.arrayContaining(["recall", "retain", "reflect", "learn"]));
 	});
+
+	it.each(["backend-off", "knowledge-off", "invalid-config", "failed-open"] as const)(
+		"withdraws delivered knowledge after %s and redelivers on recovery",
+		async failure => {
+			const dbPath = tempDir.join("pilot.db");
+			settings = Settings.isolated({
+				"compaction.enabled": false,
+				"memory.backend": "mnemopi",
+				"mnemopi.dbPath": dbPath,
+				"mnemopi.bank": "pilot",
+				"mnemopi.scoping": "global",
+				"mnemopi.autoRecall": false,
+				"mnemopi.autoRetain": false,
+				"mnemopi.noEmbeddings": true,
+				"mnemopi.llmMode": "none",
+				"mnemopi.knowledge.enabled": true,
+				"mnemopi.knowledge.domain": "personal",
+				"mnemopi.knowledge.topics": ["delivery"],
+			});
+			const current = createSession(async () => []);
+			await current.applyMemoryBackend();
+			const knowledge = getMnemopiSessionState(current)?.knowledge;
+			if (!knowledge) throw new Error("Expected knowledge runtime");
+			const entryId = current.sessionManager.appendMessage({ role: "user", content: "Use staging.", timestamp: 1 });
+			await knowledge.publish({
+				topic: "delivery",
+				key: "environment",
+				kind: "decision",
+				origin: "quoted",
+				content: "Use staging.",
+				sources: [{ type: "session", entryId, quote: "Use staging." }],
+				expectedCurrentId: null,
+			});
+			await current.prompt("What is current?");
+			const delivered = current.sessionManager.getBranch().filter(entry => entry.type === "custom_message");
+			expect(
+				delivered.some(entry => typeof entry.content === "string" && entry.content.includes('"state":"current"')),
+			).toBe(true);
+
+			if (failure === "backend-off") cfgMemoryBackend.override(settings, "off");
+			if (failure === "knowledge-off") cfgMnemopiKnowledgeEnabled.override(settings, false);
+			if (failure === "invalid-config") cfgMnemopiKnowledgeDomain.override(settings, "");
+			if (failure === "failed-open") {
+				const blocked = tempDir.join("not-a-directory");
+				await Bun.write(blocked, "blocked");
+				cfgMnemopiDbPath.override(settings, path.join(blocked, "pilot.db"));
+			}
+			await current.prompt("Can prior knowledge still be treated as current?");
+			const withdrawn = current.sessionManager
+				.getBranch()
+				.filter(entry => entry.type === "custom_message")
+				.at(-1);
+			expect(withdrawn?.content).toContain('"withdrawn":true');
+			expect(getMnemopiSessionState(current)?.knowledge).toBeUndefined();
+
+			cfgMemoryBackend.override(settings, "mnemopi");
+			cfgMnemopiKnowledgeEnabled.override(settings, true);
+			cfgMnemopiKnowledgeDomain.override(settings, "personal");
+			cfgMnemopiDbPath.override(settings, dbPath);
+			await current.prompt("What is current after recovery?");
+			const recovered = current.sessionManager
+				.getBranch()
+				.filter(entry => entry.type === "custom_message")
+				.at(-1);
+			expect(recovered?.content).toContain('"state":"current"');
+			expect(recovered?.content).toContain("Use staging.");
+		},
+	);
 
 	it("applies memory settings edited mid-session before the next prompt", async () => {
 		const current = createSession(async () =>

@@ -25,6 +25,7 @@ export const BUILTIN_TOOL_NAMES = [
 	"web_search",
 	"write",
 	"memory_edit",
+	"knowledge",
 	"retain",
 	"recall",
 	"reflect",

@@ -10,7 +10,7 @@ import type { ToolSession } from ".";
 
 import { cfgAutolearnEnabled } from "../autolearn/settings";
 import { cfgMemoryBackend } from "../memory-backend/settings";
-import { isGlobalMemoryScopeAvailable } from "../mnemopi/settings";
+import { isGlobalMemoryScopeAvailable, isMnemopiKnowledgeEnabled } from "../mnemopi/settings";
 
 const learnSkillSchema = type({
 	action: "'create' | 'update'",
@@ -69,6 +69,7 @@ export class LearnTool implements AgentTool<LearnSchema> {
 	constructor(private readonly session: ToolSession) {}
 
 	static createIf(session: ToolSession): LearnTool | null {
+		if (isMnemopiKnowledgeEnabled(session.settings)) return null;
 		if (!cfgAutolearnEnabled.get(session.settings)) return null;
 		const backend = cfgMemoryBackend.get(session.settings);
 		if (backend !== "hindsight" && backend !== "mnemopi" && backend !== "local") return null;

@@ -27,9 +27,11 @@ import { redactMemorySecrets, redactRememberWrite } from "../memory-backend/reda
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import memoryRecallChangesPrompt from "../prompts/system/memory-recall-changes.md" with { type: "text" };
 import mnemopiInstructions from "../prompts/system/mnemopi-instructions.md" with { type: "text" };
+import knowledgeInstructions from "../prompts/system/mnemopi-knowledge-instructions.md" with { type: "text" };
 import { type MnemopiBackendConfig, type MnemopiScoping, truncateApproxTokens } from "./config";
 import { mnemopiEmbedClient } from "./embed-client";
 import { cfgMnemopiInjectionTokenLimit } from "./settings";
+import { MnemopiKnowledge } from "./knowledge";
 
 /** A rendered recall block and where each tracked memory's text starts in it. */
 interface RecallBlock {
@@ -257,6 +259,7 @@ export class MnemopiSessionState {
 	readonly session: AgentSession;
 	readonly memory: Mnemopi;
 	readonly globalMemory?: Mnemopi;
+	readonly knowledge?: MnemopiKnowledge;
 	readonly aliasOf?: MnemopiSessionState;
 	private readonly scoped: MnemopiScopedResources;
 	lastRetainedTurn: number;
@@ -276,11 +279,19 @@ export class MnemopiSessionState {
 		this.scoped = options.aliasOf?.scoped ?? createScopedResources(options.config);
 		this.memory = this.scoped.retain.memory;
 		this.globalMemory = this.scoped.global?.memory;
+		if (options.config.knowledge) {
+			this.knowledge = new MnemopiKnowledge(
+				options.config.knowledge,
+				this.memory.knowledge,
+				this.session.sessionManager,
+			);
+		}
 	}
 
 	setSessionId(sessionId: string): void {
 		if (this.sessionId === sessionId) return;
 		this.#recallGeneration++;
+		this.knowledge?.reset();
 		this.sessionId = sessionId;
 		this.lastRetainedTurn = 0;
 		this.#retentionCursorLoaded = false;
@@ -288,6 +299,7 @@ export class MnemopiSessionState {
 
 	resetConversationTracking(): void {
 		this.#recallGeneration++;
+		this.knowledge?.reset();
 		this.lastRetainedTurn = 0;
 		this.#retentionCursorLoaded = false;
 		this.hasRecalledForFirstTurn = false;
@@ -326,6 +338,7 @@ export class MnemopiSessionState {
 	 * (issue #4443).
 	 */
 	getScopedMemory(id: string): MnemopiScopedMemoryHit | null {
+		this.#assertGenericMemoryAccess();
 		const targets = dedupeScopedTargets([
 			this.scoped.retain,
 			...this.scoped.recall,
@@ -369,6 +382,7 @@ export class MnemopiSessionState {
 		id: string,
 		options: MnemopiMemoryEditOptions = {},
 	): MnemopiMemoryEditResult {
+		this.#assertGenericMemoryAccess();
 		return withLoopPhase("mnemopi.edit", () => {
 			const targets = dedupeScopedTargets([
 				this.scoped.retain,
@@ -433,6 +447,7 @@ export class MnemopiSessionState {
 	}
 
 	async collectScopedRecallResults(query: string): Promise<RecallResult[]> {
+		this.#assertGenericMemoryAccess();
 		const merged: RecallResult[] = [];
 		const byId = new Map<string, number>();
 		const byContent = new Map<string, number>();
@@ -525,10 +540,17 @@ export class MnemopiSessionState {
 		options: MnemopiRememberOptions = {},
 		target: MnemopiScopedMemory = this.scoped.retain,
 	): string {
+		this.#assertGenericMemoryAccess();
 		return withLoopPhase("mnemopi.retain", () => {
 			const [scrubbed, scrubbedOptions] = redactRememberWrite(memory, options);
 			return target.memory.remember(scrubbed, scrubbedOptions);
 		});
+	}
+
+	#assertGenericMemoryAccess(): void {
+		if (this.knowledge) {
+			throw new Error("Knowledge pilot retains selected evidence only; use the knowledge tool, not generic memory.");
+		}
 	}
 
 	async recallForContext(query: string, signal?: AbortSignal): Promise<string | undefined> {
@@ -555,7 +577,7 @@ export class MnemopiSessionState {
 	 * that ends in "…" when it cut one.
 	 */
 	budgetRecallBlock(block: string): string {
-		const instructions = prompt.render(mnemopiInstructions, {
+		const instructions = prompt.render(this.config.knowledge ? knowledgeInstructions : mnemopiInstructions, {
 			toolRefs: memoryToolRefs(this.session.getXdevToolEntries()),
 		});
 		return truncateApproxTokens(
@@ -615,12 +637,20 @@ export class MnemopiSessionState {
 		return { content: prompt.render(memoryRecallChangesPrompt, { removed, updated }), memories: current };
 	}
 
+	async beforeAgentStartPrompt(
+		promptText: string,
+		signal?: AbortSignal,
+		budget: (block: string) => string = block => this.budgetRecallBlock(block),
+	): Promise<MemoryPromptPreparation | undefined> {
+		return this.knowledge ? this.knowledge.prepare(signal) : this.#prepareRecall(promptText, signal, budget);
+	}
+
 	/**
 	 * A fresh recall is cut by `budget` to the prefix the prompt carries next to the memory
 	 * instructions; a reused one is resent exactly as delivered. Memories the delivered block
 	 * shows, even in part, are tracked for change reports.
 	 */
-	async beforeAgentStartPrompt(
+	async #prepareRecall(
 		promptText: string,
 		signal?: AbortSignal,
 		budget: (block: string) => string = block => this.budgetRecallBlock(block),
@@ -675,6 +705,7 @@ export class MnemopiSessionState {
 	}
 
 	async recallForCompaction(messages: AgentMessage[]): Promise<string | undefined> {
+		if (this.knowledge) return undefined;
 		const flat = withLoopPhase("mnemopi.recall", () => flattenAgentMessages(messages));
 		const lastUser = flat.findLast(message => message.role === "user");
 		if (!lastUser) return undefined;
@@ -704,6 +735,10 @@ export class MnemopiSessionState {
 	}
 
 	async forceRetainCurrentSession(options: { extract?: boolean } = {}): Promise<void> {
+		if (this.knowledge)
+			throw new Error(
+				"Knowledge pilot retains selected evidence only; publish with the knowledge tool instead of capturing the transcript.",
+			);
 		if (this.aliasOf) return;
 		const flat = withLoopPhase("mnemopi.retain", () => extractMessages(this.session.sessionManager));
 		const userTurns = withLoopPhase("mnemopi.retain", () => {
@@ -800,7 +835,7 @@ export class MnemopiSessionState {
 	}
 
 	async maybeRecallOnAgentStart(): Promise<void> {
-		if (!this.config.autoRecall || this.hasRecalledForFirstTurn) return;
+		if (this.knowledge || !this.config.autoRecall || this.hasRecalledForFirstTurn) return;
 		const generation = this.#recallGeneration;
 		// No message can join a turn already started, so a reused recall's changes wait for
 		// the next resume to be reported.
@@ -858,7 +893,7 @@ export class MnemopiSessionState {
 	 * error cannot make the backend inert.
 	 */
 	promoteEligibleWorkingMemory(): void {
-		if (this.aliasOf) return;
+		if (this.knowledge || this.aliasOf) return;
 		for (const memory of this.scoped.owned) {
 			try {
 				memory.sleep(false);
@@ -901,6 +936,7 @@ export class MnemopiSessionState {
 	async consolidate(
 		options: { full?: boolean; extract?: boolean; sleep?: boolean; retain?: boolean } = {},
 	): Promise<void> {
+		if (this.knowledge && options.retain === false) return;
 		if (options.retain !== false) {
 			await this.forceRetainCurrentSession({ extract: options.extract });
 		}
@@ -953,6 +989,7 @@ export class MnemopiSessionState {
 
 	async dispose(options: { consolidate?: boolean; timeoutMs?: number; retain?: boolean } = {}): Promise<void> {
 		this.#recallGeneration++;
+		this.knowledge?.reset();
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 		if (this.aliasOf) return;

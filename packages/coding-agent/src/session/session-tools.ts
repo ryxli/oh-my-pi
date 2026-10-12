@@ -22,6 +22,7 @@ import { resolveMemoryBackend } from "../memory-backend/resolve";
 import { MEMORY_BACKEND_TOOL_NAMES } from "../memory-backend/tool-names";
 import { invalidateToolSchemaMetadata } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import type { MemoryBackendStartOptions, MemoryPromptPreparation } from "../memory-backend/types";
+import { prepareKnowledgeWithdrawal } from "../mnemopi/knowledge";
 import type { AgentDefinition } from "../task/types";
 import evalPreludeNoticePrompt from "../prompts/system/eval-prelude-notice.md" with { type: "text" };
 import sessionAgentNoticePrompt from "../prompts/system/session-agent-notice.md" with { type: "text" };
@@ -2041,10 +2042,24 @@ export class SessionTools {
 		signal?: AbortSignal,
 	): Promise<SystemPromptPreparation> {
 		const backend = await resolveMemoryBackend(this.#host.settings);
-		if (!isCurrent() || !backend.beforeAgentStartPrompt) return { systemPrompt: this.#baseSystemPrompt };
+		if (!isCurrent()) return { systemPrompt: this.#baseSystemPrompt };
+		const session = this.#host.memoryBackendSession();
+		const withdrawal = session.getMnemopiSessionState()?.knowledge
+			? undefined
+			: prepareKnowledgeWithdrawal(session.sessionManager, signal);
 
 		try {
-			const memory = await backend.beforeAgentStartPrompt(this.#host.memoryBackendSession(), promptText, signal);
+			const prepared = await backend.beforeAgentStartPrompt?.(session, promptText, signal);
+			const memory: MemoryPromptPreparation | undefined = withdrawal
+				? {
+						context: prepared?.context,
+						notice: {
+							content: [prepared?.notice?.content, withdrawal.notice?.content].filter(Boolean).join("\n\n"),
+							details: prepared?.notice?.details ?? withdrawal.notice?.details,
+						},
+						commit: () => (!prepared || prepared.commit()) && withdrawal.commit(),
+					}
+				: prepared;
 			if (!isCurrent() || !memory) return { systemPrompt: this.#baseSystemPrompt };
 			const injected = memory.context;
 			if (!injected) {
@@ -2088,7 +2103,12 @@ export class SessionTools {
 				backend: backend.id,
 				error: String(err),
 			});
-			return { systemPrompt: this.#baseSystemPrompt };
+			const failedKnowledge = prepareKnowledgeWithdrawal(session.sessionManager, signal);
+			return {
+				systemPrompt: this.#baseSystemPrompt,
+				memoryNotice: failedKnowledge?.notice,
+				commit: failedKnowledge ? () => isCurrent() && failedKnowledge.commit() : undefined,
+			};
 		}
 	}
 
