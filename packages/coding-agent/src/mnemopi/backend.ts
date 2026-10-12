@@ -167,15 +167,21 @@ export const mnemopiBackend: MemoryBackend = {
 	async clear(agentDir, _cwd, session): Promise<void> {
 		const current = getMnemopiSessionState(session);
 		const config = current?.config ?? (session ? loadMnemopiConfig(session.settings, agentDir) : undefined);
-		if (config?.knowledge) {
-			throw new Error(
-				"Shared knowledge cannot be cleared while sessions may hold the database. Retract selected records; stop all pilot sessions before offline database deletion.",
-			);
+		if (!config) return;
+		await loadMnemopiCore();
+		const dbPaths = getMnemopiScopedDbPaths(config);
+		for (const dbPath of dbPaths) {
+			if (
+				config.knowledge ||
+				((await Bun.file(dbPath).exists()) && requireMnemopiCore().KnowledgeStore.hasSchema(dbPath))
+			) {
+				throw new Error(
+					"Shared knowledge cannot be cleared while sessions may hold the database. Retract selected records; stop all pilot sessions before offline database deletion.",
+				);
+			}
 		}
 		const previous = session ? setMnemopiSessionState(session, undefined) : undefined;
 		await previous?.dispose({ consolidate: false });
-		if (!config) return;
-		await loadMnemopiCore();
 		// Close the cached default Mnemopi instance so its SQLite handle doesn't
 		// keep the DB files locked on Windows when removeDbFiles tries to delete.
 		// Use the core module (already awaited via loadMnemopiCore above):
@@ -184,7 +190,7 @@ export const mnemopiBackend: MemoryBackend = {
 		// taskDepth > 0). resetMemoryForTests is re-exported identically from core.
 		requireMnemopiCore().resetMemoryForTests();
 		await Bun.sleep(0);
-		await removeDbFiles(getMnemopiScopedDbPaths(config));
+		await removeDbFiles(dbPaths);
 		if (!session?.sessionId || previous?.aliasOf || cfgMemoryBackend.get(session.settings) !== "mnemopi") return;
 		try {
 			await Promise.all([loadMnemopi(), loadMnemopiCore()]);

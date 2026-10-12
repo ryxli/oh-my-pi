@@ -1,5 +1,6 @@
 Inspect or explicitly publish shared knowledge for this session's configured domain and selected topics.
 No automatic conversation capture occurs.
+Generic retain, recall, reflect, memory_edit, and learn are disabled in this mode.
 
 - `list`: return a bounded active snapshot with current, candidate, conflict, and evidence freshness states.
 - `publish`: supply `topic`, `kind` (`decision`, `investigation`, `policy`), `origin` (`quoted`, `inferred`), `content`, `sources`, and `expectedCurrentId` (the current ID from list, or null when absent).

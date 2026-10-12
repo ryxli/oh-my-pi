@@ -8,6 +8,7 @@ import { sessionMemoryToolRefs } from "../memory-backend/tool-names";
 import type { ToolSession } from ".";
 
 import { cfgMemoryBackend } from "../memory-backend/settings";
+import { isMnemopiKnowledgeEnabled } from "../mnemopi/settings";
 
 const memoryReflectSchema = type({
 	query: type("string").describe("question to answer"),
@@ -33,6 +34,7 @@ export class MemoryReflectTool implements AgentTool<typeof memoryReflectSchema> 
 	constructor(private readonly session: ToolSession) {}
 
 	static createIf(session: ToolSession): MemoryReflectTool | null {
+		if (isMnemopiKnowledgeEnabled(session.settings)) return null;
 		const backend = cfgMemoryBackend.get(session.settings);
 		if (backend !== "hindsight" && backend !== "mnemopi") return null;
 		if (backend === "hindsight" && !isHindsightConfigured(loadHindsightConfig(session.settings))) return null;

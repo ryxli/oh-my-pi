@@ -1,4 +1,4 @@
-import type { Database } from "bun:sqlite";
+import { Database } from "bun:sqlite";
 
 const MAX_ACTIVE_RECORDS_PER_TOPIC = 32;
 
@@ -46,6 +46,15 @@ function decodeRecord(row: KnowledgeRow): KnowledgeRecord {
 /** Local reference records only; callers verify sources and decide how to use them. */
 export class KnowledgeStore {
 	#db: Database;
+
+	/** The schema marks a database as knowledge-owned, including empty or retracted history. */
+	static hasSchema(dbPath: string): boolean {
+		using db = new Database(dbPath, { readonly: true });
+		using query = db.prepare<{ name: string }, []>(
+			"SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_records'",
+		);
+		return query.get() !== null;
+	}
 
 	constructor(db: Database) {
 		this.#db = db;

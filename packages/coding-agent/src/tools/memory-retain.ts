@@ -7,7 +7,7 @@ import retainDescription from "../prompts/tools/retain.md" with { type: "text" }
 import type { ToolSession } from ".";
 
 import { cfgMemoryBackend } from "../memory-backend/settings";
-import { isGlobalMemoryScopeAvailable } from "../mnemopi/settings";
+import { isGlobalMemoryScopeAvailable, isMnemopiKnowledgeEnabled } from "../mnemopi/settings";
 
 const memoryRetainSchemaBase = type({
 	items: type({
@@ -55,6 +55,7 @@ export class MemoryRetainTool implements AgentTool<MemoryRetainSchema, MemoryRet
 	constructor(private readonly session: ToolSession) {}
 
 	static createIf(session: ToolSession): MemoryRetainTool | null {
+		if (isMnemopiKnowledgeEnabled(session.settings)) return null;
 		const backend = cfgMemoryBackend.get(session.settings);
 		if (backend !== "hindsight" && backend !== "mnemopi") return null;
 		if (backend === "hindsight" && !isHindsightConfigured(loadHindsightConfig(session.settings))) return null;

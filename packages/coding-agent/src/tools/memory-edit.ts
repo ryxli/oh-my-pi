@@ -6,6 +6,7 @@ import { sessionMemoryToolRefs } from "../memory-backend/tool-names";
 import type { ToolSession } from ".";
 
 import { cfgMemoryBackend } from "../memory-backend/settings";
+import { isMnemopiKnowledgeEnabled } from "../mnemopi/settings";
 
 const memoryEditSchema = type({
 	op: type("'update' | 'forget' | 'invalidate'").describe("memory edit operation"),
@@ -34,6 +35,7 @@ export class MemoryEditTool implements AgentTool<typeof memoryEditSchema> {
 	constructor(private readonly session: ToolSession) {}
 
 	static createIf(session: ToolSession): MemoryEditTool | null {
+		if (isMnemopiKnowledgeEnabled(session.settings)) return null;
 		const backend = cfgMemoryBackend.get(session.settings);
 		if (backend !== "mnemopi") return null;
 		return new MemoryEditTool(session);

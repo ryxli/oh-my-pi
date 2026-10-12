@@ -1,7 +1,6 @@
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import { cfgMemoryBackend } from "../memory-backend/settings";
-import { cfgMnemopiKnowledgeEnabled } from "../mnemopi/settings";
+import { isMnemopiKnowledgeEnabled } from "../mnemopi/settings";
 import knowledgeDescription from "../prompts/tools/knowledge.md" with { type: "text" };
 import type { ToolSession } from ".";
 
@@ -33,9 +32,7 @@ export class KnowledgeTool implements AgentTool<typeof knowledgeSchema> {
 	constructor(readonly session: ToolSession) {}
 
 	static createIf(session: ToolSession): KnowledgeTool | null {
-		return cfgMemoryBackend.get(session.settings) === "mnemopi" && cfgMnemopiKnowledgeEnabled.get(session.settings)
-			? new KnowledgeTool(session)
-			: null;
+		return isMnemopiKnowledgeEnabled(session.settings) ? new KnowledgeTool(session) : null;
 	}
 
 	async execute(_id: string, params: KnowledgeParams): Promise<AgentToolResult> {

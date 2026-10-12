@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import { Settings } from "../src/config/settings";
-import { findPersistedRecall, MEMORY_RECALL_CHANGES_MESSAGE_TYPE } from "../src/memory-backend/recall-entry";
+import { MEMORY_RECALL_CHANGES_MESSAGE_TYPE } from "../src/memory-backend/recall-entry";
 import { mnemopiBackend } from "../src/mnemopi/backend";
 import { loadMnemopiConfig } from "../src/mnemopi/config";
 import { KNOWLEDGE_NOTICE_LIMIT, loadKnowledgeConfig, prepareKnowledgeWithdrawal } from "../src/mnemopi/knowledge";
 import {
-	getMnemopiRecallScope,
+	getMnemopiScopedDbPaths,
 	getMnemopiSessionState,
 	loadMnemopi,
 	loadMnemopiCore,
@@ -15,7 +15,8 @@ import {
 } from "../src/mnemopi/state";
 import type { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
-import type { ToolSession } from "../src/tools";
+import { BUILTIN_TOOLS, type ToolSession } from "../src/tools";
+import { MemoryRetainTool } from "../src/tools/memory-retain";
 import { KnowledgeTool } from "../src/tools/knowledge";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -296,6 +297,37 @@ describe("opt-in shared domain knowledge", () => {
 		expect(await deliver(start(dir))).toContain("Use canary.");
 	});
 
+	it("protects pilot databases from ordinary clear before publication and after retraction", async () => {
+		const dir = directory();
+		const pilot = start(dir);
+		const ordinary = start(dir, { "mnemopi.knowledge.enabled": false });
+		for (const phase of ["empty", "retracted"] as const) {
+			if (phase === "retracted") {
+				const record = await publish(pilot, "Use staging.");
+				knowledge(pilot).retract(record.id);
+			}
+			await expect(mnemopiBackend.clear(dir.path(), dir.path(), ordinary.session)).rejects.toThrow(
+				"stop all pilot sessions",
+			);
+			expect(getMnemopiSessionState(ordinary.session)).toBe(ordinary);
+			expect(await Bun.file(dir.join("pilot.db")).exists()).toBe(true);
+			expect(knowledge(pilot).store.history("project-a", "deployment")).toHaveLength(phase === "empty" ? 0 : 1);
+		}
+	});
+
+	it("still clears ordinary memory databases", async () => {
+		const dir = directory();
+		const ordinary = start(dir, { "mnemopi.knowledge.enabled": false });
+		ordinary.rememberScoped("Ordinary memory.");
+		const paths = getMnemopiScopedDbPaths(ordinary.config);
+		await mnemopiBackend.clear(dir.path(), dir.path(), ordinary.session);
+		const replacement = getMnemopiSessionState(ordinary.session);
+		if (!replacement) throw new Error("Expected reinitialized ordinary memory");
+		states.splice(states.indexOf(ordinary), 1, replacement);
+		expect(await replacement.recallResultsScoped("Ordinary memory")).toEqual([]);
+		for (const dbPath of paths) expect(await Bun.file(dbPath).exists()).toBe(true);
+	});
+
 	it("keeps concurrent conflicts and inferred candidates visible beside current", async () => {
 		const dir = directory();
 		const a = start(dir);
@@ -552,46 +584,50 @@ describe("opt-in shared domain knowledge", () => {
 		expect((await knowledge(state).publish({ ...observation, kind: "investigation" })).state).toBe("current");
 	});
 
-	it("co-delivers recall changes without corrupting persisted recall bookkeeping", async () => {
+	it("excludes generic recall from pilot prompts and keeps ordinary recall working", async () => {
 		const dir = directory();
-		const writer = start(dir, { "mnemopi.autoRecall": true });
-		const id = writer.rememberScoped("The deploy host is alpha-7.");
-		const first = await writer.beforeAgentStartPrompt("Where is the deploy host?");
-		expect(first?.context).toContain("alpha-7");
-		expect(first?.commit()).toBe(true);
-		writer.session.sessionManager.appendMessage({ role: "user", content: "Where is the deploy host?", timestamp: 1 });
-		writer.editScopedMemory("update", id, { content: "The deploy host is beta-9." });
-		await publish(writer, "Use staging.");
-		const resumed = start(dir, { "mnemopi.autoRecall": true }, writer.session.sessionManager);
-		const prepared = await resumed.beforeAgentStartPrompt("Where is the deploy host?");
-		expect(prepared?.context).toBe(first?.context);
-		expect(prepared?.notice?.content).toContain("beta-9");
+		const ordinary = start(dir, { "mnemopi.knowledge.enabled": false, "mnemopi.autoRecall": true });
+		ordinary.rememberScoped("The astronomy observation target is Neptune.");
+		const normalPrompt = await ordinary.beforeAgentStartPrompt("What is the astronomy observation target?");
+		expect(normalPrompt?.context).toContain("Neptune");
+		const pilot = start(dir, { "mnemopi.autoRecall": true });
+		await publish(pilot, "Use staging.");
+		const prepared = await pilot.beforeAgentStartPrompt("What is the astronomy observation target?");
+		expect(prepared?.context).toBeUndefined();
 		expect(prepared?.notice?.content).toContain("Use staging.");
+		expect(prepared?.notice?.content).not.toContain("Neptune");
 		expect(prepared?.commit()).toBe(true);
-		if (!prepared?.notice) throw new Error("Expected combined notice");
-		resumed.session.sessionManager.appendCustomMessageEntry(
-			MEMORY_RECALL_CHANGES_MESSAGE_TYPE,
-			prepared.notice.content,
-			false,
-			prepared.notice.details,
-		);
+		await pilot.maybeRecallOnAgentStart();
+		expect(pilot.lastRecallSnippet).toBeUndefined();
 		expect(
-			findPersistedRecall(resumed.session.sessionManager, getMnemopiRecallScope(resumed.config))?.memories,
-		).toContainEqual({ id, text: "The deploy host is beta-9." });
+			await pilot.recallForCompaction([
+				{ role: "user", content: "What is the astronomy observation target?", timestamp: 1 },
+			]),
+		).toBeUndefined();
+		await expect(pilot.recallResultsScoped("astronomy")).rejects.toThrow("selected evidence only");
 	});
 
-	it("does not lose knowledge notices when optional generic recall fails", async () => {
-		const state = start(directory(), { "mnemopi.autoRecall": true });
-		await publish(state, "Use staging.");
-		const spy = spyOn(state, "collectScopedRecallResults").mockRejectedValueOnce(new Error("recall failed"));
-		try {
-			const prepared = await state.beforeAgentStartPrompt("Where should deployment run?");
-			expect(prepared?.notice?.content).toContain("Use staging.");
-			expect(prepared?.commit()).toBe(true);
-			expect(prepared?.commit()).toBe(false);
-		} finally {
-			spy.mockRestore();
+	it("hides generic memory tools and rejects direct unsourced writes in pilot mode", async () => {
+		const state = start(directory(), { "autolearn.enabled": true });
+		const session = {
+			settings: state.session.settings,
+			getMnemopiSessionState: () => state,
+		} as ToolSession;
+		for (const name of ["retain", "recall", "reflect", "memory_edit", "learn"] as const) {
+			expect(await BUILTIN_TOOLS[name](session)).toBeNull();
 		}
+		await expect(
+			new MemoryRetainTool(session).execute("unsourced", {
+				items: [{ content: "Unselected private conversation" }],
+			}),
+		).rejects.toThrow("selected evidence only");
+		expect(() => state.rememberScoped("Unsourced fact")).toThrow("selected evidence only");
+		expect(() => state.editScopedMemory("update", "unknown", { content: "Unsourced fact" })).toThrow(
+			"selected evidence only",
+		);
+		using query = state.memory.db.prepare<{ count: number }, []>("SELECT COUNT(*) AS count FROM working_memory");
+		expect(query.get()?.count).toBe(0);
+		expect(knowledge(state).store.list("project-a", ["deployment"])).toEqual([]);
 	});
 
 	it("checks each configured file once per snapshot and preserves stale recovery locators", async () => {
