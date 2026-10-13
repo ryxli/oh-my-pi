@@ -3398,6 +3398,7 @@ export async function prewarmOpenAICodexResponses(
 		| "serviceTier"
 	>,
 ): Promise<void> {
+	options?.signal?.throwIfAborted();
 	const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
 	if (!apiKey) return;
 	const accountId = getCodexAccountId(apiKey);
@@ -3420,6 +3421,7 @@ export async function prewarmOpenAICodexResponses(
 	const codexClientVersion = CODEX_CLIENT_VERSION;
 	const requestIdentity = createCodexCompatibilityIdentity(metadataSession);
 	const attestation = await getCodexAttestationHeader(accountId);
+	options?.signal?.throwIfAborted();
 	const routedRequest: Pick<RequestBody, "model" | "service_tier"> = {
 		model: model.requestModelId ?? model.id,
 	};
@@ -4033,10 +4035,12 @@ class CodexWebSocketConnection {
 	}
 
 	async connect(signal?: AbortSignal): Promise<void> {
+		signal?.throwIfAborted();
 		if (this.isOpen()) return;
 		if (this.#connectPromise) {
 			logger.time("codexWs:awaitSharedHandshake");
 			await this.#connectPromise;
+			signal?.throwIfAborted();
 			return;
 		}
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
@@ -4653,6 +4657,7 @@ async function getOrCreateCodexWebSocketConnection(
 	provider: string,
 	signal?: AbortSignal,
 ): Promise<CodexWebSocketConnection> {
+	signal?.throwIfAborted();
 	const proxy = getProxyForUrl(provider, new URL(url));
 	const headerRecord = headersToRecord(headers);
 	// Join an in-flight handshake instead of tearing it down: closing a
@@ -4671,6 +4676,7 @@ async function getOrCreateCodexWebSocketConnection(
 			// (state.connection may have been replaced or cleared).
 		}
 	}
+	signal?.throwIfAborted();
 	if (state.connection?.isOpen()) {
 		if (!state.connection.matchesAuth(headerRecord)) {
 			state.connection.close("token-refresh");
