@@ -11,6 +11,8 @@ import type { Settings } from "../config/settings";
 import { redactMemorySecrets } from "../memory-backend/redact";
 import type { MemoryPromptPreparation } from "../memory-backend/types";
 import knowledgeNotice from "../prompts/system/mnemopi-knowledge.md" with { type: "text" };
+import type { SessionEntry } from "../session/session-entries";
+import { readSessionMessage } from "../session/session-loader";
 import type { SessionManager } from "../session/session-manager";
 import {
 	cfgMnemopiAutoRetain,
@@ -31,7 +33,8 @@ export interface KnowledgeConfig {
 
 export type KnowledgeSelection =
 	| { type: "file"; path: string; quote: string }
-	| { type: "session"; entryId?: string; quote: string };
+	| { type: "session"; entryId?: string; path?: never; sessionId?: never; quote: string }
+	| { type: "session"; entryId: string; path: string; sessionId: string; quote: string };
 
 export interface KnowledgePublication {
 	topic: string;
@@ -43,6 +46,15 @@ export interface KnowledgePublication {
 }
 
 type KnowledgeSession = Pick<SessionManager, "getBranchView" | "getSessionId" | "appendCustomEntry">;
+interface KnowledgeSessionEvidence {
+	text: string;
+	sha256: string;
+	isUser: boolean;
+	isTool: boolean;
+	role: "user" | "assistant" | "toolResult";
+	timestamp: string;
+	parentId: string | null;
+}
 const DELIVERY_ENTRY = "mnemopi_knowledge_delivery";
 export const KNOWLEDGE_NOTICE_LIMIT = 16_000;
 const MAX_SOURCE_BYTES = 1_048_576;
@@ -161,6 +173,10 @@ export class MnemopiKnowledge {
 			} else {
 				if (input.kind === "policy")
 					throw new Error("Policy requires configured file evidence, never session evidence.");
+				if ((selection.path === undefined) !== (selection.sessionId === undefined))
+					throw new Error("Recorded session evidence requires both path and sessionId.");
+				if (selection.path !== undefined && !selection.entryId)
+					throw new Error("Recorded session evidence requires an exact entryId.");
 				const entryId =
 					selection.entryId ??
 					this.session
@@ -173,23 +189,45 @@ export class MnemopiKnowledge {
 								!entry.message.synthetic,
 						)?.id;
 				if (!entryId) throw new Error("No real user message exists on the current branch.");
-				const evidence = this.#sessionEvidence(entryId);
+				const evidence = await this.#sessionEvidence(entryId, selection);
 				if (!evidence || !evidence.text.includes(selection.quote))
-					throw new Error("Session quote is not in a selected current-branch message.");
+					throw new Error(
+						"Session quote is not in a selected current-branch message or configured recorded session.",
+					);
 				if (!evidence.isUser && !(evidence.isTool && input.kind === "investigation")) origin = "inferred";
-				sources.push({ type: "session", entryId, quote: selection.quote, sessionId, sha256: evidence.sha256 });
+				sources.push({
+					type: "session",
+					entryId,
+					quote: selection.quote,
+					sessionId: selection.sessionId ?? sessionId,
+					...(selection.path === undefined ? {} : { path: selection.path }),
+					sha256: evidence.sha256,
+				});
 			}
 		}
 		if (origin === "quoted" && !sources.some(source => source.quote === input.content)) {
 			throw new Error("Quoted content must equal one selected source quote; summaries must be inferred candidates.");
 		}
-		if (
-			sessionId !== this.session.getSessionId() ||
-			sources.some(
-				source => source.type === "session" && this.#sessionEvidence(source.entryId)?.sha256 !== source.sha256,
+		if (sessionId !== this.session.getSessionId())
+			throw new Error("Session changed during publication; select evidence again.");
+		for (const source of sources) {
+			if (
+				source.type === "session" &&
+				(await this.#sessionEvidence(source.entryId, source))?.sha256 !== source.sha256
 			)
-		) {
-			throw new Error("Session evidence changed during publication; select current-branch sources again.");
+				throw new Error("Session evidence changed during publication; select sources again.");
+		}
+		// No await between the final branch/ownership check and the store transaction.
+		if (sessionId !== this.session.getSessionId())
+			throw new Error("Session changed during publication; select evidence again.");
+		const branch = this.session.getBranchView();
+		for (const source of sources) {
+			if (
+				source.type === "session" &&
+				source.path === undefined &&
+				this.#messageEvidence(branch.find(entry => entry.id === source.entryId))?.sha256 !== source.sha256
+			)
+				throw new Error("Session evidence changed during publication; select sources again.");
 		}
 		const serialized = JSON.stringify({ content: input.content, sources });
 		if (redactMemorySecrets(serialized) !== serialized) {
@@ -221,8 +259,8 @@ export class MnemopiKnowledge {
 								? "unchanged"
 								: "stale",
 					);
-				} else if (source.sessionId === this.session.getSessionId()) {
-					const evidence = this.#sessionEvidence(source.entryId);
+				} else if (source.path !== undefined || source.sessionId === this.session.getSessionId()) {
+					const evidence = await this.#sessionEvidence(source.entryId, source);
 					freshness.push(
 						evidence?.sha256 === source.sha256 && evidence.text.includes(source.quote)
 							? "recorded-session"
@@ -260,6 +298,7 @@ export class MnemopiKnowledge {
 												type: source.type,
 												sessionId: source.sessionId,
 												entryId: source.entryId,
+												...(source.path === undefined ? {} : { path: source.path }),
 												sha256: source.sha256,
 											},
 								),
@@ -296,6 +335,48 @@ export class MnemopiKnowledge {
 			omittedCount: records.length - handles.length,
 			sha256: new Bun.CryptoHasher("sha256").update(snapshot).digest("hex"),
 		}).replaceAll("<", "\\u003c");
+	}
+
+	/** Returns only selected published quotes, never surrounding unapproved journal content. */
+	async readSources(id: string, sourceIndex = 0): Promise<string> {
+		const record = this.store.list(this.config.domain, this.config.topics).find(record => record.id === id);
+		if (!record) throw new Error("Knowledge record is not active in the selected domain/topics.");
+		if (!Number.isInteger(sourceIndex) || sourceIndex < 0 || sourceIndex >= record.sources.length)
+			throw new Error("Select an existing zero-based sourceIndex.");
+		const source = record.sources[sourceIndex];
+		const sessionEvidence =
+			source.type === "session" ? await this.#sessionEvidence(source.entryId, source) : undefined;
+		const evidence = source.type === "file" ? await this.#fileEvidence(source.path) : sessionEvidence;
+		const available = evidence?.sha256 === source.sha256 && evidence.text.includes(source.quote);
+		const view = {
+			type: source.type,
+			sha256: source.sha256,
+			...(source.type === "file"
+				? { path: source.path }
+				: { sessionId: source.sessionId, entryId: source.entryId, path: source.path }),
+			availability: available ? "recorded-evidence" : "unavailable",
+			...(available
+				? {
+						quote: source.quote,
+						...(source.type === "session" && source.path !== undefined && sessionEvidence
+							? {
+									role: sessionEvidence.role,
+									timestamp: sessionEvidence.timestamp,
+									parentId: sessionEvidence.parentId,
+								}
+							: {}),
+					}
+				: {}),
+		};
+		const serialized = JSON.stringify({
+			id: record.id,
+			sourceIndex,
+			sourceCount: record.sources.length,
+			sources: [view],
+		});
+		if (redactMemorySecrets(serialized) !== serialized)
+			throw new Error("Knowledge evidence contains a possible secret.");
+		return serialized.replaceAll("<", "\\u003c");
 	}
 
 	async prepare(signal?: AbortSignal): Promise<MemoryPromptPreparation> {
@@ -341,8 +422,22 @@ export class MnemopiKnowledge {
 			throw new Error("Topic is not selected in this session's knowledge configuration.");
 	}
 
-	#sessionEvidence(entryId: string): { text: string; sha256: string; isUser: boolean; isTool: boolean } | undefined {
-		const entry = this.session.getBranchView().find(entry => entry.id === entryId);
+	async #sessionEvidence(
+		entryId: string,
+		source?: { path?: string; sessionId?: string },
+	): Promise<KnowledgeSessionEvidence | undefined> {
+		let entry: SessionEntry | undefined;
+		if (source?.path !== undefined) {
+			if (!source.sessionId || !this.config.sourcePaths.includes(source.path)) return undefined;
+			entry = await readSessionMessage(source.path, source.sessionId, entryId);
+		} else {
+			if (source?.sessionId !== undefined && source.sessionId !== this.session.getSessionId()) return undefined;
+			entry = this.session.getBranchView().find(entry => entry.id === entryId);
+		}
+		return this.#messageEvidence(entry, source?.path !== undefined);
+	}
+
+	#messageEvidence(entry: SessionEntry | undefined, recorded = false): KnowledgeSessionEvidence | undefined {
 		if (entry?.type !== "message") return undefined;
 		const message = entry.message;
 		if (message.role !== "user" && message.role !== "assistant" && message.role !== "toolResult") return undefined;
@@ -359,11 +454,15 @@ export class MnemopiKnowledge {
 						attribution: message.role === "assistant" ? "agent" : message.attribution,
 						synthetic: message.role === "user" ? message.synthetic : undefined,
 						text,
+						...(recorded ? { entryId: entry.id, timestamp: entry.timestamp, parentId: entry.parentId } : {}),
 					}),
 				)
 				.digest("hex"),
 			isUser: message.role === "user" && message.attribution !== "agent" && !message.synthetic,
 			isTool: message.role === "toolResult",
+			role: message.role,
+			timestamp: entry.timestamp,
+			parentId: entry.parentId,
 		};
 	}
 

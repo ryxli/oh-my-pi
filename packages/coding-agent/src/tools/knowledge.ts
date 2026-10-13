@@ -5,16 +5,18 @@ import knowledgeDescription from "../prompts/tools/knowledge.md" with { type: "t
 import type { ToolSession } from ".";
 
 const knowledgeSchema = type({
-	op: "'list' | 'publish' | 'retract'",
+	op: "'list' | 'publish' | 'retract' | 'read'",
 	"topic?": "string",
 	"kind?": "'decision' | 'investigation' | 'policy'",
 	"origin?": "'quoted' | 'inferred'",
 	"content?": "string",
 	"sources?": type({ type: "'file'", path: "string", quote: "string" })
-		.or(type({ type: "'session'", "entryId?": "string", quote: "string" }))
+		.or(type({ type: "'session'", "entryId?": "string", quote: "string", "+": "reject" }))
+		.or(type({ type: "'session'", entryId: "string", path: "string", sessionId: "string", quote: "string" }))
 		.array(),
 	"expectedCurrentId?": "string | null",
 	"id?": "string",
+	"sourceIndex?": "number.integer >= 0",
 });
 
 export type KnowledgeParams = typeof knowledgeSchema.infer;
@@ -27,7 +29,8 @@ export class KnowledgeTool implements AgentTool<typeof knowledgeSchema> {
 	readonly strict = true;
 	readonly loadMode = "discoverable";
 	readonly summary = "Inspect or explicitly publish selected domain knowledge with verified evidence";
-	readonly approval = (args: unknown) => ((args as Partial<KnowledgeParams>).op === "list" ? "read" : "write");
+	readonly approval = (args: unknown) =>
+		["list", "read"].includes((args as Partial<KnowledgeParams>).op ?? "") ? "read" : "write";
 
 	constructor(readonly session: ToolSession) {}
 
@@ -39,6 +42,13 @@ export class KnowledgeTool implements AgentTool<typeof knowledgeSchema> {
 		const knowledge = this.session.getMnemopiSessionState?.()?.knowledge;
 		if (!knowledge) throw new Error("Knowledge is not configured for this session.");
 		if (params.op === "list") return { content: [{ type: "text", text: await knowledge.snapshot() }], details: {} };
+		if (params.op === "read") {
+			if (!params.id) throw new Error("knowledge read requires id.");
+			return {
+				content: [{ type: "text", text: await knowledge.readSources(params.id, params.sourceIndex) }],
+				details: {},
+			};
+		}
 		if (params.op === "retract") {
 			if (!params.id) throw new Error("knowledge retract requires id.");
 			const retracted = knowledge.retract(params.id);
