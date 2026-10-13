@@ -14,6 +14,7 @@ import {
 	setMnemopiSessionState,
 } from "../src/mnemopi/state";
 import type { AgentSession } from "../src/session/agent-session";
+import * as sessionLoader from "../src/session/session-loader";
 import { SessionManager } from "../src/session/session-manager";
 import { BUILTIN_TOOLS, type ToolSession } from "../src/tools";
 import { MemoryRetainTool } from "../src/tools/memory-retain";
@@ -94,6 +95,203 @@ async function deliver(state: MnemopiSessionState) {
 }
 
 describe("opt-in shared domain knowledge", () => {
+	it("binds recorded time and ancestry to a published quote", async () => {
+		const dir = directory();
+		const file = dir.join("recorded.jsonl");
+		const header = { type: "session", id: "original", timestamp: "2026-01-01T00:00:00Z", cwd: dir.path() };
+		const entry = {
+			type: "message",
+			id: "selected",
+			parentId: null as string | null,
+			timestamp: header.timestamp,
+			message: { role: "user", content: "Use staging.", timestamp: 1 },
+		};
+		await Bun.write(file, JSON.stringify(header) + "\n" + JSON.stringify(entry) + "\n");
+		const state = start(dir, { "mnemopi.knowledge.sourcePaths": [file] });
+		const record = await knowledge(state).publish({
+			topic: "deployment",
+			kind: "decision",
+			origin: "quoted",
+			content: entry.message.content,
+			sources: [
+				{ type: "session", path: file, sessionId: header.id, entryId: entry.id, quote: entry.message.content },
+			],
+			expectedCurrentId: null,
+		});
+		expect(JSON.parse(await knowledge(state).readSources(record.id)).sources[0]).toMatchObject({
+			role: "user",
+			timestamp: header.timestamp,
+			parentId: null,
+			availability: "recorded-evidence",
+		});
+		entry.timestamp = "2026-02-01T00:00:00Z";
+		await Bun.write(file, JSON.stringify(header) + "\n" + JSON.stringify(entry) + "\n");
+		expect(await knowledge(state).readSources(record.id)).not.toContain("Use staging.");
+		entry.timestamp = header.timestamp;
+		entry.parentId = "another-branch";
+		await Bun.write(file, JSON.stringify(header) + "\n" + JSON.stringify(entry) + "\n");
+		expect(await knowledge(state).snapshot()).not.toContain("Use staging.");
+	});
+
+	it("rejects branch switches during mixed recorded and current-source validation", async () => {
+		const dir = directory();
+		const original = SessionManager.create(dir.path(), dir.join("original"));
+		const recorded = original.appendMessage({ role: "user", content: "Recorded context.", timestamp: 1 });
+		await original.ensureOnDisk();
+		const file = original.getSessionFile();
+		if (!file) throw new Error("Expected recorded source");
+		const state = start(dir, { "mnemopi.knowledge.sourcePaths": [file] });
+		const manager = state.session.sessionManager;
+		const root = manager.appendMessage({ role: "user", content: "Earlier context.", timestamp: 1 });
+		const selected = manager.appendMessage({ role: "user", content: "Use staging.", timestamp: 2 });
+		const reader = sessionLoader.readSessionMessage;
+		let reads = 0;
+		const spy = spyOn(sessionLoader, "readSessionMessage").mockImplementation(async (...args) => {
+			const evidence = await reader(...args);
+			if (++reads === 2) manager.branch(root);
+			return evidence;
+		});
+		try {
+			await expect(
+				knowledge(state).publish({
+					topic: "deployment",
+					kind: "decision",
+					origin: "quoted",
+					content: "Use staging.",
+					sources: [
+						{ type: "session", entryId: selected, quote: "Use staging." },
+						{
+							type: "session",
+							path: file,
+							sessionId: original.getSessionId(),
+							entryId: recorded,
+							quote: "Recorded context.",
+						},
+					],
+					expectedCurrentId: null,
+				}),
+			).rejects.toThrow("changed");
+			expect(knowledge(state).store.list("project-a", ["deployment"])).toEqual([]);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("publishes original journal evidence once and reads only its quote after the publisher stops", async () => {
+		const dir = directory();
+		const original = SessionManager.create(dir.path(), dir.join("originals"));
+		const entryId = original.appendMessage({
+			role: "user",
+			content: "Use staging. Unselected business context.",
+			timestamp: 1,
+		});
+		original.appendMessage({ role: "user", content: "Unselected sibling.", timestamp: 2 });
+		await original.ensureOnDisk();
+		await original.flush();
+		const file = original.getSessionFile();
+		if (!file) throw new Error("Expected original journal");
+		const settings = { "mnemopi.knowledge.sourcePaths": [file] };
+		const publisher = start(dir, settings);
+		const record = await knowledge(publisher).publish({
+			topic: "deployment",
+			kind: "decision",
+			origin: "quoted",
+			content: "Use staging.",
+			sources: [{ type: "session", path: file, sessionId: original.getSessionId(), entryId, quote: "Use staging." }],
+			expectedCurrentId: null,
+		});
+		expect(record.state).toBe("current");
+		expect(record.sources[0]).toMatchObject({ path: file, sessionId: original.getSessionId(), entryId });
+		await publisher.dispose({ consolidate: false });
+		const receiver = start(dir, settings);
+		expect(await deliver(receiver)).toContain('"freshness":["recorded-session"]');
+		const tool = new KnowledgeTool({
+			settings: receiver.session.settings,
+			getMnemopiSessionState: () => receiver,
+		} as ToolSession);
+		expect(tool.approval({ op: "read" })).toBe("read");
+		const read = await tool.execute("read-original", { op: "read", id: record.id });
+		const text = JSON.stringify(read.content);
+		expect(text).toContain("Use staging.");
+		expect(text).toContain("user");
+		expect(text).toContain("timestamp");
+		expect(text).not.toContain("Unselected business");
+		expect(text).not.toContain("Unselected sibling");
+		await expect(knowledge(receiver).readSources(record.id, 1)).rejects.toThrow("sourceIndex");
+		expect(knowledge(receiver).store.history("project-a", "deployment")).toHaveLength(1);
+		const restricted = start(dir, { "mnemopi.knowledge.sourcePaths": [] });
+		await Bun.write(
+			file,
+			(await Bun.file(file).text()).replace("Unselected business context.", "Revised business context."),
+		);
+		expect(await knowledge(receiver).snapshot()).toContain('"availability":"unavailable"');
+		expect(await knowledge(receiver).readSources(record.id)).not.toContain("Use staging.");
+		expect(await deliver(restricted)).toContain('"availability":"unavailable"');
+		expect(await knowledge(restricted).readSources(record.id)).not.toContain("Use staging.");
+		fs.unlinkSync(file);
+		expect(await knowledge(receiver).snapshot()).toContain('"availability":"unavailable"');
+		expect(await knowledge(receiver).readSources(record.id)).not.toContain("Use staging.");
+	});
+
+	it("rejects mismatched original identities and downgrades recorded synthetic or agent-attributed decisions", async () => {
+		const dir = directory();
+		const file = dir.join("original.jsonl");
+		const header = { type: "session", id: "original", timestamp: "2026-01-01T00:00:00Z", cwd: dir.path() };
+		const entries = [
+			{
+				type: "message",
+				id: "agent",
+				parentId: null,
+				timestamp: header.timestamp,
+				message: { role: "user", attribution: "agent", content: "Use production.", timestamp: 1 },
+			},
+			{
+				type: "message",
+				id: "synthetic",
+				parentId: "agent",
+				timestamp: header.timestamp,
+				message: { role: "user", synthetic: true, content: "Use production.", timestamp: 2 },
+			},
+		];
+		await Bun.write(file, [header, ...entries].map(entry => JSON.stringify(entry)).join("\n") + "\n");
+		const state = start(dir, { "mnemopi.knowledge.sourcePaths": [file] });
+		const input = {
+			topic: "deployment",
+			kind: "decision" as const,
+			origin: "quoted" as const,
+			content: "Use production.",
+			expectedCurrentId: null,
+		};
+		for (const entry of entries) {
+			const record = await knowledge(state).publish({
+				...input,
+				sources: [{ type: "session", path: file, sessionId: "original", entryId: entry.id, quote: input.content }],
+			});
+			expect(record.origin).toBe("inferred");
+			expect(record.state).toBe("candidate");
+		}
+		for (const source of [
+			{ type: "session" as const, path: file, sessionId: "wrong", entryId: "agent", quote: input.content },
+			{
+				type: "session" as const,
+				path: dir.join("unapproved.jsonl"),
+				sessionId: "original",
+				entryId: "agent",
+				quote: input.content,
+			},
+			{ type: "session" as const, path: file, sessionId: "original", quote: input.content },
+			{ type: "session" as const, sessionId: "original", entryId: "agent", quote: input.content },
+		])
+			await expect(
+				Reflect.apply(knowledge(state).publish, knowledge(state), [{ ...input, sources: [source] }]),
+			).rejects.toThrow();
+		const current = knowledge(state).store.list("project-a", ["deployment"]);
+		expect(current).toHaveLength(2);
+		await Bun.write(file, JSON.stringify({ ...header, id: "different" }) + "\n" + JSON.stringify(entries[0]) + "\n");
+		expect(await knowledge(state).snapshot()).not.toContain(input.content);
+		expect(await knowledge(state).readSources(current[0].id)).not.toContain(input.content);
+	});
+
 	it("withdraws file evidence when a previous source allowlist is restored", async () => {
 		const dir = directory();
 		const file = dir.join("policy.txt");
@@ -482,10 +680,13 @@ describe("opt-in shared domain knowledge", () => {
 		await expect(
 			knowledge(state).publish({ ...input, sources: [{ type: "file", path: dir.join("other.txt"), quote: text }] }),
 		).rejects.toThrow("unavailable");
-		await knowledge(state).publish(input);
+		const record = await knowledge(state).publish(input);
 		const notice = await deliver(state);
 		expect(notice).not.toContain("<system>");
 		expect(notice).toContain("\\u003csystem>");
+		const source = await knowledge(state).readSources(record.id);
+		expect(source).not.toContain("<system>");
+		expect(JSON.parse(source).sources[0].quote).toBe(text);
 	});
 
 	it("redelivers after compaction or an explicit reset without rewriting the prefix", async () => {
@@ -500,6 +701,24 @@ describe("opt-in shared domain knowledge", () => {
 		state.resetConversationTracking();
 		expect(await deliver(state)).toContain("Use staging.");
 		expect(state.lastRecallSnippet).toBeUndefined();
+	});
+
+	it("validates current and recorded session selections as distinct tool inputs", () => {
+		const state = start(directory());
+		const tool = new KnowledgeTool({
+			settings: state.session.settings,
+			getMnemopiSessionState: () => state,
+		} as ToolSession);
+		const current = { type: "session", quote: "Use staging." };
+		const recorded = { ...current, path: "original.jsonl", sessionId: "original", entryId: "selected" };
+		expect(tool.parameters.allows({ op: "publish", sources: [current] })).toBe(true);
+		expect(tool.parameters.allows({ op: "publish", sources: [recorded] })).toBe(true);
+		for (const source of [
+			{ ...current, path: recorded.path },
+			{ ...current, sessionId: recorded.sessionId },
+			{ ...current, path: recorded.path, sessionId: recorded.sessionId },
+		])
+			expect(tool.parameters.allows({ op: "publish", sources: [source] })).toBe(false);
 	});
 
 	it("publishes the latest real user quote through the usable tool surface", async () => {

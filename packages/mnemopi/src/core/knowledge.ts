@@ -6,7 +6,7 @@ export type KnowledgeKind = "decision" | "investigation" | "policy";
 export type KnowledgeOrigin = "quoted" | "inferred";
 export type KnowledgeSource =
 	| { type: "file"; path: string; sha256: string; quote: string }
-	| { type: "session"; sessionId: string; entryId: string; sha256: string; quote: string };
+	| { type: "session"; sessionId: string; entryId: string; path?: string; sha256: string; quote: string };
 
 export interface KnowledgeRecord {
 	id: string;
@@ -101,6 +101,7 @@ export class KnowledgeStore {
 			} else if (source.type === "session") {
 				validateText(source.sessionId, "sessionId", Infinity);
 				validateText(source.entryId, "entryId", Infinity);
+				if (source.path !== undefined) validateText(source.path, "path", Infinity);
 			} else {
 				throw new TypeError("Invalid source type");
 			}
