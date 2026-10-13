@@ -6,8 +6,9 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession, type ExtensionFactory } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
+import { logger, TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 const runtimeProviderExtension: ExtensionFactory = pi => {
@@ -152,7 +153,7 @@ describe.serial("createAgentSession resolveServiceTierByFamily", () => {
 				async () => {
 					throw new Error("Unexpected network request in SDK service-tier regression test");
 				},
-				{ preconnect: globalThis.fetch.preconnect },
+				{ preconnect: () => {} },
 			),
 		);
 	});
@@ -194,6 +195,66 @@ describe.serial("createAgentSession resolveServiceTierByFamily", () => {
 			toolNames: ["read"],
 		};
 	}
+
+	it("does not prewarm a disposed SDK session after delayed key resolution", async () => {
+		using tempDir = TempDir.createSync("@omp-prewarm-dispose-");
+		const previousPreference = Bun.env.PI_CODEX_WEBSOCKET;
+		Bun.env.PI_CODEX_WEBSOCKET = "1";
+		const entered = Promise.withResolvers<void>();
+		const key = Promise.withResolvers<string>();
+		installCapturingWebSocket();
+		const completed = Promise.withResolvers<void>();
+		const debug = vi.spyOn(logger, "debug").mockImplementation(message => {
+			if (message === "Codex websocket prewarm failed") completed.resolve();
+		});
+		let session: AgentSession | undefined;
+		try {
+			({ session } = await createAgentSession({
+				...sessionOptions(
+					tempDir.path(),
+					openAuthStorage(),
+					Settings.isolated({
+						"memory.backend": "off",
+						"providers.openaiWebsockets": "on",
+						enabledModels: ["openai-codex/deferred-model"],
+					}),
+					SessionManager.inMemory(),
+				),
+				extensions: [deferredCodexProviderExtension],
+				modelPattern: "openai-codex/deferred-model",
+				bindProcessState: false,
+				autoTitle: false,
+				cacheWarming: false,
+				getApiKey: async () => {
+					entered.resolve();
+					return key.promise;
+				},
+			}));
+			await entered.promise;
+			await session.dispose();
+			key.resolve("RUNTIME_CODEX_KEY");
+			await withTimeout(completed.promise, 1000, "Disposed prewarm did not finish");
+			expect(session.lifecycleSignal.aborted).toBe(true);
+			const reason: unknown = session.lifecycleSignal.reason;
+			if (!(reason instanceof Error)) throw new Error("Expected a session disposal error");
+			expect(CapturingWebSocket.instances).toHaveLength(0);
+			expect(session.providerSessionState.size).toBe(0);
+			expect(debug).toHaveBeenCalledWith("Codex websocket prewarm failed", {
+				error: reason.message,
+				provider: session.model?.provider,
+				model: session.model?.id,
+			});
+		} finally {
+			key.resolve("RUNTIME_CODEX_KEY");
+			await session?.dispose();
+			try {
+				if (session) await withTimeout(completed.promise, 1000, "Disposed prewarm did not finish");
+			} finally {
+				if (previousPreference === undefined) delete Bun.env.PI_CODEX_WEBSOCKET;
+				else Bun.env.PI_CODEX_WEBSOCKET = previousPreference;
+			}
+		}
+	});
 
 	it("routes prewarm and the first SDK turn from the final model and exact-agent tier override", async () => {
 		using tempDir = TempDir.createSync("@omp-service-tier-prewarm-first-turn-");
