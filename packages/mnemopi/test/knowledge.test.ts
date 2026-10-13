@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { KnowledgeStore, Mnemopi } from "@oh-my-pi/pi-mnemopi";
 import { KnowledgeStore as CoreKnowledgeStore } from "@oh-my-pi/pi-mnemopi/core";
-import type { KnowledgePublishInput } from "@oh-my-pi/pi-mnemopi/core/knowledge";
+import type { KnowledgePublishInput, KnowledgeRecord } from "@oh-my-pi/pi-mnemopi/core/knowledge";
 import { openDatabase } from "@oh-my-pi/pi-mnemopi/db";
 
 const databases: Database[] = [];
@@ -21,6 +21,7 @@ function publication(overrides: Partial<KnowledgePublishInput> = {}): KnowledgeP
 	return {
 		domain: "project",
 		topic: "runtime",
+		key: "runtime-choice",
 		kind: "decision",
 		origin: "quoted",
 		content: "Use the local runtime.",
@@ -60,12 +61,90 @@ describe("KnowledgeStore", () => {
 		}
 	});
 
+	it("keeps independent keys current and limits supersession to the exact domain/topic/key", () => {
+		const store = openStore();
+		const runtime = store.publish(publication());
+		const transport = store.publish(publication({ key: "transport" }));
+		const wrongKey = store.publish(publication({ key: "transport", expectedCurrentId: runtime.id }));
+		const candidate = store.publish(
+			publication({ key: "transport", origin: "inferred", expectedCurrentId: transport.id }),
+		);
+		const replacement = store.publish(publication({ expectedCurrentId: runtime.id }));
+		expect(wrongKey.state).toBe("conflict");
+		expect(candidate.state).toBe("candidate");
+		expect(store.list("project", ["runtime"])).toEqual([replacement, transport, wrongKey, candidate]);
+		expect(store.history("project", "runtime")[0]?.state).toBe("superseded");
+		expect(store.retract("project", replacement.id)).toBe(true);
+		expect(store.list("project", ["runtime"])).toEqual([transport, wrongKey, candidate]);
+	});
+
+	it("migrates legacy rows and the current index atomically and survives reopening", () => {
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "mnemopi-knowledge-migration-"));
+		directories.push(directory);
+		const filename = path.join(directory, "knowledge.sqlite");
+		const db = openDatabase(filename);
+		databases.push(db);
+		db.exec(`
+			CREATE TABLE knowledge_records (
+				id TEXT PRIMARY KEY, domain TEXT NOT NULL, topic TEXT NOT NULL,
+				kind TEXT NOT NULL CHECK (kind IN ('decision', 'investigation', 'policy')),
+				origin TEXT NOT NULL CHECK (origin IN ('quoted', 'inferred')),
+				content TEXT NOT NULL, sources TEXT NOT NULL, predecessorId TEXT,
+				state TEXT NOT NULL CHECK (state IN ('current', 'candidate', 'conflict', 'superseded', 'retracted')),
+				createdAt TEXT NOT NULL,
+				CHECK (origin != 'inferred' OR state IN ('candidate', 'retracted'))
+			);
+			CREATE UNIQUE INDEX knowledge_current ON knowledge_records(domain, topic) WHERE state = 'current';
+		`);
+		const input = publication();
+		using insert = db.prepare("INSERT INTO knowledge_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+		for (const state of ["superseded", "current", "candidate", "conflict", "retracted"]) {
+			insert.run(
+				state,
+				input.domain,
+				input.topic,
+				input.kind,
+				state === "candidate" ? "inferred" : "quoted",
+				input.content,
+				JSON.stringify(input.sources),
+				state === "current" ? "superseded" : null,
+				state,
+				"2026-01-01T00:00:00.000Z",
+			);
+		}
+		const before = db
+			.query<Omit<KnowledgeRecord, "key" | "sources"> & { sources: string }, []>(
+				"SELECT * FROM knowledge_records ORDER BY rowid",
+			)
+			.all();
+		const migrated = new KnowledgeStore(db);
+		expect(migrated.history("project", "runtime")).toEqual(
+			before.map(row => ({ ...row, key: "legacy", sources: [...input.sources] })),
+		);
+		const independent = migrated.publish(publication());
+		const corrected = migrated.publish(publication({ key: "legacy", expectedCurrentId: "current" }));
+		expect(migrated.list("project", ["runtime"]).filter(record => record.state === "current")).toEqual([
+			corrected,
+			independent,
+		]);
+		expect(() => db.query("UPDATE knowledge_records SET key = 'legacy' WHERE id = ?").run(independent.id)).toThrow();
+		for (const connection of databases.splice(0)) connection.close();
+		const reopened = openStore(filename);
+		expect(reopened.list("project", ["runtime"]).filter(record => record.state === "current")).toEqual([
+			corrected,
+			independent,
+		]);
+		expect(reopened.history("project", "runtime")).toHaveLength(7);
+		expect(reopened.history("project", "runtime")[1]?.state).toBe("superseded");
+	});
+
 	it("bounds active records without dropping conflicts and frees capacity on retraction", () => {
 		const store = openStore();
 		const current = store.publish(publication());
 		const conflicts = Array.from({ length: 31 }, () => store.publish(publication()));
 		expect(() => store.publish(publication())).toThrow("Knowledge active record limit (32)");
 		expect(() => store.publish(publication({ origin: "inferred" }))).toThrow(RangeError);
+		expect(() => store.publish(publication({ key: "another-decision" }))).toThrow(RangeError);
 		expect(store.history("project", "runtime")).toHaveLength(32);
 		const replacement = store.publish(publication({ expectedCurrentId: current.id }));
 		expect(store.list("project", ["runtime"])).toEqual([...conflicts, replacement]);
@@ -103,6 +182,8 @@ describe("KnowledgeStore", () => {
 			"conflict",
 			"current",
 		]);
+		const independent = reopened.publish(publication({ key: "transport" }));
+		expect(reopened.list("project", ["runtime"])).toEqual([conflict, newest, independent]);
 	});
 
 	it("keeps inferred records as candidates regardless of kind or matching expectation", () => {
@@ -183,6 +264,11 @@ describe("KnowledgeStore", () => {
 			publication({ domain: "a".repeat(129) }),
 			publication({ topic: "" }),
 			publication({ topic: "a".repeat(129) }),
+			{ ...publication(), key: undefined },
+			publication({ key: "" }),
+			publication({ key: " " }),
+			publication({ key: " padded " }),
+			publication({ key: "a".repeat(129) }),
 			publication({ content: " " }),
 			publication({ content: "a".repeat(4001) }),
 			{ ...publication(), kind: "instruction" },
@@ -217,6 +303,7 @@ describe("KnowledgeStore", () => {
 		const input = publication({
 			domain: "d".repeat(128),
 			topic: "t".repeat(128),
+			key: "k".repeat(128),
 			content: "c".repeat(4000),
 			sources: Array.from({ length: 8 }, () => ({
 				type: "file",

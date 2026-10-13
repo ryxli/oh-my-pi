@@ -12,6 +12,7 @@ export interface KnowledgeRecord {
 	id: string;
 	domain: string;
 	topic: string;
+	key: string;
 	kind: KnowledgeKind;
 	origin: KnowledgeOrigin;
 	content: string;
@@ -24,6 +25,7 @@ export interface KnowledgeRecord {
 export interface KnowledgePublishInput {
 	domain: string;
 	topic: string;
+	key: string;
 	kind: KnowledgeKind;
 	origin: KnowledgeOrigin;
 	content: string;
@@ -58,24 +60,37 @@ export class KnowledgeStore {
 
 	constructor(db: Database) {
 		this.#db = db;
-		db.exec(`
-			CREATE TABLE IF NOT EXISTS knowledge_records (
-				id TEXT PRIMARY KEY,
-				domain TEXT NOT NULL,
-				topic TEXT NOT NULL,
-				kind TEXT NOT NULL CHECK (kind IN ('decision', 'investigation', 'policy')),
-				origin TEXT NOT NULL CHECK (origin IN ('quoted', 'inferred')),
-				content TEXT NOT NULL,
-				sources TEXT NOT NULL,
-				predecessorId TEXT,
-				state TEXT NOT NULL CHECK (state IN ('current', 'candidate', 'conflict', 'superseded', 'retracted')),
-				createdAt TEXT NOT NULL,
-				CHECK (origin != 'inferred' OR state IN ('candidate', 'retracted'))
-			);
-			CREATE UNIQUE INDEX IF NOT EXISTS knowledge_current
-				ON knowledge_records(domain, topic) WHERE state = 'current';
-			CREATE INDEX IF NOT EXISTS knowledge_topic ON knowledge_records(domain, topic);
-		`);
+		db.transaction(() => {
+			db.exec(`
+				CREATE TABLE IF NOT EXISTS knowledge_records (
+					id TEXT PRIMARY KEY,
+					domain TEXT NOT NULL,
+					topic TEXT NOT NULL,
+					key TEXT NOT NULL,
+					kind TEXT NOT NULL CHECK (kind IN ('decision', 'investigation', 'policy')),
+					origin TEXT NOT NULL CHECK (origin IN ('quoted', 'inferred')),
+					content TEXT NOT NULL,
+					sources TEXT NOT NULL,
+					predecessorId TEXT,
+					state TEXT NOT NULL CHECK (state IN ('current', 'candidate', 'conflict', 'superseded', 'retracted')),
+					createdAt TEXT NOT NULL,
+					CHECK (origin != 'inferred' OR state IN ('candidate', 'retracted'))
+				);
+			`);
+			using columns = db.prepare<{ name: string }, []>("PRAGMA table_info(knowledge_records)");
+			if (!columns.all().some(column => column.name === "key")) {
+				// Preserve each topic's existing lineage without guessing independent decision identities.
+				db.exec(`
+					ALTER TABLE knowledge_records ADD COLUMN key TEXT NOT NULL DEFAULT 'legacy';
+					DROP INDEX IF EXISTS knowledge_current;
+				`);
+			}
+			db.exec(`
+				CREATE UNIQUE INDEX IF NOT EXISTS knowledge_current
+					ON knowledge_records(domain, topic, key) WHERE state = 'current';
+				CREATE INDEX IF NOT EXISTS knowledge_topic ON knowledge_records(domain, topic);
+			`);
+		}).immediate();
 	}
 
 	/** Synchronous immediate transactions serialize CAS across database connections. */
@@ -83,6 +98,8 @@ export class KnowledgeStore {
 		if (input === null || typeof input !== "object") throw new TypeError("publish requires an object");
 		validateText(input.domain, "domain", 128);
 		validateText(input.topic, "topic", 128);
+		validateText(input.key, "key", 128);
+		if (input.key !== input.key.trim()) throw new TypeError("key must not have surrounding whitespace");
 		validateText(input.content, "content", 4000);
 		if (!["decision", "investigation", "policy"].includes(input.kind)) throw new TypeError("Invalid kind");
 		if (input.origin !== "quoted" && input.origin !== "inferred") throw new TypeError("Invalid origin");
@@ -109,10 +126,10 @@ export class KnowledgeStore {
 		const sources = JSON.stringify(input.sources);
 		return this.#db
 			.transaction(() => {
-				using currentQuery = this.#db.prepare<{ id: string }, [string, string]>(
-					"SELECT id FROM knowledge_records WHERE domain = ? AND topic = ? AND state = 'current'",
+				using currentQuery = this.#db.prepare<{ id: string }, [string, string, string]>(
+					"SELECT id FROM knowledge_records WHERE domain = ? AND topic = ? AND key = ? AND state = 'current'",
 				);
-				const currentId = currentQuery.get(input.domain, input.topic)?.id ?? null;
+				const currentId = currentQuery.get(input.domain, input.topic, input.key)?.id ?? null;
 				let state: KnowledgeRecord["state"];
 				if (input.origin === "inferred") state = "candidate";
 				else if (input.expectedCurrentId === currentId) state = "current";
@@ -137,6 +154,7 @@ export class KnowledgeStore {
 					id: crypto.randomUUID(),
 					domain: input.domain,
 					topic: input.topic,
+					key: input.key,
 					kind: input.kind,
 					origin: input.origin,
 					content: input.content,
@@ -146,12 +164,13 @@ export class KnowledgeStore {
 					createdAt: new Date().toISOString(),
 				};
 				using insert = this.#db.prepare(`INSERT INTO knowledge_records
-				(id, domain, topic, kind, origin, content, sources, predecessorId, state, createdAt)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+				(id, domain, topic, key, kind, origin, content, sources, predecessorId, state, createdAt)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
 				insert.run(
 					record.id,
 					record.domain,
 					record.topic,
+					record.key,
 					record.kind,
 					record.origin,
 					record.content,
@@ -172,7 +191,7 @@ export class KnowledgeStore {
 		if (topics.length === 0) return [];
 		using query = this.#db.prepare<KnowledgeRow, string[]>(`SELECT * FROM knowledge_records
 			WHERE domain = ? AND topic IN (${topics.map(() => "?").join(",")})
-			AND state IN ('current', 'candidate', 'conflict') ORDER BY topic, rowid`);
+			AND state IN ('current', 'candidate', 'conflict') ORDER BY topic, key, rowid`);
 		return query.all(domain, ...topics).map(decodeRecord);
 	}
 

@@ -74,10 +74,16 @@ function knowledge(state: MnemopiSessionState) {
 	return state.knowledge;
 }
 
-async function publish(state: MnemopiSessionState, content: string, expectedCurrentId: string | null = null) {
+async function publish(
+	state: MnemopiSessionState,
+	content: string,
+	expectedCurrentId: string | null = null,
+	key = "environment",
+) {
 	const entryId = state.session.sessionManager.appendMessage({ role: "user", content, timestamp: 1 });
 	return knowledge(state).publish({
 		topic: "deployment",
+		key,
 		kind: "decision",
 		origin: "quoted",
 		content,
@@ -95,6 +101,33 @@ async function deliver(state: MnemopiSessionState) {
 }
 
 describe("opt-in shared domain knowledge", () => {
+	it("delivers independent keys together and groups conflicts with their own key", async () => {
+		const dir = directory();
+		const writer = start(dir);
+		const original = await publish(writer, "Use staging.");
+		const transport = await publish(writer, "Use HTTPS.", null, "transport");
+		const conflict = await publish(writer, "Use HTTP.", original.id, "transport");
+		const corrected = await publish(writer, "Use canary.", original.id);
+		const receiver = start(dir);
+		expect(JSON.parse(await knowledge(receiver).snapshot())).toMatchObject({
+			groups: [
+				{ topic: "deployment", key: "environment", records: [{ id: corrected.id, state: "current" }] },
+				{
+					topic: "deployment",
+					key: "transport",
+					records: [
+						{ id: transport.id, state: "current" },
+						{ id: conflict.id, state: "conflict" },
+					],
+				},
+			],
+		});
+		const notice = await deliver(receiver);
+		expect(notice).toContain("Use canary.");
+		expect(notice).toContain("Use HTTPS.");
+		expect(notice).not.toContain("Use staging.");
+	});
+
 	it("binds recorded time and ancestry to a published quote", async () => {
 		const dir = directory();
 		const file = dir.join("recorded.jsonl");
@@ -110,6 +143,7 @@ describe("opt-in shared domain knowledge", () => {
 		const state = start(dir, { "mnemopi.knowledge.sourcePaths": [file] });
 		const record = await knowledge(state).publish({
 			topic: "deployment",
+			key: "environment",
 			kind: "decision",
 			origin: "quoted",
 			content: entry.message.content,
@@ -155,6 +189,7 @@ describe("opt-in shared domain knowledge", () => {
 			await expect(
 				knowledge(state).publish({
 					topic: "deployment",
+					key: "environment",
 					kind: "decision",
 					origin: "quoted",
 					content: "Use staging.",
@@ -194,6 +229,7 @@ describe("opt-in shared domain knowledge", () => {
 		const publisher = start(dir, settings);
 		const record = await knowledge(publisher).publish({
 			topic: "deployment",
+			key: "environment",
 			kind: "decision",
 			origin: "quoted",
 			content: "Use staging.",
@@ -257,6 +293,7 @@ describe("opt-in shared domain knowledge", () => {
 		const state = start(dir, { "mnemopi.knowledge.sourcePaths": [file] });
 		const input = {
 			topic: "deployment",
+			key: "environment",
 			kind: "decision" as const,
 			origin: "quoted" as const,
 			content: "Use production.",
@@ -299,6 +336,7 @@ describe("opt-in shared domain knowledge", () => {
 		const writer = start(dir);
 		await knowledge(writer).publish({
 			topic: "deployment",
+			key: "environment",
 			kind: "policy",
 			origin: "quoted",
 			content: "Allow staging deployment.",
@@ -400,7 +438,7 @@ describe("opt-in shared domain knowledge", () => {
 		on.session.sessionManager.appendMessage({ role: "user", content: "Do not capture this turn", timestamp: 1 });
 		await on.maybeRetainOnAgentEnd([]);
 		expect(knowledge(on).store.list("project-a", ["deployment"])).toEqual([]);
-		expect(await deliver(on)).toContain('"records":[]');
+		expect(await deliver(on)).toContain('"groups":[]');
 	});
 
 	it("requires explicit bounded scope, pilot storage, and no automatic retention", () => {
@@ -482,7 +520,7 @@ describe("opt-in shared domain knowledge", () => {
 		const current = await publish(state, "Use staging.");
 		await deliver(state);
 		expect(knowledge(state).retract(current.id)).toBe(true);
-		expect(await deliver(state)).toContain('"records":[]');
+		expect(await deliver(state)).toContain('"groups":[]');
 		await publish(state, "Use canary.");
 		await deliver(state);
 		const other = start(dir);
@@ -539,6 +577,7 @@ describe("opt-in shared domain knowledge", () => {
 		});
 		const candidate = await knowledge(b).publish({
 			topic: "deployment",
+			key: "environment",
 			kind: "decision",
 			origin: "inferred",
 			content: "Production is a hypothesis.",
@@ -559,6 +598,7 @@ describe("opt-in shared domain knowledge", () => {
 		const state = start(dir);
 		await knowledge(state).publish({
 			topic: "deployment",
+			key: "environment",
 			kind: "policy",
 			origin: "quoted",
 			content: "Allow staging deployment.",
@@ -611,6 +651,7 @@ describe("opt-in shared domain knowledge", () => {
 		manager.branch(root);
 		const input = {
 			topic: "deployment",
+			key: "environment",
 			kind: "decision" as const,
 			origin: "quoted" as const,
 			content: "Use production.",
@@ -648,6 +689,20 @@ describe("opt-in shared domain knowledge", () => {
 		).rejects.toThrow("file evidence");
 	});
 
+	it("rejects credential-shaped keys and withholds them from imported record notices", async () => {
+		const state = start(directory());
+		const secretKey = `ghp_${"a".repeat(20)}`;
+		await expect(publish(state, "Use staging.", null, secretKey)).rejects.toThrow("possible secret");
+		expect(knowledge(state).store.list("project-a", ["deployment"])).toEqual([]);
+		const original = await publish(state, "Use staging.");
+		knowledge(state).store.publish({ ...original, key: secretKey, expectedCurrentId: null });
+		expect(await knowledge(state).snapshot()).not.toContain(secretKey);
+		for (let index = 0; index < 5; index++) await publish(state, "Evidence ".repeat(400));
+		const overflow = await knowledge(state).snapshot();
+		expect(overflow).toContain('"overflow":true');
+		expect(overflow).not.toContain(secretKey);
+	});
+
 	it("reports bounded overflow without hiding conflict or candidate counts", async () => {
 		const state = start(directory());
 		const text = "Evidence ".repeat(400);
@@ -671,6 +726,7 @@ describe("opt-in shared domain knowledge", () => {
 		const state = start(dir);
 		const input = {
 			topic: "deployment",
+			key: "environment",
 			kind: "investigation" as const,
 			origin: "quoted" as const,
 			content: text,
@@ -731,9 +787,21 @@ describe("opt-in shared domain knowledge", () => {
 			getMnemopiSessionState: () => state,
 		} as ToolSession);
 		if (!tool) throw new Error("Expected knowledge tool");
-		await tool.execute("publish", {
+		await expect(
+			tool.execute("missing-key", {
+				op: "publish",
+				topic: "deployment",
+				kind: "decision",
+				origin: "quoted",
+				content: "Use staging.",
+				sources: [{ type: "session", quote: "Use staging." }],
+				expectedCurrentId: null,
+			}),
+		).rejects.toThrow("requires topic, key");
+		const receipt = await tool.execute("publish", {
 			op: "publish",
 			topic: "deployment",
+			key: "environment",
 			kind: "decision",
 			origin: "quoted",
 			content: "Use staging.",
@@ -743,10 +811,12 @@ describe("opt-in shared domain knowledge", () => {
 		const record = knowledge(state).store.list("project-a", ["deployment"])[0];
 		expect(record.state).toBe("current");
 		expect(record.sources[0]).toMatchObject({ type: "session", entryId, sessionId: manager.getSessionId() });
+		expect(receipt.details).toMatchObject({ id: record.id, key: "environment" });
 		await expect(
 			tool.execute("fabricated", {
 				op: "publish",
 				topic: "deployment",
+				key: "environment",
 				kind: "decision",
 				origin: "quoted",
 				content: "Use production.",
@@ -787,6 +857,7 @@ describe("opt-in shared domain knowledge", () => {
 		});
 		const input = {
 			topic: "deployment",
+			key: "environment",
 			kind: "decision" as const,
 			origin: "quoted" as const,
 			content: "Use staging.",
@@ -857,6 +928,7 @@ describe("opt-in shared domain knowledge", () => {
 		for (const quote of ["Use staging.", "Use canary."]) {
 			await knowledge(state).publish({
 				topic: "deployment",
+				key: "environment",
 				kind: "policy",
 				origin: "quoted",
 				content: quote,

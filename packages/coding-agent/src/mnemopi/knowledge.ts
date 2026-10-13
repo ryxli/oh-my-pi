@@ -38,6 +38,7 @@ export type KnowledgeSelection =
 
 export interface KnowledgePublication {
 	topic: string;
+	key: string;
 	kind: KnowledgeKind;
 	origin: KnowledgeOrigin;
 	content: string;
@@ -156,6 +157,13 @@ export class MnemopiKnowledge {
 
 	async publish(input: KnowledgePublication): Promise<KnowledgeRecord> {
 		this.#assertTopic(input.topic);
+		if (
+			typeof input.key !== "string" ||
+			!input.key.trim() ||
+			input.key.length > 128 ||
+			input.key !== input.key.trim()
+		)
+			throw new Error("Knowledge key must be 1-128 characters, with no surrounding whitespace.");
 		const sessionId = this.session.getSessionId();
 		if (input.sources.length === 0 || input.sources.length > 8) throw new Error("Select 1-8 evidence sources.");
 		if (!input.content.trim() || input.content.length > 4000)
@@ -229,7 +237,7 @@ export class MnemopiKnowledge {
 			)
 				throw new Error("Session evidence changed during publication; select sources again.");
 		}
-		const serialized = JSON.stringify({ content: input.content, sources });
+		const serialized = JSON.stringify({ key: input.key, content: input.content, sources });
 		if (redactMemorySecrets(serialized) !== serialized) {
 			throw new Error("Knowledge evidence contains a possible secret; select a different excerpt.");
 		}
@@ -281,6 +289,7 @@ export class MnemopiKnowledge {
 			views.push({
 				id: record.id,
 				topic: record.topic,
+				key: redactMemorySecrets(record.key),
 				kind: record.kind,
 				state: record.state,
 				origin: record.origin,
@@ -306,16 +315,31 @@ export class MnemopiKnowledge {
 						: { content: record.content, sources: record.sources }),
 			});
 		}
+		const groups = new Map<string, { topic: string; key: string; records: typeof views }>();
+		for (const view of views) {
+			const groupId = JSON.stringify([view.topic, view.key]);
+			let group = groups.get(groupId);
+			if (!group) {
+				group = { topic: view.topic, key: view.key, records: [] };
+				groups.set(groupId, group);
+			}
+			group.records.push(view);
+		}
 		const snapshot = JSON.stringify({
 			domain: this.config.domain,
 			topics: this.config.topics,
-			records: views,
+			groups: [...groups.values()],
 		}).replaceAll("<", "\\u003c");
 		if (snapshot.length <= KNOWLEDGE_NOTICE_LIMIT - 2000) return snapshot;
 		const handles = [];
 		let handleChars = 0;
 		for (const record of records.slice(0, 32)) {
-			const handle = { id: record.id, topic: record.topic, state: record.state };
+			const handle = {
+				id: record.id,
+				topic: record.topic,
+				key: redactMemorySecrets(record.key),
+				state: record.state,
+			};
 			handleChars += JSON.stringify(handle).replaceAll("<", "\\u003c").length + 1;
 			if (handleChars > KNOWLEDGE_NOTICE_LIMIT / 2) break;
 			handles.push(handle);
