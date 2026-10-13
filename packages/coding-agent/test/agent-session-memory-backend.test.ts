@@ -342,6 +342,7 @@ describe("AgentSession memory backend lifecycle", () => {
 			const entryId = current.sessionManager.appendMessage({ role: "user", content: "Use staging.", timestamp: 1 });
 			await knowledge.publish({
 				topic: "delivery",
+				key: "environment",
 				kind: "decision",
 				origin: "quoted",
 				content: "Use staging.",

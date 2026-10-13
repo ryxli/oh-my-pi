@@ -2,10 +2,16 @@ Inspect or explicitly publish shared knowledge for this session's configured dom
 No automatic conversation capture occurs.
 Generic retain, recall, reflect, memory_edit, and learn are disabled in this mode.
 
-- `list`: return a bounded active snapshot with current, candidate, conflict, and evidence freshness states.
+- `list`: return a bounded active snapshot grouped by `(topic, key)`, with current, candidate, conflict, and evidence freshness states.
 - `read`: supply an active record `id` and optional zero-based `sourceIndex` (default 0) to verify and read one selected source quote, original role, timestamp and parent ID when available.
-- `publish`: supply `topic`, `kind` (`decision`, `investigation`, `policy`), `origin` (`quoted`, `inferred`), `content`, `sources`, and `expectedCurrentId` (the current ID from list, or null when absent).
+- `publish`: supply `topic`, `key`, `kind` (`decision`, `investigation`, `policy`), `origin` (`quoted`, `inferred`), `content`, `sources`, and `expectedCurrentId` (the current ID for that exact topic and key from list, or null when absent).
 - `retract`: explicitly withdraw one active record by `id` in the configured domain and selected topics.
+
+Topics are coarse responsibility allowlists, not individual decisions.
+Choose a stable free-form key (1-128 characters, no surrounding whitespace) for each independent decision or finding.
+Reuse its key for corrections; never supersede an unrelated key's current record.
+Currentness is scoped to `(domain, topic, key)`; multiple independent keys can be current in one topic.
+Pre-key records retain their original topic and lineage under key `legacy`; do not infer new decision identities from migration.
 
 Select 1-8 sources: `{type:"file",path,quote}` for an exact configured absolute file path, or `{type:"session",entryId,quote}` for an existing current-branch message ID.
 Omit `entryId` to select only the latest real user message on the current branch; the host persists its actual ID.

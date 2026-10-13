@@ -7,6 +7,7 @@ import type { ToolSession } from ".";
 const knowledgeSchema = type({
 	op: "'list' | 'publish' | 'retract' | 'read'",
 	"topic?": "string",
+	"key?": "string",
 	"kind?": "'decision' | 'investigation' | 'policy'",
 	"origin?": "'quoted' | 'inferred'",
 	"content?": "string",
@@ -56,6 +57,7 @@ export class KnowledgeTool implements AgentTool<typeof knowledgeSchema> {
 		}
 		if (
 			params.topic === undefined ||
+			params.key === undefined ||
 			params.kind === undefined ||
 			params.origin === undefined ||
 			params.content === undefined ||
@@ -63,11 +65,12 @@ export class KnowledgeTool implements AgentTool<typeof knowledgeSchema> {
 			params.expectedCurrentId === undefined
 		) {
 			throw new Error(
-				"knowledge publish requires topic, kind, origin, content, sources, and expectedCurrentId (null for no current record).",
+				"knowledge publish requires topic, key, kind, origin, content, sources, and expectedCurrentId (null for no current record at that key).",
 			);
 		}
 		const record = await knowledge.publish({
 			topic: params.topic,
+			key: params.key,
 			kind: params.kind,
 			origin: params.origin,
 			content: params.content,
@@ -77,6 +80,7 @@ export class KnowledgeTool implements AgentTool<typeof knowledgeSchema> {
 		const receipt = {
 			id: record.id,
 			topic: record.topic,
+			key: record.key,
 			state: record.state,
 			origin: record.origin,
 			predecessorId: record.predecessorId,
