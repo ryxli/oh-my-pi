@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { scheduler } from "node:timers/promises";
 import { completeSimple, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import * as codexAttestation from "@oh-my-pi/pi-ai/providers/openai-codex-attestation";
 import {
 	buildTransformedCodexRequestBody,
 	createOpenAICodexCompatibilityMetadata,
@@ -24,6 +25,7 @@ import { __resetProxyCache } from "@oh-my-pi/pi-ai/utils/proxy";
 import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import * as natives from "@oh-my-pi/pi-natives";
 import * as piUtils from "@oh-my-pi/pi-utils";
 import { withEnv } from "./helpers";
 
@@ -55,6 +57,7 @@ beforeEach(() => {
 	for (const key in originalProxyEnv) delete Bun.env[key];
 	__resetProxyCache();
 	vi.spyOn(piUtils, "getInstallId").mockReturnValue(TEST_INSTALLATION_ID);
+	vi.spyOn(natives, "deviceCheckGenerateToken").mockResolvedValue({ supported: false, latencyMs: 0 });
 });
 
 afterEach(() => {
@@ -362,6 +365,23 @@ class MockWebSocket {
 			},
 		});
 	}
+}
+
+function observeSharedHandshake(): Promise<void> {
+	const joined = Promise.withResolvers<void>();
+	const time = piUtils.logger.time;
+	function observeTime(operation: string): void;
+	function observeTime<T, A extends unknown[]>(operation: string, fn: (...args: A) => T, ...args: A): T;
+	function observeTime<T, A extends unknown[]>(operation: string, fn?: (...args: A) => T, ...args: A): T | undefined {
+		if (operation === "codexWs:awaitSharedHandshake") joined.resolve();
+		if (fn === undefined) {
+			time(operation);
+			return;
+		}
+		return time(operation, fn, ...args);
+	}
+	vi.spyOn(piUtils.logger, "time").mockImplementation(observeTime);
+	return joined.promise;
 }
 
 describe("openai-codex streaming", () => {
@@ -6089,12 +6109,15 @@ describe("openai-codex streaming", () => {
 		});
 
 		let constructorCount = 0;
+		const created = Promise.withResolvers<void>();
+		const joined = observeSharedHandshake();
 		const sockets: DeferredOpenWebSocket[] = [];
 		class DeferredOpenWebSocket extends MockWebSocket {
 			constructor(url: string, options?: { headers?: WsHeaders }) {
 				super(url, options);
 				constructorCount += 1;
 				sockets.push(this);
+				created.resolve();
 			}
 
 			open(): void {
@@ -6131,8 +6154,8 @@ describe("openai-codex streaming", () => {
 			providerSessionState,
 		}).result();
 
-		// Let both callers reach the handshake before the socket opens.
-		await Bun.sleep(5);
+		await created.promise;
+		await joined;
 		for (const socket of sockets) socket.open();
 
 		await prewarmPromise;
@@ -7244,6 +7267,128 @@ describe("openai-codex streaming", () => {
 			.map(c => c.text)
 			.join("");
 		expect(text).toBe("Second");
+	});
+
+	it("does not allocate prewarm transport for an already-cancelled session", async () => {
+		vi.spyOn(codexAttestation, "getCodexAttestationHeader").mockResolvedValue(undefined);
+		const controller = new AbortController();
+		const reason = new Error("session disposed before prewarm");
+		controller.abort(reason);
+		let sockets = 0;
+		class CancelledPrewarmSocket extends MockWebSocket {
+			constructor(url: string, options?: WsOptions) {
+				super(url, options);
+				sockets++;
+			}
+		}
+		global.WebSocket = CancelledPrewarmSocket as unknown as typeof WebSocket;
+		await expect(
+			prewarmOpenAICodexResponses(createCodexTestModel(), {
+				apiKey: createCodexTestToken(),
+				sessionId: "cancelled-prewarm",
+				providerSessionState: new Map<string, ProviderSessionState>(),
+				signal: controller.signal,
+			}),
+		).rejects.toBe(reason);
+		expect(sockets).toBe(0);
+	});
+
+	it("keeps a cancelled handshake join from reusing or replacing transport", async () => {
+		await withEnv({ PI_CODEX_WEBSOCKET: "1" }, async () => {
+			vi.spyOn(codexAttestation, "getCodexAttestationHeader").mockResolvedValue(undefined);
+			const created = Promise.withResolvers<JoiningPrewarmSocket>();
+			let sockets = 0;
+			class JoiningPrewarmSocket extends MockWebSocket {
+				constructor(url: string, options?: WsOptions) {
+					super(url, options);
+					sockets++;
+					created.resolve(this);
+				}
+				open(): void {
+					this.readyState = MockWebSocket.OPEN;
+					this.emit("open", new Event("open"));
+				}
+				override close(): void {
+					const wasConnecting = this.readyState === MockWebSocket.CONNECTING;
+					super.close();
+					if (wasConnecting) this.emit("close", { code: 1000 } as unknown as Event);
+				}
+			}
+			global.WebSocket = JoiningPrewarmSocket as unknown as typeof WebSocket;
+			const model = createCodexTestModel();
+			const providerSessionState = new Map<string, ProviderSessionState>();
+			const options = { apiKey: createCodexTestToken(), sessionId: "cancelled-join", providerSessionState };
+			const first = prewarmOpenAICodexResponses(model, options).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			const controller = new AbortController();
+			try {
+				const socket = await created.promise;
+				const joined = observeSharedHandshake();
+				const second = prewarmOpenAICodexResponses(model, { ...options, signal: controller.signal }).then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+				await joined;
+				const reason = new Error("handshake join cancelled");
+				controller.abort(reason);
+				socket.open();
+				expect(await first).toBeUndefined();
+				expect(await second).toBe(reason);
+				expect(sockets).toBe(1);
+			} finally {
+				controller.abort();
+				for (const state of providerSessionState.values()) state.close();
+				await first;
+			}
+		});
+	});
+
+	it("does not resurrect disposed prewarm transport after delayed attestation", async () => {
+		await withEnv({ PI_CODEX_WEBSOCKET: "1" }, async () => {
+			const entered = Promise.withResolvers<void>();
+			const attestation = Promise.withResolvers<string | undefined>();
+			vi.spyOn(codexAttestation, "getCodexAttestationHeader").mockImplementation(() => {
+				entered.resolve();
+				return attestation.promise;
+			});
+			let sockets = 0;
+			class LateAttestationSocket extends MockWebSocket {
+				constructor(url: string, options?: WsOptions) {
+					super(url, options);
+					sockets++;
+				}
+			}
+			global.WebSocket = LateAttestationSocket as unknown as typeof WebSocket;
+			const providerSessionState = new Map<string, ProviderSessionState>();
+			const controller = new AbortController();
+			const reason = new Error("session disposed during attestation");
+			const prewarm = prewarmOpenAICodexResponses(createCodexTestModel(), {
+				apiKey: createCodexTestToken(),
+				sessionId: "late-attestation",
+				providerSessionState,
+				signal: controller.signal,
+			});
+			const observed = prewarm.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			try {
+				await entered.promise;
+				controller.abort(reason);
+				for (const state of providerSessionState.values()) state.close();
+				providerSessionState.clear();
+				attestation.resolve(undefined);
+				expect(await observed).toBe(reason);
+				expect(sockets).toBe(0);
+				expect(providerSessionState.size).toBe(0);
+			} finally {
+				attestation.resolve(undefined);
+				await observed;
+				for (const state of providerSessionState.values()) state.close();
+			}
+		});
 	});
 
 	it("passes explicit service tier routing through websocket prewarm", async () => {
