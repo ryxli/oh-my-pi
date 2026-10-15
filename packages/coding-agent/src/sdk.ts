@@ -5264,12 +5264,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 								await resolveApiKeyOnce(await options.getApiKey(codexModel))
 							: await modelRegistry.getApiKey(codexModel, providerSessionId);
 						if (!codexPrewarmApiKey) return;
+						session.lifecycleSignal.throwIfAborted();
 						await logger.time("prewarmOpenAICodexResponses", prewarmOpenAICodexResponses, codexModel, {
 							apiKey: codexPrewarmApiKey,
 							sessionId: providerSessionId,
 							preferWebsockets: session.preferWebsockets,
 							providerSessionState: session.providerSessionState,
 							serviceTier: session.effectiveServiceTier(codexModel),
+							signal: session.lifecycleSignal,
 						});
 					} catch (error) {
 						const errorMessage = error instanceof Error ? error.message : String(error);
