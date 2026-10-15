@@ -7789,6 +7789,76 @@ describe("openai-codex streaming", () => {
 		expect(text).toBe("Second");
 	});
 
+	it("does not allocate prewarm transport for an already-cancelled session", async () => {
+		vi.spyOn(codexAttestation, "getCodexAttestationHeader").mockResolvedValue(undefined);
+		const controller = new AbortController();
+		const reason = new Error("session disposed before prewarm");
+		controller.abort(reason);
+		let sockets = 0;
+		class CancelledPrewarmSocket extends MockWebSocket {
+			constructor(url: string, options?: WsOptions) {
+				super(url, options);
+				sockets++;
+			}
+		}
+		global.WebSocket = CancelledPrewarmSocket as unknown as typeof WebSocket;
+		await expect(
+			prewarmOpenAICodexResponses(createCodexTestModel(), {
+				apiKey: createCodexTestToken(),
+				sessionId: "cancelled-prewarm",
+				providerSessionState: new Map<string, ProviderSessionState>(),
+				signal: controller.signal,
+			}),
+		).rejects.toBe(reason);
+		expect(sockets).toBe(0);
+	});
+
+	it("does not resurrect disposed prewarm transport after delayed attestation", async () => {
+		await withEnv({ PI_CODEX_WEBSOCKET: "1" }, async () => {
+			const entered = Promise.withResolvers<void>();
+			const attestation = Promise.withResolvers<string | undefined>();
+			vi.spyOn(codexAttestation, "getCodexAttestationHeader").mockImplementation(() => {
+				entered.resolve();
+				return attestation.promise;
+			});
+			let sockets = 0;
+			class LateAttestationSocket extends MockWebSocket {
+				constructor(url: string, options?: WsOptions) {
+					super(url, options);
+					sockets++;
+				}
+			}
+			global.WebSocket = LateAttestationSocket as unknown as typeof WebSocket;
+			const providerSessionState = new Map<string, ProviderSessionState>();
+			const controller = new AbortController();
+			const reason = new Error("session disposed during attestation");
+			const prewarm = prewarmOpenAICodexResponses(createCodexTestModel(), {
+				apiKey: createCodexTestToken(),
+				sessionId: "late-attestation",
+				providerSessionState,
+				signal: controller.signal,
+			});
+			const observed = prewarm.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			try {
+				await entered.promise;
+				controller.abort(reason);
+				for (const state of providerSessionState.values()) state.close();
+				providerSessionState.clear();
+				attestation.resolve(undefined);
+				expect(await observed).toBe(reason);
+				expect(sockets).toBe(0);
+				expect(providerSessionState.size).toBe(0);
+			} finally {
+				attestation.resolve(undefined);
+				await observed;
+				for (const state of providerSessionState.values()) state.close();
+			}
+		});
+	});
+
 	it("passes explicit service tier routing through websocket prewarm", async () => {
 		using tempDir = TempDir.createSync("@pi-codex-prewarm-tier-");
 		setAgentDir(tempDir.path());

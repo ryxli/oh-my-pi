@@ -3301,6 +3301,7 @@ export async function prewarmOpenAICodexResponses(
 		| "serviceTier"
 	>,
 ): Promise<void> {
+	options?.signal?.throwIfAborted();
 	const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
 	if (!apiKey) return;
 	const accountId = getCodexAccountId(apiKey);
@@ -3323,6 +3324,7 @@ export async function prewarmOpenAICodexResponses(
 	const codexClientVersion = CODEX_CLIENT_VERSION;
 	const requestIdentity = createCodexCompatibilityIdentity(metadataSession);
 	const attestation = await getCodexAttestationHeader(accountId);
+	options?.signal?.throwIfAborted();
 	const routedRequest: Pick<RequestBody, "model" | "service_tier"> = {
 		model: model.requestModelId ?? model.id,
 	};
