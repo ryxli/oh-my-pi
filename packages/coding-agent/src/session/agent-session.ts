@@ -983,7 +983,7 @@ export class AgentSession implements SettingsScope {
 	#autolearnCaptureAbortController: AbortController | undefined;
 	#autolearnCaptureTask: Promise<void> | undefined;
 	#isDisposed = false;
-	#modelDiscoveryAbortController = new AbortController();
+	#lifecycleAbortController = new AbortController();
 	/** Process-wide by default (double-spend safety across sessions); injectable for tests. */
 	#resetCoordinator: CodexAutoRedeemCoordinator;
 	/** Each turn stream may adopt a peer's confirmed reset once, not retry on it indefinitely. */
@@ -5519,6 +5519,11 @@ export class AgentSession implements SettingsScope {
 		return this.#isDisposed;
 	}
 
+	/** Cancels session-owned startup work when disposal begins. */
+	get lifecycleSignal(): AbortSignal {
+		return this.#lifecycleAbortController.signal;
+	}
+
 	markMovedFromEmptySessionFile(sessionFile: string): void {
 		this.#movedFromEmptySessionFile = path.resolve(sessionFile);
 	}
@@ -5536,8 +5541,8 @@ export class AgentSession implements SettingsScope {
 	 */
 	beginDispose(): void {
 		this.#isDisposed = true;
+		this.#lifecycleAbortController.abort();
 		for (const dispose of this.#disposers.splice(0)) dispose();
-		this.#modelDiscoveryAbortController.abort();
 		this.#queuedMessageDrainBlocked = false;
 		this.#usagePreflightReadyForNextModelCall = false;
 		this.#detachUsageBeforeQueueDequeue?.();
@@ -13578,7 +13583,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	async #retryInactiveAdvisorAfterModelDiscovery(): Promise<void> {
 		if (this.#isDisposed || !this.#advisors.hasInactiveNoModelAdvisor()) return;
-		await this.#modelRegistry.awaitInitialBackgroundRefresh(this.#modelDiscoveryAbortController.signal);
+		await this.#modelRegistry.awaitInitialBackgroundRefresh(this.#lifecycleAbortController.signal);
 		if (this.#isDisposed) return;
 		if (this.#advisors.retryAfterModelDiscovery()) this.#emit({ type: "model_changed" });
 	}
@@ -13609,7 +13614,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	async #revalidateFallbackChainsAfterModelDiscovery(): Promise<void> {
 		if (this.#isDisposed || !this.#recovery.hasPendingDiscoveryDeferredFallbackValidation()) return;
-		await this.#modelRegistry.awaitInitialBackgroundRefresh(this.#modelDiscoveryAbortController.signal);
+		await this.#modelRegistry.awaitInitialBackgroundRefresh(this.#lifecycleAbortController.signal);
 		if (this.#isDisposed) return;
 		if (this.#recovery.revalidateRetryFallbackChainsAfterDiscovery()) {
 			this.#emit({ type: "config_warnings_changed" });
@@ -13624,7 +13629,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	async #surfaceModelRegistryWarningsAfterDiscovery(): Promise<void> {
 		if (this.#isDisposed || typeof this.#modelRegistry.awaitInitialBackgroundRefresh !== "function") return;
-		await this.#modelRegistry.awaitInitialBackgroundRefresh(this.#modelDiscoveryAbortController.signal);
+		await this.#modelRegistry.awaitInitialBackgroundRefresh(this.#lifecycleAbortController.signal);
 		if (this.#isDisposed) return;
 		const warnings = this.#modelRegistry.drainConfigWarnings();
 		if (warnings.length === 0) return;
@@ -13655,7 +13660,7 @@ export class AgentSession implements SettingsScope {
 		const boundAtStartup = this.model;
 		if (this.#isDisposed || !boundAtStartup) return;
 		if (typeof this.#modelRegistry.awaitInitialBackgroundRefresh !== "function") return;
-		await this.#modelRegistry.awaitInitialBackgroundRefresh(this.#modelDiscoveryAbortController.signal);
+		await this.#modelRegistry.awaitInitialBackgroundRefresh(this.#lifecycleAbortController.signal);
 		if (this.#isDisposed) return;
 		// Only silently re-metadata the startup-bound selector: bail if the user
 		// switched models while discovery was in flight.
