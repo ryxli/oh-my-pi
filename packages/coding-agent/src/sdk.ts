@@ -5551,6 +5551,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 								await resolveApiKeyOnce(await options.getApiKey(codexModel))
 							: await modelRegistry.getApiKey(codexModel, providerSessionId);
 						if (!codexPrewarmApiKey) return;
+						session.lifecycleSignal.throwIfAborted();
 						// Load the transport only for an actual Codex prewarm, not unrelated session setup.
 						const { prewarmOpenAICodexResponses } =
 							await import("@oh-my-pi/pi-ai/providers/openai-codex-responses");
@@ -5560,6 +5561,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							preferWebsockets: session.preferWebsockets,
 							providerSessionState: session.providerSessionState,
 							serviceTier: session.effectiveServiceTier(codexModel),
+							signal: session.lifecycleSignal,
 						});
 					} catch (error) {
 						const errorMessage = error instanceof Error ? error.message : String(error);
