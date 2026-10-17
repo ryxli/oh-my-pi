@@ -199,24 +199,44 @@ export async function readSessionMessage(
 	sessionId: string,
 	entryId: string,
 ): Promise<SessionMessageEntry | undefined> {
-	let checkedHeader = false;
 	let message: SessionMessageEntry | undefined;
+	await visitSessionMessages(filePath, sessionId, [entryId], entry => {
+		message = entry;
+	});
+	return message;
+}
+
+/** Visit selected messages in one scan, retaining only IDs and checking the journal identity first. */
+export async function visitSessionMessages(
+	filePath: string,
+	sessionId: string,
+	entryIds: Iterable<string>,
+	visit: (entry: SessionMessageEntry) => void,
+): Promise<void> {
+	const remaining = new Set(entryIds);
+	if (remaining.size === 0) return;
+	let checkedHeader = false;
+	let visitorThrew = false;
 	try {
 		await visitEntriesFromFileStream(filePath, entry => {
 			if (!checkedHeader) {
 				checkedHeader = true;
 				return isValidSessionHeader(entry) && entry.id === sessionId;
 			}
-			if (entry.type === "message" && entry.id === entryId) {
-				message = entry;
-				return false;
+			if (entry.type === "message" && remaining.delete(entry.id)) {
+				try {
+					visit(entry);
+				} catch (error) {
+					visitorThrew = true;
+					throw error;
+				}
+				return remaining.size > 0;
 			}
 		});
 	} catch (error) {
-		if (isEnoent(error) || isEnotdir(error) || isEisdir(error)) return undefined;
+		if (!visitorThrew && (isEnoent(error) || isEnotdir(error) || isEisdir(error))) return;
 		throw error;
 	}
-	return message;
 }
 
 /** Parse session JSONL and visit each entry without retaining prior entries. */

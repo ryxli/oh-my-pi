@@ -8,11 +8,12 @@ import type {
 } from "@oh-my-pi/pi-mnemopi/core";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
+import { MEMORY_RECALL_CHANGES_MESSAGE_TYPE } from "../memory-backend/recall-entry";
 import { redactMemorySecrets } from "../memory-backend/redact";
 import type { MemoryPromptPreparation } from "../memory-backend/types";
 import knowledgeNotice from "../prompts/system/mnemopi-knowledge.md" with { type: "text" };
 import type { SessionEntry } from "../session/session-entries";
-import { readSessionMessage } from "../session/session-loader";
+import { readSessionMessage, visitSessionMessages } from "../session/session-loader";
 import type { SessionManager } from "../session/session-manager";
 import {
 	cfgMnemopiAutoRetain,
@@ -46,7 +47,7 @@ export interface KnowledgePublication {
 	expectedCurrentId: string | null;
 }
 
-type KnowledgeSession = Pick<SessionManager, "getBranchView" | "getSessionId" | "appendCustomEntry">;
+type KnowledgeSession = Pick<SessionManager, "getBranchView" | "getSessionId">;
 interface KnowledgeSessionEvidence {
 	text: string;
 	sha256: string;
@@ -56,9 +57,25 @@ interface KnowledgeSessionEvidence {
 	timestamp: string;
 	parentId: string | null;
 }
-const DELIVERY_ENTRY = "mnemopi_knowledge_delivery";
 export const KNOWLEDGE_NOTICE_LIMIT = 16_000;
 const MAX_SOURCE_BYTES = 1_048_576;
+
+function knowledgeDelivery(entry: SessionEntry): { scope: string; sha256: string } | { withdrawn: true } | undefined {
+	if (entry.type !== "custom_message" || entry.customType !== MEMORY_RECALL_CHANGES_MESSAGE_TYPE) return undefined;
+	const details = entry.details;
+	if (typeof details !== "object" || details === null || !("knowledge" in details)) return undefined;
+	const delivery = details.knowledge;
+	if (typeof delivery !== "object" || delivery === null) return undefined;
+	if ("withdrawn" in delivery && delivery.withdrawn === true) return { withdrawn: true };
+	if (
+		"scope" in delivery &&
+		typeof delivery.scope === "string" &&
+		"sha256" in delivery &&
+		typeof delivery.sha256 === "string"
+	)
+		return { scope: delivery.scope, sha256: delivery.sha256 };
+	return undefined;
+}
 
 export function loadKnowledgeConfig(settings: Settings): KnowledgeConfig | undefined {
 	if (!cfgMnemopiKnowledgeEnabled.get(settings)) return undefined;
@@ -109,18 +126,12 @@ export function prepareKnowledgeWithdrawal(
 	signal?: AbortSignal,
 ): MemoryPromptPreparation | undefined {
 	const branch = session.getBranchView();
-	const index = branch.findLastIndex(entry => entry.type === "custom" && entry.customType === DELIVERY_ENTRY);
+	const index = branch.findLastIndex(entry => knowledgeDelivery(entry) !== undefined);
 	const previous = branch[index];
-	if (!previous || previous.type !== "custom") return undefined;
+	if (!previous) return undefined;
 	const compacted = branch.findLastIndex(entry => entry.type === "compaction") > index;
-	if (
-		!compacted &&
-		typeof previous.data === "object" &&
-		previous.data !== null &&
-		"withdrawn" in previous.data &&
-		previous.data.withdrawn === true
-	)
-		return undefined;
+	const delivery = knowledgeDelivery(previous);
+	if (!compacted && delivery && "withdrawn" in delivery) return undefined;
 	return {
 		notice: {
 			content: prompt.render(knowledgeNotice, {
@@ -129,12 +140,8 @@ export function prepareKnowledgeWithdrawal(
 			details: { knowledge: { withdrawn: true } },
 		},
 		commit: () => {
-			const latest = session
-				.getBranchView()
-				.findLast(entry => entry.type === "custom" && entry.customType === DELIVERY_ENTRY);
-			if (signal?.aborted || latest?.id !== previous.id) return false;
-			session.appendCustomEntry(DELIVERY_ENTRY, { withdrawn: true });
-			return true;
+			const latest = session.getBranchView().findLast(entry => knowledgeDelivery(entry) !== undefined);
+			return !signal?.aborted && latest?.id === previous.id;
 		},
 	};
 }
@@ -142,7 +149,7 @@ export function prepareKnowledgeWithdrawal(
 /** Owns provenance and staged delivery, not the store's currentness decisions. */
 export class MnemopiKnowledge {
 	#generation = 0;
-	#forceDelivery = false;
+	#deliveryBeforeReset: string | undefined;
 
 	constructor(
 		readonly config: KnowledgeConfig,
@@ -152,7 +159,9 @@ export class MnemopiKnowledge {
 
 	reset(): void {
 		this.#generation++;
-		this.#forceDelivery = true;
+		this.#deliveryBeforeReset = this.session
+			.getBranchView()
+			.findLast(entry => knowledgeDelivery(entry) !== undefined)?.id;
 	}
 
 	async publish(input: KnowledgePublication): Promise<KnowledgeRecord> {
@@ -254,6 +263,39 @@ export class MnemopiKnowledge {
 		const records = this.store.list(this.config.domain, this.config.topics);
 		const views = [];
 		const files = new Map<string, { text: string; sha256: string } | undefined>();
+		const recordedSessions = new Map<string, Map<string, Map<string, KnowledgeSource[]>>>();
+		const recordedFreshness = new Map<KnowledgeSource, boolean>();
+		for (const record of records) {
+			for (const source of record.sources) {
+				if (
+					source.type !== "session" ||
+					source.path === undefined ||
+					!source.sessionId ||
+					!this.config.sourcePaths.includes(source.path)
+				)
+					continue;
+				let sessions = recordedSessions.get(source.path);
+				if (!sessions) recordedSessions.set(source.path, (sessions = new Map()));
+				let selections = sessions.get(source.sessionId);
+				if (!selections) sessions.set(source.sessionId, (selections = new Map()));
+				let sources = selections.get(source.entryId);
+				if (!sources) selections.set(source.entryId, (sources = []));
+				sources.push(source);
+			}
+		}
+		for (const [filePath, sessions] of recordedSessions) {
+			for (const [sessionId, selections] of sessions) {
+				await visitSessionMessages(filePath, sessionId, selections.keys(), entry => {
+					const evidence = this.#messageEvidence(entry, true);
+					for (const source of selections.get(entry.id)!) {
+						recordedFreshness.set(
+							source,
+							evidence?.sha256 === source.sha256 && evidence.text.includes(source.quote),
+						);
+					}
+				});
+			}
+		}
 		for (const record of records) {
 			const freshness: string[] = [];
 			for (const source of record.sources) {
@@ -267,7 +309,9 @@ export class MnemopiKnowledge {
 								? "unchanged"
 								: "stale",
 					);
-				} else if (source.path !== undefined || source.sessionId === this.session.getSessionId()) {
+				} else if (source.path !== undefined) {
+					freshness.push(recordedFreshness.get(source) ? "recorded-session" : "unavailable");
+				} else if (source.sessionId === this.session.getSessionId()) {
 					const evidence = await this.#sessionEvidence(source.entryId, source);
 					freshness.push(
 						evidence?.sha256 === source.sha256 && evidence.text.includes(source.quote)
@@ -416,26 +460,24 @@ export class MnemopiKnowledge {
 		const content = prompt.render(knowledgeNotice, { snapshot });
 		const sha256 = new Bun.CryptoHasher("sha256").update(content).digest("hex");
 		const scope = JSON.stringify(this.config);
-		let previous: unknown;
+		let previousId: string | undefined;
+		let previousHash: string | undefined;
 		const branch = this.session.getBranchView();
 		for (let index = branch.length - 1; index >= 0; index--) {
 			const entry = branch[index];
 			if (entry.type === "reset_boundary" || entry.type === "compaction") break;
-			if (entry.type !== "custom" || entry.customType !== DELIVERY_ENTRY) continue;
-			const data = entry.data;
-			if (typeof data === "object" && data !== null && "scope" in data && data.scope === scope && "sha256" in data) {
-				previous = data.sha256;
-			}
+			const delivery = knowledgeDelivery(entry);
+			if (!delivery) continue;
+			previousId = entry.id;
+			if ("scope" in delivery && delivery.scope === scope) previousHash = delivery.sha256;
 			break;
 		}
-		const changed = this.#forceDelivery || previous !== sha256;
+		const changed = previousHash !== sha256 || previousId === this.#deliveryBeforeReset;
 		return {
 			notice: changed ? { content, details: { knowledge: { scope, sha256 } } } : undefined,
 			commit: () => {
 				if (generation !== this.#generation || signal?.aborted) return false;
 				this.#generation++;
-				if (changed) this.session.appendCustomEntry(DELIVERY_ENTRY, { scope, sha256 });
-				this.#forceDelivery = false;
 				return true;
 			},
 		};

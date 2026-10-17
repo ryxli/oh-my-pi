@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
+import { Agent } from "@oh-my-pi/pi-agent-core";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { MEMORY_RECALL_CHANGES_MESSAGE_TYPE } from "../src/memory-backend/recall-entry";
 import { mnemopiBackend } from "../src/mnemopi/backend";
@@ -13,9 +17,13 @@ import {
 	MnemopiSessionState,
 	setMnemopiSessionState,
 } from "../src/mnemopi/state";
-import type { AgentSession } from "../src/session/agent-session";
+import { AgentSession } from "../src/session/agent-session";
+import { AuthStorage } from "../src/session/auth-storage";
+import { convertToLlm } from "../src/session/messages";
+import { SCENE_CUT_MESSAGE_TYPE } from "../src/session/scene-cut";
 import * as sessionLoader from "../src/session/session-loader";
 import { SessionManager } from "../src/session/session-manager";
+import { SessionMaintenance } from "../src/session/session-maintenance";
 import { BUILTIN_TOOLS, type ToolSession } from "../src/tools";
 import { MemoryRetainTool } from "../src/tools/memory-retain";
 import { KnowledgeTool } from "../src/tools/knowledge";
@@ -98,6 +106,15 @@ async function deliver(state: MnemopiSessionState) {
 	if (!prepared) throw new Error("Expected staged preparation");
 	expect(prepared.context).toBeUndefined();
 	expect(prepared.commit()).toBe(true);
+	if (prepared.notice) {
+		state.session.sessionManager.appendCustomMessageEntry(
+			MEMORY_RECALL_CHANGES_MESSAGE_TYPE,
+			prepared.notice.content,
+			false,
+			prepared.notice.details,
+			"agent",
+		);
+	}
 	return prepared.notice?.content;
 }
 
@@ -269,6 +286,99 @@ describe("opt-in shared domain knowledge", () => {
 		expect(await knowledge(receiver).readSources(record.id)).not.toContain("Use staging.");
 	});
 
+	it("batches selected journal reads and revalidates changed, missing, and mismatched evidence", async () => {
+		const dir = directory();
+		const file = dir.join("recorded.jsonl");
+		const header = { type: "session", id: "original", timestamp: "2026-01-01T00:00:00Z", cwd: dir.path() };
+		const entries = ["Use staging.", "Run the checks."].map((content, index) => ({
+			type: "message",
+			id: `selected-${index}`,
+			parentId: null,
+			timestamp: header.timestamp,
+			message: { role: "user", content, timestamp: index },
+		}));
+		const journal = [header, ...entries].map(entry => JSON.stringify(entry)).join("\n") + "\n";
+		await Bun.write(file, journal);
+		const state = start(dir, { "mnemopi.knowledge.sourcePaths": [file] });
+		for (const entry of entries) {
+			await knowledge(state).publish({
+				topic: "deployment",
+				key: entry.id,
+				kind: "decision",
+				origin: "quoted",
+				content: entry.message.content,
+				sources: [
+					{ type: "session", path: file, sessionId: header.id, entryId: entry.id, quote: entry.message.content },
+				],
+				expectedCurrentId: null,
+			});
+		}
+		const reader = spyOn(sessionLoader, "visitSessionMessages");
+		try {
+			const initial = await knowledge(state).snapshot();
+			expect(initial).toContain(entries[0].message.content);
+			expect(initial).toContain(entries[1].message.content);
+			expect(reader).toHaveBeenCalledTimes(1);
+			expect(reader.mock.calls[0].slice(0, 2)).toEqual([file, header.id]);
+			expect(await knowledge(state).snapshot()).toBe(initial);
+			expect(reader).toHaveBeenCalledTimes(2);
+			await Bun.write(file, journal.replace("Use staging.", "Approval revoked."));
+			const changed = await knowledge(state).snapshot();
+			expect(changed).not.toContain(entries[0].message.content);
+			expect(changed).toContain(entries[1].message.content);
+			await Bun.write(file, [header, entries[0]].map(entry => JSON.stringify(entry)).join("\n") + "\n");
+			const missing = await knowledge(state).snapshot();
+			expect(missing).toContain(entries[0].message.content);
+			expect(missing).not.toContain(entries[1].message.content);
+			await Bun.write(file, journal.replace('"id":"original"', '"id":"wrong"'));
+			const mismatched = await knowledge(state).snapshot();
+			for (const entry of entries) expect(mismatched).not.toContain(entry.message.content);
+			expect(reader).toHaveBeenCalledTimes(5);
+			const restricted = start(dir, { "mnemopi.knowledge.sourcePaths": [] });
+			expect(await knowledge(restricted).snapshot()).toBe(mismatched);
+			expect(reader).toHaveBeenCalledTimes(5);
+			fs.unlinkSync(file);
+			expect(await knowledge(state).snapshot()).toBe(mismatched);
+			expect(reader).toHaveBeenCalledTimes(6);
+		} finally {
+			reader.mockRestore();
+		}
+	});
+
+	it("streams only selected recorded messages and preserves callback failures", async () => {
+		const dir = directory();
+		const file = dir.join("selected.jsonl");
+		const header = { type: "session", id: "original", timestamp: "2026-01-01T00:00:00Z", cwd: dir.path() };
+		const entries = ["first", "unselected", "last", "first"].map((id, index) => ({
+			type: "message" as const,
+			id,
+			parentId: null,
+			timestamp: header.timestamp,
+			message: { role: "user" as const, content: `Message ${index}`, timestamp: index },
+		}));
+		await Bun.write(file, [header, ...entries].map(entry => JSON.stringify(entry)).join("\n") + "\n");
+		const selected: string[] = [];
+		await sessionLoader.visitSessionMessages(file, header.id, ["first", "last", "first"], entry => {
+			selected.push(entry.id);
+		});
+		expect(selected).toEqual(["first", "last"]);
+		expect(await sessionLoader.readSessionMessage(file, header.id, "first")).toEqual(entries[0]);
+		for (const [sessionId, ids] of [
+			["wrong", ["first"]],
+			[header.id, ["missing"]],
+			[header.id, []],
+		] as const) {
+			await sessionLoader.visitSessionMessages(file, sessionId, ids, entry => selected.push(entry.id));
+		}
+		expect(selected).toEqual(["first", "last"]);
+		const failure = Object.assign(new Error("Selected message callback failed"), { code: "ENOENT" });
+		await expect(
+			sessionLoader.visitSessionMessages(file, header.id, ["first"], () => {
+				throw failure;
+			}),
+		).rejects.toBe(failure);
+	});
+
 	it("rejects mismatched original identities and downgrades recorded synthetic or agent-attributed decisions", async () => {
 		const dir = directory();
 		const file = dir.join("original.jsonl");
@@ -419,10 +529,29 @@ describe("opt-in shared domain knowledge", () => {
 		const withdrawal = prepareKnowledgeWithdrawal(manager);
 		expect(withdrawal?.notice?.content).toContain('"withdrawn":true');
 		expect(withdrawal?.commit()).toBe(true);
+		expect(prepareKnowledgeWithdrawal(manager)?.notice).toEqual(withdrawal?.notice);
+		if (!withdrawal?.notice) throw new Error("Expected withdrawal notice");
+		manager.appendCustomMessageEntry(
+			MEMORY_RECALL_CHANGES_MESSAGE_TYPE,
+			withdrawal.notice.content,
+			false,
+			withdrawal.notice.details,
+			"agent",
+		);
 		expect(prepareKnowledgeWithdrawal(manager)).toBeUndefined();
 		const kept = manager.appendMessage({ role: "user", content: "Continue", timestamp: 2 });
 		manager.appendCompaction("Earlier context summarized", undefined, kept, 100);
-		expect(prepareKnowledgeWithdrawal(manager)?.commit()).toBe(true);
+		const renewed = prepareKnowledgeWithdrawal(manager);
+		expect(renewed?.commit()).toBe(true);
+		expect(prepareKnowledgeWithdrawal(manager)?.notice).toEqual(renewed?.notice);
+		if (!renewed?.notice) throw new Error("Expected renewed withdrawal");
+		manager.appendCustomMessageEntry(
+			MEMORY_RECALL_CHANGES_MESSAGE_TYPE,
+			renewed.notice.content,
+			false,
+			renewed.notice.details,
+			"agent",
+		);
 		expect(prepareKnowledgeWithdrawal(manager)).toBeUndefined();
 		expect(await deliver(state)).toContain("Use canary.");
 	});
@@ -490,6 +619,7 @@ describe("opt-in shared domain knowledge", () => {
 		const replacement = await state.beforeAgentStartPrompt("replacement");
 		expect(retry?.commit()).toBe(false);
 		expect(replacement?.commit()).toBe(true);
+		expect(await deliver(state)).toContain("Use canary.");
 		expect(await deliver(state)).toBeUndefined();
 	});
 
@@ -614,6 +744,156 @@ describe("opt-in shared domain knowledge", () => {
 		fs.unlinkSync(file);
 		expect(await deliver(state)).toContain('"freshness":["unavailable"]');
 	});
+
+	it.each(["continue", "abort", "dispose", "abort-after-commit", "withdraw-after-commit"] as const)(
+		"refreshes source-backed Knowledge before automatic scene continuation (%s)",
+		async action => {
+			const dir = directory();
+			const file = dir.join("policy.txt");
+			const approval = "Allow staging deployment.";
+			await Bun.write(file, approval);
+			const writer = start(dir, { "compaction.enabled": false, "todo.enabled": false });
+			await knowledge(writer).publish({
+				topic: "deployment",
+				key: "environment",
+				kind: "policy",
+				origin: "quoted",
+				content: approval,
+				sources: [{ type: "file", path: file, quote: approval }],
+				expectedCurrentId: null,
+			});
+			const mock = createMockModel({
+				responses: [
+					async () => {
+						await Bun.write(file, "All deployment approval is revoked.");
+						if (action === "withdraw-after-commit") setMnemopiSessionState(session, undefined);
+						return { content: ["Previous task complete."] };
+					},
+					{ content: ["Approval unavailable."] },
+				],
+			});
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled model");
+			const authStorage = await AuthStorage.create(":memory:");
+			authStorage.keys.setRuntime("anthropic", "test-key");
+			const session = new AgentSession({
+				agent: new Agent({
+					getApiKey: () => "test-key",
+					initialState: { model, systemPrompt: ["Test"], tools: [] },
+					streamFn: mock.stream,
+					convertToLlm,
+				}),
+				sessionManager: SessionManager.inMemory(dir.path()),
+				settings: writer.session.settings,
+				modelRegistry: new ModelRegistry(authStorage, dir.join("models.yml")),
+			});
+			const state = new MnemopiSessionState({
+				sessionId: session.sessionId,
+				config: loadMnemopiConfig(session.settings, dir.path()),
+				session,
+			});
+			setMnemopiSessionState(session, state);
+			const preparing = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const prepare = knowledge(state).prepare.bind(knowledge(state));
+			let preparations = 0;
+			const preparation = spyOn(knowledge(state), "prepare").mockImplementation(async signal => {
+				const prepared = await prepare(signal);
+				if (++preparations === 2 && (action === "abort" || action === "dispose")) {
+					preparing.resolve();
+					await release.promise;
+				}
+				return prepared;
+			});
+			let maintenanceCalls = 0;
+			const maintenance = spyOn(SessionMaintenance.prototype, "runPrePromptCompactionIfNeeded").mockImplementation(
+				async () => {
+					if (
+						++maintenanceCalls === 2 &&
+						(action === "abort-after-commit" || action === "withdraw-after-commit")
+					) {
+						preparing.resolve();
+						await release.promise;
+					}
+				},
+			);
+			try {
+				session.stageSceneCut({
+					label: "Recheck deployment",
+					state: ["Previous task complete."],
+					objective: "Check current deployment authorization.",
+					exit: "Authorization checked.",
+					continue: true,
+				});
+				const pending = session.prompt("Complete the previous task.");
+				if (action !== "continue") {
+					await preparing.promise;
+					try {
+						if (action === "dispose") session.beginDispose();
+						else await session.abort();
+					} finally {
+						release.resolve();
+					}
+				}
+				await pending;
+				await session.waitForIdle();
+				expect(mock.calls).toHaveLength(action === "continue" ? 2 : 1);
+				const initial = JSON.stringify(mock.calls[0].context);
+				expect(initial).toContain(approval);
+				expect(initial).toContain('\\"freshness\\":[\\"unchanged\\"]');
+				expect(preparation).toHaveBeenCalledTimes(action === "withdraw-after-commit" ? 1 : 2);
+				if (action === "continue") {
+					const continuation = JSON.stringify(mock.calls[1].context);
+					expect(continuation).toContain("mnemopi-knowledge");
+					expect(continuation).toContain('\\"freshness\\":[\\"stale\\"]');
+					expect(continuation).toContain('\\"availability\\":\\"unavailable\\"');
+					expect(continuation).not.toContain(approval);
+					expect(continuation.match(/# Scene: Recheck deployment/g)).toHaveLength(1);
+				} else {
+					expect(
+						session.messages.filter(
+							message => message.role === "custom" && message.customType === MEMORY_RECALL_CHANGES_MESSAGE_TYPE,
+						),
+					).toHaveLength(0);
+					if (action === "withdraw-after-commit") {
+						expect(prepareKnowledgeWithdrawal(session.sessionManager)?.notice?.content).toContain(
+							'"withdrawn":true',
+						);
+					} else {
+						const retry = await state.beforeAgentStartPrompt("Retry current authorization");
+						expect(retry?.notice?.content).toContain('"freshness":["stale"]');
+						expect(retry?.notice?.content).not.toContain(approval);
+					}
+					if (action !== "dispose") {
+						await session.prompt("Retry current authorization");
+						expect(mock.calls).toHaveLength(2);
+						expect(JSON.stringify(mock.calls[1].context)).toContain("mnemopi-knowledge");
+						expect(JSON.stringify(mock.calls[1].context)).not.toContain(approval);
+						if (action === "withdraw-after-commit") {
+							expect(JSON.stringify(mock.calls[1].context)).toContain('\\"withdrawn\\":true');
+							expect(prepareKnowledgeWithdrawal(session.sessionManager)).toBeUndefined();
+						}
+					}
+				}
+				expect(
+					session.sessionManager
+						.getEntries()
+						.filter(entry => entry.type === "custom_message" && entry.customType === SCENE_CUT_MESSAGE_TYPE),
+				).toHaveLength(1);
+				expect(
+					session.messages.filter(
+						message => message.role === "custom" && message.customType === SCENE_CUT_MESSAGE_TYPE,
+					),
+				).toHaveLength(1);
+			} finally {
+				preparation.mockRestore();
+				maintenance.mockRestore();
+				await session.dispose();
+				if (action === "withdraw-after-commit") await state.dispose({ consolidate: false });
+				authStorage.close();
+			}
+		},
+	);
 
 	it("fails closed on unexpected source validation failure", async () => {
 		const state = start(directory());
@@ -755,6 +1035,8 @@ describe("opt-in shared domain knowledge", () => {
 		expect(await deliver(state)).toContain("Use staging.");
 		expect(await deliver(state)).toBeUndefined();
 		state.resetConversationTracking();
+		const undelivered = await state.beforeAgentStartPrompt("Reset but interrupted before delivery");
+		expect(undelivered?.commit()).toBe(true);
 		expect(await deliver(state)).toContain("Use staging.");
 		expect(state.lastRecallSnippet).toBeUndefined();
 	});

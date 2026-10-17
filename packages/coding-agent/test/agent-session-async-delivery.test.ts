@@ -957,6 +957,76 @@ describe("AgentSession owner-routed async delivery", () => {
 		expect(mock.calls.some(call => JSON.stringify(call.context.messages).includes("QUEUED RESULT"))).toBe(true);
 	});
 
+	it("delivers a preserved job once after the scene reset readiness barrier", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorages.push(authStorage);
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		const manager = new AsyncJobManager({});
+		AsyncJobManager.setInstance(manager);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage),
+			agentId: "SceneOwner",
+			asyncJobManager: manager,
+		});
+		const job = Promise.withResolvers<string>();
+		manager.register("bash", "scene job", () => job.promise, { id: "scene-job", ownerId: "SceneOwner" });
+		const resetting = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const refreshBase = session.refreshBaseSystemPrompt.bind(session);
+		const refresh = vi.spyOn(session, "refreshBaseSystemPrompt").mockImplementation(async () => {
+			resetting.resolve();
+			await release.promise;
+			await refreshBase();
+		});
+		session.stageSceneCut({
+			label: "Retain job",
+			state: ["Job remains owned"],
+			objective: "Inspect job output",
+			exit: "Done",
+			continue: true,
+		});
+		const pending = session.prompt("Obsolete task context");
+		await resetting.promise;
+		try {
+			job.resolve("PRESERVED SCENE RESULT");
+			await manager.waitForOwnerJobs("SceneOwner");
+			expect(session.isSessionTransitioning).toBe(true);
+			expect(session.hasPendingAsyncWork()).toBe(true);
+			expect(manager.isJobResultConsumed("scene-job")).toBe(false);
+			expect(mock.calls).toHaveLength(1);
+		} finally {
+			release.resolve();
+		}
+		await pending;
+		await session.settleAsyncWork();
+		refresh.mockRestore();
+		expect(session.hasPendingAsyncWork()).toBe(false);
+		expect(manager.isJobResultConsumed("scene-job")).toBe(true);
+		expect(
+			session.messages.filter(message => JSON.stringify(message).includes("PRESERVED SCENE RESULT")),
+		).toHaveLength(1);
+		expect(
+			session.messages.filter(message => message.role === "custom" && message.customType === "scene-cut-message"),
+		).toHaveLength(1);
+		const delivered = mock.calls.find(call =>
+			JSON.stringify(call.context.messages).includes("PRESERVED SCENE RESULT"),
+		);
+		expect(delivered).toBeDefined();
+		expect(JSON.stringify(delivered?.context.messages)).toContain("Inspect job output");
+		expect(JSON.stringify(delivered?.context.messages)).not.toContain("Obsolete task context");
+	});
+
 	it("keeps the event loop live until a delayed idle flush runs", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });

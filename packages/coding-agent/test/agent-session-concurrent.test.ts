@@ -33,6 +33,7 @@ import {
 	convertToLlm,
 	isUserInterruptAbort,
 	shouldRenderAbortReason,
+	USER_INTERRUPT_LABEL,
 } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -109,8 +110,21 @@ describe("AgentSession concurrent prompt guard", () => {
 			modelRegistry: sharedModelRegistry,
 		});
 		const continuations: string[] = [];
+		const capsuleEvents: string[] = [];
 		session.subscribe(event => {
 			if (event.type === "scene_cut_applied") continuations.push(event.continuation);
+			if (
+				(event.type === "message_start" || event.type === "message_end") &&
+				event.message.role === "custom" &&
+				event.message.customType === "scene-cut-message"
+			) {
+				capsuleEvents.push(event.type);
+				expect(
+					session.sessionManager
+						.getBranch()
+						.filter(entry => entry.type === "custom_message" && entry.customType === "scene-cut-message"),
+				).toHaveLength(1);
+			}
 		});
 		session.stageSceneCut({
 			label: "Next task",
@@ -123,11 +137,194 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.waitForIdle();
 		expect(continuations).toEqual([shouldContinue ? "continue" : "wait"]);
 		expect(mock.calls).toHaveLength(shouldContinue ? 2 : 1);
+		expect(capsuleEvents).toEqual(["message_start", "message_end"]);
 		expect(JSON.stringify(session.messages)).not.toContain("Obsolete task context");
 		expect(JSON.stringify(session.messages)).toContain("Inspect the retained artifact.");
 		if (shouldContinue) {
 			expect(JSON.stringify(mock.calls[1].context.messages)).not.toContain("Obsolete task context");
 			expect(JSON.stringify(mock.calls[1].context.messages)).toContain("Inspect the retained artifact.");
+		} else {
+			await session.prompt("Now inspect it");
+			expect(mock.calls).toHaveLength(2);
+			expect(JSON.stringify(mock.calls[1].context.messages)).toContain("Inspect the retained artifact.");
+		}
+		expect(
+			session.messages.filter(message => message.role === "custom" && message.customType === "scene-cut-message"),
+		).toHaveLength(1);
+		expect(
+			session.sessionManager
+				.buildSessionContext()
+				.messages.filter(message => message.role === "custom" && message.customType === "scene-cut-message"),
+		).toHaveLength(1);
+		expect(capsuleEvents).toEqual(["message_start", "message_end"]);
+	});
+
+	it("discards a staged scene cut when the user interrupts before application", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(tempDir),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		let interrupted: Promise<void> | undefined;
+		session.subscribe(event => {
+			if (event.type === "agent_end" && !interrupted) {
+				interrupted = session.abort({ reason: USER_INTERRUPT_LABEL });
+			}
+		});
+		session.stageSceneCut({
+			label: "Cancelled scene",
+			state: ["Done"],
+			objective: "Do not resume",
+			exit: "Done",
+			continue: true,
+		});
+		await session.prompt("Original task");
+		await interrupted;
+		await session.waitForIdle();
+		expect(mock.calls).toHaveLength(1);
+		expect(JSON.stringify(session.messages)).not.toContain("Cancelled scene");
+		await session.prompt("New user task");
+		expect(mock.calls).toHaveLength(2);
+		expect(JSON.stringify(mock.calls[1].context.messages)).not.toContain("Cancelled scene");
+	});
+
+	it.each(["abort", "dispose", "steer"] as const)(
+		"honors %s while preparing automatic scene continuation",
+		async action => {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+			const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+			const agent = new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [] },
+				streamFn: mock.stream,
+				convertToLlm,
+			});
+			const preparing = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			let preparations = 0;
+			const runtime = new ExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				pi => {
+					pi.on("before_agent_start", async () => {
+						if (++preparations === 2) {
+							preparing.resolve();
+							await release.promise;
+						}
+						return {
+							systemPrompt: ["Prepared scene policy"],
+							message: { customType: "scene-policy", content: "Prepared scene context", display: false },
+						};
+					});
+				},
+				tempDir,
+				new EventBus(),
+				runtime,
+				"scene-preparation",
+			);
+			const sessionManager = SessionManager.inMemory(tempDir);
+			const extensionRunner = new ExtensionRunner(
+				[extension],
+				runtime,
+				tempDir,
+				sessionManager,
+				sharedModelRegistry,
+			);
+			session = new AgentSession({
+				agent,
+				sessionManager,
+				extensionRunner,
+				settings: Settings.isolated(),
+				modelRegistry: sharedModelRegistry,
+			});
+			session.stageSceneCut({
+				label: "Next",
+				state: ["Prior task done"],
+				objective: "New scene objective",
+				exit: "Done",
+				continue: true,
+			});
+			const pending = session.prompt("Old scene");
+			await preparing.promise;
+			try {
+				if (action === "abort") await session.abort();
+				else if (action === "dispose") session.beginDispose();
+				else await session.prompt("User directive wins", { streamingBehavior: "steer" });
+			} finally {
+				release.resolve();
+			}
+			await pending;
+			await session.waitForIdle();
+			expect(mock.calls).toHaveLength(action === "steer" ? 2 : 1);
+			expect(
+				session.messages.filter(message => message.role === "custom" && message.customType === "scene-cut-message"),
+			).toHaveLength(1);
+			if (action === "steer") {
+				expect(JSON.stringify(mock.calls[1].context.messages)).toContain("User directive wins");
+				expect(JSON.stringify(mock.calls[1].context.messages)).toContain("Prepared scene context");
+				expect(mock.calls[1].context.systemPrompt).toEqual(["Prepared scene policy"]);
+				expect(preparations).toBe(3);
+			} else {
+				expect(
+					session.messages.filter(message => message.role === "custom" && message.customType === "scene-policy"),
+				).toHaveLength(0);
+				expect(preparations).toBe(2);
+			}
+		},
+	);
+
+	it("prepares each chained scene once and stops after eight automatic continuations", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let responses = 0;
+		const mock = createMockModel({
+			handler: () => {
+				session.stageSceneCut({
+					label: `Scene ${++responses}`,
+					state: ["Prior scene done"],
+					objective: `Objective ${responses}`,
+					exit: "Done",
+					continue: true,
+				});
+				return { content: ["Done"] };
+			},
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		const extensionRunner = {
+			emit: vi.fn().mockResolvedValue(undefined),
+			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+			hasHandlers: vi.fn().mockReturnValue(false),
+		} as unknown as ExtensionRunner;
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(tempDir),
+			extensionRunner,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		const continuations: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "scene_cut_applied") continuations.push(event.continuation);
+		});
+		await session.prompt("Start");
+		await session.waitForIdle();
+		expect(mock.calls).toHaveLength(9);
+		expect(extensionRunner.emitBeforeAgentStart).toHaveBeenCalledTimes(9);
+		expect(continuations).toEqual([...Array(8).fill("continue"), "limit"]);
+		for (const call of mock.calls.slice(1)) {
+			expect(JSON.stringify(call.context.messages).match(/# Scene: Scene /g)).toHaveLength(1);
 		}
 	});
 
