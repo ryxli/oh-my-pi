@@ -6308,27 +6308,30 @@ export class AgentSession implements SettingsScope {
 	}
 
 	async #applyPendingSceneCut(): Promise<void> {
+		if (this.#isDisposed) return;
 		const cut = this.#sceneCut.beginApply();
 		if (!cut) return;
 
 		try {
+			const content = prompt.render(sceneCutTemplate, { ...cut });
+			const message: CustomMessage<SceneCut> = {
+				role: "custom",
+				customType: SCENE_CUT_MESSAGE_TYPE,
+				content,
+				display: true,
+				details: cut,
+				attribution: "agent",
+				timestamp: Date.now(),
+			};
+			let generation: number;
 			{
 				// Keep the reset and canonical scene insertion behind one readiness
 				// barrier, but release it before a continuation can wait on readiness.
 				using _transition = this.#beginSessionTransition();
-				const reset = await this.resetSessionContext({ preserveAsyncJobs: true });
-				if (!reset) return;
+				const reset = this.resetSessionContext({ preserveAsyncJobs: true });
+				generation = this.#promptGeneration;
+				if (!(await reset) || this.#isDisposed) return;
 
-				const content = prompt.render(sceneCutTemplate, { ...cut });
-				const message: CustomMessage<SceneCut> = {
-					role: "custom",
-					customType: SCENE_CUT_MESSAGE_TYPE,
-					content,
-					display: true,
-					details: cut,
-					attribution: "agent",
-					timestamp: Date.now(),
-				};
 				this.sessionManager.appendCustomEntry(SCENE_CUT_CUSTOM_TYPE, cut);
 				this.sessionManager.appendCustomMessageEntry(
 					message.customType,
@@ -6338,6 +6341,10 @@ export class AgentSession implements SettingsScope {
 					message.attribution,
 				);
 				this.agent.appendMessage(message);
+				// Publish the durable capsule through the same live transcript path as
+				// an idle custom message, without persisting it again through agent events.
+				await this.#emitSessionEvent({ type: "message_start", message }, { detachExtensions: true });
+				await this.#emitSessionEvent({ type: "message_end", message }, { detachExtensions: true });
 				this.#sceneCut.completeApply();
 			}
 			const continuation = this.#sceneCut.claimAutomaticContinuation(cut);
@@ -6352,17 +6359,10 @@ export class AgentSession implements SettingsScope {
 			}
 			if (continuation === "wait") return;
 
-			this.#beginInFlight();
-			try {
-				if (!(await this.#runUsageAwarePreflightForNextModelCall())) return;
-				await this.agent.continue();
-				if (!this.#sceneCut.hasStaged) {
-					await this.#waitForPostPromptRecovery();
-				}
-			} finally {
-				this.#usagePreflightReadyForNextModelCall = false;
-				this.#endInFlight();
+			if (this.#isDisposed || this.#abortInProgress || this.#promptGeneration !== generation || this.isStreaming) {
+				return;
 			}
+			await this.#promptWithMessage(message, content, { messageAlreadyInContext: true });
 			// The next cut must see this continuation as settled: reset refuses
 			// while an in-flight prompt still contributes to isStreaming.
 			if (this.#sceneCut.hasStaged) {
@@ -8492,6 +8492,8 @@ export class AgentSession implements SettingsScope {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			acceptTerminalEmptyStop?: boolean;
+			/** Prepare a new turn from a capsule already durably appended and displayed. */
+			messageAlreadyInContext?: boolean;
 		},
 	): Promise<boolean> {
 		// Returns false when the prompt was dropped before reaching the agent —
@@ -8593,7 +8595,7 @@ export class AgentSession implements SettingsScope {
 			// promotion/summary can rebuild the base prompt and clear a roster delta
 			// it subsumes, avoiding a contradictory materialized notice.
 			const xdevMountNoticeIndex = messages.length;
-			messages.push(message);
+			if (!options?.messageAlreadyInContext) messages.push(message);
 			// Inject any pending "nextTurn" messages as context alongside the user message
 			for (const msg of this.#pendingNextTurnMessages) {
 				messages.push(msg);
@@ -10734,7 +10736,10 @@ export class AgentSession implements SettingsScope {
 	}): Promise<void> {
 		const userInterrupt = options?.reason === USER_INTERRUPT_LABEL;
 		this.#pendingAbortErrorId = userInterrupt ? AIError.create(AIError.Flag.UserInterrupt) : undefined;
-		if (userInterrupt) this.#advisors.autoResumeSuppressed = true;
+		if (userInterrupt) {
+			this.#advisors.autoResumeSuppressed = true;
+			this.#sceneCut.completeApply();
+		}
 		// Pull advisor concerns out of the steer/follow-up queues before any await so
 		// the post-abort stranded-message drain can't auto-resume the run on them.
 		// They are re-recorded as visible advice once the agent settles (below).
