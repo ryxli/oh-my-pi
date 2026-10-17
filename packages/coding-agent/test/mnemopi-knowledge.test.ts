@@ -19,6 +19,7 @@ import { SessionManager } from "../src/session/session-manager";
 import { BUILTIN_TOOLS, type ToolSession } from "../src/tools";
 import { MemoryRetainTool } from "../src/tools/memory-retain";
 import { KnowledgeTool } from "../src/tools/knowledge";
+import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 await Promise.all([loadMnemopi(), loadMnemopiCore()]);
@@ -797,16 +798,24 @@ describe("opt-in shared domain knowledge", () => {
 				expectedCurrentId: null,
 			}),
 		).rejects.toThrow("requires topic, key");
-		const receipt = await tool.execute("publish", {
-			op: "publish",
-			topic: "deployment",
-			key: "environment",
-			kind: "decision",
-			origin: "quoted",
-			content: "Use staging.",
-			sources: [{ type: "session", quote: "Use staging." }],
-			expectedCurrentId: null,
+		// Through argument validation, as the model's call arrives: it strips the
+		// optional null, so a first publish must still land as current.
+		const args = validateToolArguments(tool, {
+			type: "toolCall",
+			id: "publish",
+			name: tool.name,
+			arguments: {
+				op: "publish",
+				topic: "deployment",
+				key: "environment",
+				kind: "decision",
+				origin: "quoted",
+				content: "Use staging.",
+				sources: [{ type: "session", quote: "Use staging." }],
+				expectedCurrentId: null,
+			},
 		});
+		const receipt = await tool.execute("publish", tool.parameters.assert(args));
 		const record = knowledge(state).store.list("project-a", ["deployment"])[0];
 		expect(record.state).toBe("current");
 		expect(record.sources[0]).toMatchObject({ type: "session", entryId, sessionId: manager.getSessionId() });

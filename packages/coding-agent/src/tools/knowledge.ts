@@ -61,12 +61,9 @@ export class KnowledgeTool implements AgentTool<typeof knowledgeSchema> {
 			params.kind === undefined ||
 			params.origin === undefined ||
 			params.content === undefined ||
-			params.sources === undefined ||
-			params.expectedCurrentId === undefined
+			params.sources === undefined
 		) {
-			throw new Error(
-				"knowledge publish requires topic, key, kind, origin, content, sources, and expectedCurrentId (null for no current record at that key).",
-			);
+			throw new Error("knowledge publish requires topic, key, kind, origin, content, and sources.");
 		}
 		const record = await knowledge.publish({
 			topic: params.topic,
@@ -75,7 +72,10 @@ export class KnowledgeTool implements AgentTool<typeof knowledgeSchema> {
 			origin: params.origin,
 			content: params.content,
 			sources: params.sources,
-			expectedCurrentId: params.expectedCurrentId,
+			// Argument validation strips null from optional fields, so null and
+			// omitted both arrive as undefined. A wrong expectation still lands as
+			// a visible conflict in the store, never an overwrite.
+			expectedCurrentId: params.expectedCurrentId ?? null,
 		});
 		const receipt = {
 			id: record.id,

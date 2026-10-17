@@ -4,7 +4,7 @@ Generic retain, recall, reflect, memory_edit, and learn are disabled in this mod
 
 - `list`: return a bounded active snapshot grouped by `(topic, key)`, with current, candidate, conflict, and evidence freshness states.
 - `read`: supply an active record `id` and optional zero-based `sourceIndex` (default 0) to verify and read one selected source quote, original role, timestamp and parent ID when available.
-- `publish`: supply `topic`, `key`, `kind` (`decision`, `investigation`, `policy`), `origin` (`quoted`, `inferred`), `content`, `sources`, and `expectedCurrentId` (the current ID for that exact topic and key from list, or null when absent).
+- `publish`: supply `topic`, `key`, `kind` (`decision`, `investigation`, `policy`), `origin` (`quoted`, `inferred`), `content`, `sources`, and `expectedCurrentId` (the current ID for that exact topic and key from list; omit or null when absent).
 - `retract`: explicitly withdraw one active record by `id` in the configured domain and selected topics.
 
 Topics are coarse responsibility allowlists, not individual decisions.
