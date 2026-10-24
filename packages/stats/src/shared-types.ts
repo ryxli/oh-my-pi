@@ -670,8 +670,8 @@ export interface MemoryGraphFact {
 	id: string;
 	factType: MemoryFactType;
 	text: string;
-	/** ISO time the fact happened or was mentioned. */
-	date: string | null;
+	/** ISO time omp learned the fact (Hindsight mentioned_at), unlike the event time extraction may infer from text. */
+	learnedAt: string | null;
 	tags: string[];
 	/** Number of source facts behind an observation; 1 for plain facts. */
 	proofCount: number;
@@ -703,4 +703,17 @@ export interface MemoryGraphResponse {
 	limit: number;
 	nodes: MemoryGraphNode[];
 	edges: MemoryGraphEdge[];
+}
+
+/** One memory recalled by Hindsight's retrieval (semantic, keyword, graph, and temporal, then reranked). */
+export interface MemorySearchHit {
+	id: string;
+	factType: MemoryFactType;
+	text: string;
+	learnedAt: string | null;
+}
+
+/** `/api/memory/search` payload, best match first. */
+export interface MemorySearchResponse {
+	results: MemorySearchHit[];
 }

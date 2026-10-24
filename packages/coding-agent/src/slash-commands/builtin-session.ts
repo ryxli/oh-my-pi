@@ -1,6 +1,6 @@
 import { clearSubmittedText } from "./helpers/draft";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
-import { readHindsightMemoryGraph } from "../hindsight/memory-graph";
+import { hindsightStatsMemory } from "../hindsight/memory-graph";
 import { journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
 import type { AgentSession } from "../session/agent-session";
 import type { SessionOAuthAccountList } from "../session/agent-session-types";
@@ -202,7 +202,7 @@ function launchSessionStatsDashboard(
 	});
 	return launchStatsDashboard(args, {
 		judge: async () => judge,
-		memory: () => readHindsightMemoryGraph(owner.settings),
+		memory: hindsightStatsMemory(async () => owner.settings),
 	});
 }
 

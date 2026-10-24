@@ -39,7 +39,7 @@ import {
 	STATS_DASHBOARD_SECURITY_VERSION,
 } from "./port-conflict";
 import { getStatsByModel, getTimeSeries } from "./rollup";
-import type { MemoryGraphResponse } from "./shared-types";
+import type { MemoryGraphResponse, MemorySearchResponse } from "./shared-types";
 import {
 	buildSessionTrace,
 	getTraceEntry,
@@ -165,8 +165,13 @@ const ensureClientBuild = async () => {
 const STATS_ACTION_HEADER = "X-Omp-Stats-Action";
 
 /** Host-owned memory source: the host decides which backend, bank, and redaction apply. */
-export type StatsMemoryProvider = () => Promise<Omit<MemoryGraphResponse, "configured">>;
+export interface StatsMemoryProvider {
+	graph(): Promise<Omit<MemoryGraphResponse, "configured">>;
+	search(query: string): Promise<MemorySearchResponse>;
+}
 let memoryProvider: StatsMemoryProvider | undefined;
+/** Longest accepted memory search; retrieval embeds the whole query. */
+const MAX_MEMORY_QUERY_CHARS = 500;
 
 /**
  * Handle API requests.
@@ -194,8 +199,16 @@ export async function handleApi(req: Request): Promise<Response> {
 			};
 			return Response.json(empty);
 		}
-		const graph: MemoryGraphResponse = { configured: true, ...(await memoryProvider()) };
+		const graph: MemoryGraphResponse = { configured: true, ...(await memoryProvider.graph()) };
 		return Response.json(graph);
+	}
+
+	if (path === "/api/memory/search") {
+		const query = url.searchParams.get("q")?.trim() ?? "";
+		if (!query || query.length > MAX_MEMORY_QUERY_CHARS)
+			return Response.json({ error: `q must be 1-${MAX_MEMORY_QUERY_CHARS} characters` }, { status: 400 });
+		const empty: MemorySearchResponse = { results: [] };
+		return Response.json(memoryProvider ? await memoryProvider.search(query) : empty);
 	}
 
 	if (path === "/api/stats") {

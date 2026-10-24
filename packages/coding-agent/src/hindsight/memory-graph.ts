@@ -1,10 +1,12 @@
 import { type } from "@oh-my-pi/omptype";
+import type { StatsMemoryProvider } from "@oh-my-pi/omp-stats";
 import type {
 	MemoryFactType,
 	MemoryGraphEdge,
 	MemoryGraphEntity,
 	MemoryGraphFact,
 	MemoryGraphResponse,
+	MemorySearchResponse,
 } from "@oh-my-pi/omp-stats/shared-types";
 import type { Settings } from "../config/settings";
 import { redactMemorySecrets } from "../memory-backend/redact";
@@ -15,12 +17,14 @@ import { isHindsightConfigured, loadHindsightConfig } from "./config";
 /** Newest units drawn; the canvas stays interactive well past this, the JSON stays a few MB. */
 const MEMORY_GRAPH_LIMIT = 6000;
 const PAGE_SIZE = 1000;
+/** Recall token budget for a page search: ~50 memories, about 1.5 s on the local reranker. */
+const SEARCH_MAX_TOKENS = 4096;
 
 const MemoryUnitPage = type({
 	items: type({
 		id: "string",
 		text: "string",
-		date: "string | null",
+		mentioned_at: "string | null",
 		fact_type: "string | null",
 		entities: "string",
 		tags: "string[]",
@@ -31,7 +35,23 @@ const MemoryUnitPage = type({
 	total: "number",
 });
 
+const RecallPage = type({
+	results: type({ id: "string", text: "string", "type?": "string | null", "mentioned_at?": "string | null" }).array(),
+});
+
 const FACT_TYPES: readonly MemoryFactType[] = ["world", "experience", "observation"];
+
+function factTypeOf(raw: string | null | undefined): MemoryFactType {
+	return FACT_TYPES.find(candidate => candidate === raw) ?? "world";
+}
+
+/** Stats Memory page source over the Hindsight bank the loaded settings select. */
+export function hindsightStatsMemory(loadSettings: () => Promise<Settings>): StatsMemoryProvider {
+	return {
+		graph: async () => readHindsightMemoryGraph(await loadSettings()),
+		search: async query => searchHindsightMemory(await loadSettings(), query),
+	};
+}
 
 /**
  * Projects the session's Hindsight bank into the stats Memory page: memory units,
@@ -54,13 +74,13 @@ export async function readHindsightMemoryGraph(settings: Settings): Promise<Omit
 		totalMemories = page.total;
 		for (const unit of page.items) {
 			if (unit.state !== "valid") continue;
-			const factType = FACT_TYPES.find(candidate => candidate === unit.fact_type) ?? "world";
+			const factType = factTypeOf(unit.fact_type);
 			facts.push({
 				type: "fact",
 				id: unit.id,
 				factType,
 				text: redactMemorySecrets(unit.text),
-				date: unit.date,
+				learnedAt: unit.mentioned_at,
 				tags: unit.tags,
 				proofCount: unit.proof_count,
 			});
@@ -87,5 +107,22 @@ export async function readHindsightMemoryGraph(settings: Settings): Promise<Omit
 		limit: MEMORY_GRAPH_LIMIT,
 		nodes: [...facts, ...mentions.values()],
 		edges,
+	};
+}
+
+/** Ranked recall over the whole bank; uses Hindsight's local embedder and reranker, no LLM. */
+export async function searchHindsightMemory(settings: Settings, query: string): Promise<MemorySearchResponse> {
+	const config = loadHindsightConfig(settings);
+	if (!isHindsightConfigured(config)) return { results: [] };
+	const client = createHindsightClient(config);
+	const { bankId } = computeBankScope(config, settings.getCwd());
+	const recalled = RecallPage.assert(await client.recall(bankId, query, { maxTokens: SEARCH_MAX_TOKENS }));
+	return {
+		results: recalled.results.map(hit => ({
+			id: hit.id,
+			factType: factTypeOf(hit.type),
+			text: redactMemorySecrets(hit.text),
+			learnedAt: hit.mentioned_at ?? null,
+		})),
 	};
 }

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { Settings } from "../src/config/settings";
-import { readHindsightMemoryGraph } from "../src/hindsight/memory-graph";
+import { readHindsightMemoryGraph, searchHindsightMemory } from "../src/hindsight/memory-graph";
 
 const servers: { stop: (force?: boolean) => void }[] = [];
 afterEach(() => {
@@ -11,7 +11,7 @@ function unit(id: string, overrides: Record<string, unknown> = {}) {
 	return {
 		id,
 		text: `fact ${id}`,
-		date: "2026-10-23T00:00:00Z",
+		mentioned_at: "2026-10-23T00:00:00Z",
 		fact_type: "world",
 		entities: "",
 		tags: ["project:firstmate"],
@@ -80,5 +80,43 @@ describe("readHindsightMemoryGraph", () => {
 	it("returns an empty graph when Hindsight is not configured", async () => {
 		const graph = await readHindsightMemoryGraph(Settings.isolated({ "hindsight.apiUrl": "" }));
 		expect(graph).toEqual({ bankId: null, totalMemories: 0, limit: 0, nodes: [], edges: [] });
+	});
+});
+
+describe("searchHindsightMemory", () => {
+	it("recalls over the bank and returns redacted hits in rank order", async () => {
+		const secret = `ghp_${"b".repeat(36)}`;
+		const queries: unknown[] = [];
+		const server = Bun.serve({
+			port: 0,
+			async fetch(request) {
+				queries.push({ path: new URL(request.url).pathname, body: await request.json() });
+				return Response.json({
+					results: [
+						{ id: "r1", text: `token ${secret}`, type: "experience", mentioned_at: "2026-10-22T00:00:00Z" },
+						{ id: "r2", text: "plain", type: "mystery" },
+					],
+				});
+			},
+		});
+		servers.push(server);
+		const settings = Settings.isolated({
+			"hindsight.apiUrl": `http://127.0.0.1:${server.port}`,
+			"hindsight.scoping": "global",
+		});
+
+		const response = await searchHindsightMemory(settings, "cluster-a reservations");
+
+		expect(queries).toEqual([
+			{
+				path: "/v1/default/banks/omp/memories/recall",
+				body: expect.objectContaining({ query: "cluster-a reservations" }),
+			},
+		]);
+		expect(response.results.map(hit => [hit.id, hit.factType, hit.learnedAt])).toEqual([
+			["r1", "experience", "2026-10-22T00:00:00Z"],
+			["r2", "world", null],
+		]);
+		expect(JSON.stringify(response)).not.toContain(secret);
 	});
 });

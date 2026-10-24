@@ -6,6 +6,7 @@ import type {
 	FrustrationJobStatus,
 	GainDashboardStats,
 	MemoryGraphResponse,
+	MemorySearchResponse,
 	LiveStatus,
 	MessageStats,
 	ModelDashboardStats,
@@ -237,4 +238,9 @@ export async function getSessionEntryDetail(
 /** The host's memory graph (Hindsight): newest memory units, their entities, and observation provenance. */
 export async function getMemoryGraph(signal?: AbortSignal): Promise<MemoryGraphResponse> {
 	return fetchJson<MemoryGraphResponse>(`${API_BASE}/memory/graph`, { signal });
+}
+
+/** Hindsight recall over the whole bank, best match first. */
+export async function searchMemory(query: string, signal?: AbortSignal): Promise<MemorySearchResponse> {
+	return fetchJson<MemorySearchResponse>(`${API_BASE}/memory/search?q=${encodeURIComponent(query)}`, { signal });
 }

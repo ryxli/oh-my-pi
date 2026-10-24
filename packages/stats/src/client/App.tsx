@@ -64,7 +64,7 @@ function Dashboard() {
 			case "gain":
 				return <GainRoute active={active} range={range} />;
 			case "memory":
-				return <MemoryRoute active={active} />;
+				return <MemoryRoute active={active} range={range} />;
 		}
 	};
 
