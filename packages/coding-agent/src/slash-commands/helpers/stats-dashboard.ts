@@ -71,22 +71,22 @@ export function parseStatsDashboardArgs(args: string): StatsDashboardArgs | { er
 /**
  * Start (or reuse) the dashboard and open it, without waiting for ingest: the
  * server syncs sessions in the background and streams progress to the page.
- * `judge` powers the Frustration page's judge runs; a later launch replaces
- * the registered one, so the dashboard always judges through the most recent
- * session.
+ * `judge` powers the Frustration page's judge runs and `memory` the Memory
+ * page; a later launch replaces the registered ones, so the dashboard always
+ * reflects the most recent session.
  */
 export async function launchStatsDashboard(
 	args: StatsDashboardArgs,
-	judge?: stats.StatsJudgeProvider,
+	options: stats.StartServerOptions = {},
 ): Promise<StatsDashboardLaunchResult> {
 	let requestedAddressIgnored = false;
 
 	if (!activeStatsServer) {
-		activeStatsServer = await stats.startServer(args.port, args.host, { judge });
+		activeStatsServer = await stats.startServer(args.port, args.host, options);
 	} else {
 		requestedAddressIgnored = args.port !== activeStatsServer.port || args.host !== activeStatsServer.hostname;
-		// Resolves to the live in-process server; only re-registers the judge.
-		if (judge) await stats.startServer(activeStatsServer.port, activeStatsServer.hostname, { judge });
+		// Resolves to the live in-process server; only re-registers the providers.
+		await stats.startServer(activeStatsServer.port, activeStatsServer.hostname, options);
 	}
 
 	const url = stats.formatStatsDashboardUrl(activeStatsServer.hostname, activeStatsServer.port);

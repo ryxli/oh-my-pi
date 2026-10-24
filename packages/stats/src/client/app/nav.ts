@@ -7,6 +7,7 @@ import {
 	Frown,
 	LayoutGrid,
 	type LucideIcon,
+	Network,
 	PlugZap,
 	Sparkles,
 	SquareChartGantt,
@@ -24,7 +25,8 @@ export type DashboardSection =
 	| "tools"
 	| "frustration"
 	| "projects"
-	| "gain";
+	| "gain"
+	| "memory";
 
 export interface NavItem {
 	id: DashboardSection;
@@ -65,6 +67,7 @@ export const NAV: readonly NavGroup[] = [
 			{ id: "frustration", label: "Frustration", icon: Frown, hotkey: "f" },
 			{ id: "projects", label: "Projects", icon: FolderGit2, hotkey: "j" },
 			{ id: "gain", label: "Gain", icon: Sparkles, hotkey: "g" },
+			{ id: "memory", label: "Memory", icon: Network, hotkey: "y" },
 		],
 	},
 ];

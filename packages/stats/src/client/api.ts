@@ -5,6 +5,7 @@ import type {
 	FrustrationEstimate,
 	FrustrationJobStatus,
 	GainDashboardStats,
+	MemoryGraphResponse,
 	LiveStatus,
 	MessageStats,
 	ModelDashboardStats,
@@ -231,4 +232,9 @@ export async function getSessionEntryDetail(
 		`${API_BASE}/session/entry?file=${encodeURIComponent(file)}&id=${encodeURIComponent(id)}`,
 		{ signal },
 	);
+}
+
+/** The host's memory graph (Hindsight): newest memory units, their entities, and observation provenance. */
+export async function getMemoryGraph(signal?: AbortSignal): Promise<MemoryGraphResponse> {
+	return fetchJson<MemoryGraphResponse>(`${API_BASE}/memory/graph`, { signal });
 }

@@ -660,3 +660,47 @@ export interface SessionTrace {
 	tracks: TraceTrack[];
 	summary: TraceSummary;
 }
+
+/** Hindsight memory unit kinds: world facts, the agent's own experiences, and consolidated observations. */
+export type MemoryFactType = "world" | "experience" | "observation";
+
+/** One memory unit; observations carry the facts they were consolidated from. */
+export interface MemoryGraphFact {
+	type: "fact";
+	id: string;
+	factType: MemoryFactType;
+	text: string;
+	/** ISO time the fact happened or was mentioned. */
+	date: string | null;
+	tags: string[];
+	/** Number of source facts behind an observation; 1 for plain facts. */
+	proofCount: number;
+}
+
+/** A named entity that memory units mention; `mentions` counts the loaded units that name it. */
+export interface MemoryGraphEntity {
+	type: "entity";
+	id: string;
+	name: string;
+	mentions: number;
+}
+
+export type MemoryGraphNode = MemoryGraphFact | MemoryGraphEntity;
+
+/** `mentions` links a fact to an entity; `derived-from` links an observation to a source fact. */
+export interface MemoryGraphEdge {
+	source: string;
+	target: string;
+	type: "mentions" | "derived-from";
+}
+
+/** `/api/memory/graph` payload; `configured` is false when the host registered no memory source. */
+export interface MemoryGraphResponse {
+	configured: boolean;
+	bankId: string | null;
+	/** Valid memory units in the bank; `nodes` holds at most the newest `limit` of them. */
+	totalMemories: number;
+	limit: number;
+	nodes: MemoryGraphNode[];
+	edges: MemoryGraphEdge[];
+}

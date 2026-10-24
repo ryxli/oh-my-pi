@@ -3,6 +3,7 @@ import { parseHTML } from "@oh-my-pi/pi-utils/dom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { getSessionTrace } from "../src/client/api";
+import { LiveProvider } from "../src/client/data/live";
 import { type QueryResult, useQuery } from "../src/client/data/query";
 import { inflightRequest, loadQuery, releaseQuery } from "../src/client/data/query-store";
 import type { SessionTrace } from "../src/client/types";
@@ -193,5 +194,47 @@ describe("trace revalidation", () => {
 		expect(ifNoneMatch).toEqual([null, '"v1"']);
 		expect(jsonSpy).toHaveBeenCalledTimes(1);
 		expect(results.at(-1)?.data).toBe(first);
+	});
+});
+
+describe("live revalidation", () => {
+	it("refetches live queries when the data version advances, never queries that opt out", async () => {
+		class FakeEventSource {
+			static current: FakeEventSource | null = null;
+			onopen: (() => void) | null = null;
+			onerror: (() => void) | null = null;
+			onmessage: ((event: { data: string }) => void) | null = null;
+			constructor() {
+				FakeEventSource.current = this;
+			}
+			close(): void {}
+		}
+		const view = mount();
+		installGlobal("EventSource", FakeEventSource);
+		const key = freshKey();
+		const calls = { live: 0, pinned: 0 };
+		function LiveProbe({ name, live }: { name: "live" | "pinned"; live: boolean }) {
+			useQuery([key, name], async () => ++calls[name], { live });
+			return null;
+		}
+		await act(async () =>
+			view.render(
+				<LiveProvider>
+					<LiveProbe name="live" live />
+					<LiveProbe name="pinned" live={false} />
+				</LiveProvider>,
+			),
+		);
+		expect(calls).toEqual({ live: 1, pinned: 1 });
+
+		// Past the refetch throttle; two distinct server versions always advance the client version.
+		vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_000);
+		const sync = { phase: "idle", current: 0, total: 0, processed: 0, lastSyncedAt: null, error: null };
+		await act(async () => {
+			for (const version of [1_000_000 + keySeq * 10, 1_000_001 + keySeq * 10])
+				FakeEventSource.current?.onmessage?.({ data: JSON.stringify({ version, sync, indexingHours: 0 }) });
+		});
+		expect(calls.live).toBeGreaterThan(1);
+		expect(calls.pinned).toBe(1);
 	});
 });

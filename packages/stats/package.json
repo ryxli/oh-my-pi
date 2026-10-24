@@ -45,12 +45,14 @@
     "@oh-my-pi/pi-ai": "catalog:",
     "@oh-my-pi/pi-catalog": "catalog:",
     "@oh-my-pi/pi-utils": "catalog:",
+    "d3-force": "^3.0.0",
     "lucide-react": "catalog:",
     "react": "catalog:",
     "react-dom": "catalog:"
   },
   "devDependencies": {
     "@types/bun": "catalog:",
+    "@types/d3-force": "^3.0.10",
     "@types/react": "catalog:",
     "@types/react-dom": "catalog:"
   },

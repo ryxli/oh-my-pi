@@ -39,6 +39,7 @@ import {
 	STATS_DASHBOARD_SECURITY_VERSION,
 } from "./port-conflict";
 import { getStatsByModel, getTimeSeries } from "./rollup";
+import type { MemoryGraphResponse } from "./shared-types";
 import {
 	buildSessionTrace,
 	getTraceEntry,
@@ -163,6 +164,10 @@ const ensureClientBuild = async () => {
  */
 const STATS_ACTION_HEADER = "X-Omp-Stats-Action";
 
+/** Host-owned memory source: the host decides which backend, bank, and redaction apply. */
+export type StatsMemoryProvider = () => Promise<Omit<MemoryGraphResponse, "configured">>;
+let memoryProvider: StatsMemoryProvider | undefined;
+
 /**
  * Handle API requests.
  */
@@ -175,6 +180,22 @@ export async function handleApi(req: Request): Promise<Response> {
 
 	if (path === "/api/status") {
 		return Response.json(statsLive().status());
+	}
+
+	if (path === "/api/memory/graph") {
+		if (!memoryProvider) {
+			const empty: MemoryGraphResponse = {
+				configured: false,
+				bankId: null,
+				totalMemories: 0,
+				limit: 0,
+				nodes: [],
+				edges: [],
+			};
+			return Response.json(empty);
+		}
+		const graph: MemoryGraphResponse = { configured: true, ...(await memoryProvider()) };
+		return Response.json(graph);
 	}
 
 	if (path === "/api/stats") {
@@ -494,6 +515,8 @@ let liveServers = 0;
 export interface StartServerOptions {
 	/** Host judge for the Frustration dashboard's judge runs; replaces any previously registered one. */
 	judge?: StatsJudgeProvider;
+	/** Host memory graph for the Memory page; replaces any previously registered source. */
+	memory?: StatsMemoryProvider;
 }
 
 export async function startServer(
@@ -502,6 +525,7 @@ export async function startServer(
 	options: StartServerOptions = {},
 ): Promise<StatsServerHandle> {
 	if (options.judge) setStatsJudgeProvider(options.judge);
+	if (options.memory) memoryProvider = options.memory;
 	const activeKey = `${hostname}:${port}`;
 	if (port !== 0) {
 		const active = activeServers.get(activeKey);

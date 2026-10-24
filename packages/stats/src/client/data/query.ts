@@ -27,6 +27,8 @@ export interface QueryOptions {
 	enabled?: boolean;
 	/** Additionally refetch on this interval while enabled and the tab is visible. */
 	pollMs?: number;
+	/** Refetch when the stats data version advances. Data not stored in the stats DB passes `false`. Default true. */
+	live?: boolean;
 }
 
 export interface QueryResult<T> {
@@ -57,7 +59,7 @@ export function useQuery<T>(key: readonly unknown[], fetcher: QueryFetcher<T>, o
 	const keyString = JSON.stringify(key);
 	const enabled = options?.enabled ?? true;
 	const pollMs = options?.pollMs;
-	const version = useLiveVersion(enabled);
+	const version = useLiveVersion(enabled && (options?.live ?? true));
 
 	const [, rerender] = useReducer((n: number) => n + 1, 0);
 	const [error, setError] = useState<{ key: string; error: Error } | null>(null);
