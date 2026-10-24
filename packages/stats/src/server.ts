@@ -40,6 +40,7 @@ import {
 } from "./port-conflict";
 import { getStatsByModel, getTimeSeries } from "./rollup";
 import { getSpotlightDashboardStats, getSpotlightSessionContext } from "./spotlight-aggregator";
+import type { MemoryGraphResponse, MemorySearchResponse } from "./shared-types";
 import {
 	buildSessionTrace,
 	getTraceEntry,
@@ -205,6 +206,15 @@ export function setStatsCloseHandler(close: (() => void) | undefined): void {
 	closeHandler = close;
 }
 
+/** Host-owned memory source: the host decides which backend, bank, and redaction apply. */
+export interface StatsMemoryProvider {
+	graph(): Promise<MemoryGraphResponse>;
+	search(query: string): Promise<MemorySearchResponse>;
+}
+let memoryProvider: StatsMemoryProvider | undefined;
+/** Longest accepted memory search; retrieval embeds the whole query. */
+const MAX_MEMORY_QUERY_CHARS = 500;
+
 /**
  * Handle API requests.
  */
@@ -217,6 +227,28 @@ export async function handleApi(req: Request): Promise<Response> {
 
 	if (path === "/api/status") {
 		return Response.json(statsLive().status());
+	}
+
+	if (path === "/api/memory/graph") {
+		if (!memoryProvider) {
+			const empty: MemoryGraphResponse = {
+				bankId: null,
+				totalMemories: 0,
+				limit: 0,
+				nodes: [],
+				edges: [],
+			};
+			return Response.json(empty);
+		}
+		return Response.json(await memoryProvider.graph());
+	}
+
+	if (path === "/api/memory/search") {
+		const query = url.searchParams.get("q")?.trim() ?? "";
+		if (!query || query.length > MAX_MEMORY_QUERY_CHARS)
+			return Response.json({ error: `q must be 1-${MAX_MEMORY_QUERY_CHARS} characters` }, { status: 400 });
+		const empty: MemorySearchResponse = { results: [] };
+		return Response.json(memoryProvider ? await memoryProvider.search(query) : empty);
 	}
 
 	if (path === "/api/stats") {
@@ -562,6 +594,8 @@ let liveServers = 0;
 export interface StartServerOptions {
 	/** Host judge for the Frustration dashboard's judge runs; replaces any previously registered one. */
 	judge?: StatsJudgeProvider;
+	/** Host memory graph for the Memory page; replaces any previously registered source. */
+	memory?: StatsMemoryProvider;
 }
 
 /**
@@ -576,6 +610,7 @@ export async function startServer(
 	options: StartServerOptions = {},
 ): Promise<StatsServerHandle> {
 	if (options.judge) setStatsJudgeProvider(options.judge);
+	if (options.memory) memoryProvider = options.memory;
 	const requestedKey = `${hostname}:${port}`;
 	if (port !== 0) {
 		const active = activeServers.get(requestedKey);

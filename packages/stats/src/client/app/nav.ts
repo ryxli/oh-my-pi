@@ -7,6 +7,7 @@ import {
 	Frown,
 	LayoutGrid,
 	type LucideIcon,
+	Network,
 	PlugZap,
 	ScanSearch,
 	Sparkles,
@@ -26,7 +27,8 @@ export type DashboardSection =
 	| "frustration"
 	| "projects"
 	| "gain"
-	| "spotlight";
+	| "spotlight"
+	| "memory";
 
 export interface NavItem {
 	id: DashboardSection;
@@ -68,6 +70,7 @@ export const NAV: readonly NavGroup[] = [
 			{ id: "projects", label: "Projects", icon: FolderGit2, hotkey: "j" },
 			{ id: "gain", label: "Gain", icon: Sparkles, hotkey: "g" },
 			{ id: "spotlight", label: "Spotlight", icon: ScanSearch, hotkey: "s" },
+			{ id: "memory", label: "Memory", icon: Network, hotkey: "y" },
 		],
 	},
 ];
