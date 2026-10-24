@@ -8,6 +8,7 @@ import {
 	ErrorsRoute,
 	FrustrationRoute,
 	GainRoute,
+	MemoryRoute,
 	ModelsRoute,
 	OverviewRoute,
 	ProjectsRoute,
@@ -65,6 +66,8 @@ function Dashboard() {
 				return <GainRoute active={active} range={range} />;
 			case "spotlight":
 				return <SpotlightRoute active={active} range={range} />;
+			case "memory":
+				return <MemoryRoute active={active} range={range} />;
 		}
 	};
 
