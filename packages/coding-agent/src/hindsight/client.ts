@@ -127,6 +127,8 @@ export interface RecallOptions extends HindsightRequestOptions {
 	budget?: Budget;
 	tags?: string[];
 	tagsMatch?: TagsMatch;
+	/** Per-stage score floors; `reranker` (0-1) drops weak matches from every result, so recall can return nothing. */
+	minScores?: { reranker?: number };
 }
 
 export interface ReflectOptions extends HindsightRequestOptions {
@@ -366,6 +368,7 @@ export class HindsightApi implements HindsightClientApi {
 					budget: options?.budget ?? "mid",
 					tags: options?.tags,
 					tags_match: options?.tagsMatch,
+					min_scores: options?.minScores,
 				},
 				signal: options?.signal,
 				timeoutMs: this.#recallTimeoutMs,
