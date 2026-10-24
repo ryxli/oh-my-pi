@@ -147,7 +147,7 @@ export function modelPresetShadowOwner(
 const SOURCE_LABELS: Record<SettingProvenance, string> = {
 	env: "environment",
 	runtime: "command line",
-	overlay: "--config file",
+	overlay: "config.local.yml or --config file",
 	project: "project config",
 	global: "global config",
 	default: "default",
