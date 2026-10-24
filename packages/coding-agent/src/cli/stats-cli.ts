@@ -8,6 +8,8 @@ import { formatKeyHint } from "@oh-my-pi/pi-tui/key-hint-format";
 import { truncateToWidth } from "@oh-my-pi/pi-tui/utils";
 import { postmortem } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
+import { Settings } from "../config/settings";
+import { hindsightStatsMemory } from "../hindsight/memory-graph";
 import { openStandaloneJudge } from "../judgment/standalone";
 import { openTernPage } from "../tools/browser/tern/user-page";
 import { openPath } from "../utils/open";
@@ -111,6 +113,7 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 	const cwd = process.cwd();
 	const { hostname, port } = await startServer(cmd.port, cmd.host, {
 		judge: async () => (await openStandaloneJudge(cwd, "stats_frustration")).judge,
+		memory: hindsightStatsMemory(() => Settings.init({ cwd })),
 	});
 	const url = formatStatsDashboardUrl(hostname, port);
 	console.log(chalk.green(`Dashboard available at: ${url}`));

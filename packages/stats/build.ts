@@ -4,9 +4,10 @@ import * as fs from "node:fs/promises";
 await fs.rm("./dist/client", { recursive: true, force: true });
 
 // Bundle the React app. CSS imported from TSX modules is emitted alongside as index.css.
+// The Memory page's layout worker is its own entry, served beside index.js.
 console.log("Building dashboard client...");
 const result = await Bun.build({
-	entrypoints: ["./src/client/index.tsx"],
+	entrypoints: ["./src/client/index.tsx", "./src/client/memory-layout-worker.ts"],
 	outdir: "./dist/client",
 	minify: true,
 	naming: "[dir]/[name].[ext]",

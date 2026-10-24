@@ -1,5 +1,6 @@
 import { clearSubmittedText } from "./helpers/draft";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
+import { hindsightStatsMemory } from "../hindsight/memory-graph";
 import { journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
 import type { AgentSession } from "../session/agent-session";
 import type { SessionOAuthAccountList } from "../session/agent-session-types";
@@ -200,7 +201,10 @@ function launchSessionStatsDashboard(
 		telemetry: owner.session.agent.telemetry,
 		cache: sharedJudgmentCache(),
 	});
-	return launchStatsDashboard(args, async () => judge);
+	return launchStatsDashboard(args, {
+		judge: async () => judge,
+		memory: hindsightStatsMemory(async () => owner.settings),
+	});
 }
 
 export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
