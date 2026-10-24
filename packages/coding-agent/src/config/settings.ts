@@ -58,6 +58,12 @@ import "./all-settings";
 import { cfgModelRoles, cfgModelRoleStorage } from "./model-settings";
 import { cfgShellPath } from "../exec/settings";
 
+/**
+ * Machine-local settings beside config.yml, loaded as the lowest-precedence overlay when present.
+ * Like every overlay it is read and never written, so its values cannot reach a synced config.yml.
+ */
+const LOCAL_CONFIG_FILENAME = "config.local.yml";
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Types
 // ═══════════════════════════════════════════════════════════════════════════
@@ -584,6 +590,8 @@ export class Settings {
 	#storage: AgentStorage | null = null;
 
 	#configFiles: string[] = [];
+	/** The agent directory's config.local.yml; null for in-memory settings. */
+	#localConfigPath: string | null;
 	/** Global settings from config.yml/config.yaml */
 	#global: RawSettings = {};
 	/** Project settings from .claude/settings.yml etc */
@@ -673,6 +681,7 @@ export class Settings {
 		this.#cwd = path.normalize(options.cwd ?? getProjectDir());
 		this.#agentDir = path.normalize(options.agentDir ?? getAgentDir());
 		this.#configPath = options.inMemory ? null : path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]);
+		this.#localConfigPath = options.inMemory ? null : path.join(this.#agentDir, LOCAL_CONFIG_FILENAME);
 		const configFiles = process.env.PI_CONFIG_FILES?.split(path.delimiter).filter(Boolean) ?? [];
 		if (options.configFiles) configFiles.push(...options.configFiles);
 		this.#configFiles = configFiles.map(file => path.resolve(this.#cwd, expandTilde(file)));
@@ -1178,6 +1187,7 @@ export class Settings {
 		addFile(path.join(projectConfigDir, "settings.json"));
 		addFile(path.join(projectCwd, ".claude", "settings.json"));
 		for (const file of this.#projectSourcePaths) addFile(file);
+		if (this.#localConfigPath) addFile(this.#localConfigPath);
 		for (const file of this.#configFiles) addFile(file);
 		return targets;
 	}
@@ -1411,7 +1421,7 @@ export class Settings {
 				refreshed.push({
 					layer: "configOverlay",
 					settings,
-					source: this.#configFiles.join(", "),
+					source: [this.#localConfigPath, ...this.#configFiles].filter(Boolean).join(", "),
 					commit: () => {
 						this.#overlayShellPathSource = shellPathSource;
 					},
@@ -2487,7 +2497,10 @@ export class Settings {
 	async #readConfigOverlays(captureLegacyChangelogVersion = true): Promise<ConfigOverlayReadResult> {
 		let shellPathSource: string | undefined;
 		let settings: RawSettings = {};
-		for (const filePath of this.#configFiles) {
+		// Absent is the normal case for the local file; explicit overlays must exist and load after it.
+		const hasLocalConfig = this.#localConfigPath !== null && (await Bun.file(this.#localConfigPath).exists());
+		const files = hasLocalConfig ? [this.#localConfigPath!, ...this.#configFiles] : this.#configFiles;
+		for (const filePath of files) {
 			const overlay = await this.#loadOverlayYaml(filePath, captureLegacyChangelogVersion);
 			settings = this.#deepMerge(settings, overlay);
 			if (Object.hasOwn(overlay, "shellPath")) shellPathSource = filePath;

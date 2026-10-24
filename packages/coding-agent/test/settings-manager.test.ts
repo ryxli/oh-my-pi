@@ -177,6 +177,22 @@ describe("Settings", () => {
 		});
 	});
 
+	describe("machine-local config", () => {
+		it("layers config.local.yml over config.yml and never writes its values into config.yml", async () => {
+			await writeSettings({ theme: { dark: "anthracite" } });
+			await Bun.write(path.join(agentDir, "config.local.yml"), YAML.stringify({ theme: { dark: "titanium" } }));
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(cfgThemeDark.get(settings)).toBe("titanium");
+			expect(settings.getProvenance(cfgThemeDark)).toBe("overlay");
+
+			cfgSetupVersion.set(settings, 2);
+			await settings.flush();
+
+			expect(await readSettings()).toEqual({ theme: { dark: "anthracite" }, setupVersion: 2 });
+		});
+	});
+
 	describe("main config file selection", () => {
 		it("loads and updates an existing config.yaml without creating config.yml", async () => {
 			const yamlConfigPath = path.join(agentDir, "config.yaml");
