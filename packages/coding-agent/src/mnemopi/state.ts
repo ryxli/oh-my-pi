@@ -287,9 +287,14 @@ export class MnemopiSessionState {
 	}
 
 	resetConversationTracking(): void {
-		this.#recallGeneration++;
+		this.resetRecall();
 		this.lastRetainedTurn = 0;
 		this.#retentionCursorLoaded = false;
+	}
+
+	/** Forget the recall made for the conversation so far; the next prompt recalls again. */
+	resetRecall(): void {
+		this.#recallGeneration++;
 		this.hasRecalledForFirstTurn = false;
 		this.lastRecallSnippet = undefined;
 	}

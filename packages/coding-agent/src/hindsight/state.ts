@@ -24,6 +24,12 @@ import { countUserTurns, extractMessages } from "./transcript";
 const RETAIN_FLUSH_BATCH_SIZE = 16;
 const RETAIN_FLUSH_INTERVAL_MS = 5_000;
 const MENTAL_MODEL_LOAD_TIMED_OUT = Symbol("mental-model-load-timed-out");
+/**
+ * Reranker floor (0-1) for memories injected without being asked. Measured 2026-10-23 on 40 real
+ * session openers: 70% of recalled memories scored under 0.05 and clearly relevant ones 0.6-0.999;
+ * at 0.3 three in four sessions inject nothing instead of ~15 unrelated memories.
+ */
+const AUTO_RECALL_MIN_RERANKER_SCORE = 0.3;
 
 interface PendingRetainItem {
 	content: string;
@@ -275,13 +281,18 @@ export class HindsightSessionState {
 	}
 
 	resetConversationTracking(): void {
-		this.#recallGeneration++;
+		this.resetRecall();
 		this.lastRetainedTurn = 0;
-		this.hasRecalledForFirstTurn = false;
-		this.lastRecallSnippet = undefined;
 		this.#lastRetainedMessageIndex = 0;
 		this.#cachedTranscript = "";
 		this.#lastRetainedPrefixKey = "";
+	}
+
+	/** Forget the recall made for the conversation so far; the next prompt recalls again. */
+	resetRecall(): void {
+		this.#recallGeneration++;
+		this.hasRecalledForFirstTurn = false;
+		this.lastRecallSnippet = undefined;
 	}
 
 	enqueueRetain(content: string, context?: string): void {
@@ -300,6 +311,7 @@ export class HindsightSessionState {
 				types: this.config.recallTypes.length > 0 ? this.config.recallTypes : undefined,
 				tags: this.recallTags,
 				tagsMatch: this.recallTagsMatch,
+				minScores: { reranker: AUTO_RECALL_MIN_RERANKER_SCORE },
 				signal,
 			});
 			if (signal?.aborted) return { context: null, ok: false };
@@ -459,7 +471,13 @@ export class HindsightSessionState {
 		const queryMessages = [...history, { role: "user" as const, content: latestPrompt }];
 		const query = composeRecallQuery(latestPrompt, queryMessages, this.config.recallContextTurns);
 		const truncated = truncateRecallQuery(query, latestPrompt, this.config.recallMaxQueryChars);
-		const { context, ok } = await this.recallForContext(truncated, signal);
+		// After a compaction the opening prompt is often a short follow-up ("yes", "go"); the summary
+		// opens with the work in progress, so its head leads the query within the same character budget.
+		const compaction = this.session.sessionManager.getBranch().findLast(entry => entry.type === "compaction");
+		const maxChars = this.config.recallMaxQueryChars;
+		const room = maxChars > 0 ? maxChars - truncated.length - 2 : Number.POSITIVE_INFINITY;
+		const recallQuery = compaction && room > 0 ? `${compaction.summary.slice(0, room)}\n\n${truncated}` : truncated;
+		const { context, ok } = await this.recallForContext(recallQuery, signal);
 		if (!ok) return undefined;
 
 		return {

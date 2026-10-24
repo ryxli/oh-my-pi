@@ -2579,6 +2579,7 @@ export class AgentSession implements SettingsScope {
 			resetPlanReference: () => {
 				this.#planReferenceSent = false;
 			},
+			resetMemoryRecall: () => this.#memory.resetRecallAfterCompaction(),
 			syncTodoPhasesFromBranch: () => {
 				this.#todo.syncFromBranch();
 				this.#modelMentions.syncFromBranch();

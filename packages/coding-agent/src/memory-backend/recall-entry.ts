@@ -100,8 +100,8 @@ function isMemoryRecallChangesDetails(details: unknown): details is MemoryRecall
  * The latest recall for `scope` on the current branch that a turn followed, with the
  * memories still current per the latest change report delivered after it. Undefined
  * when the branch needs a fresh recall: none was recorded since the last context
- * reset, or no turn followed one (a branch that edits the first prompt asks a
- * different question).
+ * reset or compaction (the conversation it answered is gone), or no turn followed
+ * one (a branch that edits the first prompt asks a different question).
  */
 export function findPersistedRecall(
 	sessionManager: Pick<SessionManager, "getBranch">,
@@ -112,7 +112,7 @@ export function findPersistedRecall(
 	let reported: RecalledMemory[] | undefined;
 	for (let index = entries.length - 1; index >= 0; index--) {
 		const entry = entries[index];
-		if (entry.type === "reset_boundary") return undefined;
+		if (entry.type === "reset_boundary" || entry.type === "compaction") return undefined;
 		if (entry.type === "message") {
 			turnFollowed = true;
 		} else if (entry.type === "custom_message" && entry.customType === MEMORY_RECALL_CHANGES_MESSAGE_TYPE) {

@@ -10,7 +10,7 @@
  */
 import { afterEach, describe, expect, it } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { HindsightApi } from "@oh-my-pi/pi-coding-agent/hindsight/client";
+import type { HindsightApi, RecallOptions } from "@oh-my-pi/pi-coding-agent/hindsight/client";
 import type { HindsightConfig } from "@oh-my-pi/pi-coding-agent/hindsight/config";
 import { HindsightSessionState } from "@oh-my-pi/pi-coding-agent/hindsight/state";
 import { MEMORY_RECALL_CHANGES_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/memory-backend/recall-entry";
@@ -25,6 +25,7 @@ import {
 	setMnemopiSessionState,
 } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { SessionMemory, type SessionMemoryHost } from "@oh-my-pi/pi-coding-agent/session/session-memory";
 import { clipRecallContent } from "@oh-my-pi/pi-mnemopi";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -478,8 +479,14 @@ describe("Hindsight recall across a resume", () => {
 		bankId: string,
 		memory: string,
 		{ recallTags, ...overrides }: HindsightScope = {},
+		recalls: Array<{ query: string; options?: RecallOptions }> = [],
 	): HindsightSessionState {
-		const client = { recall: async () => ({ results: [{ id: "m", text: memory }] }) } as unknown as HindsightApi;
+		const client = {
+			recall: async (_bankId: string, query: string, options?: RecallOptions) => {
+				recalls.push({ query, options });
+				return { results: [{ id: "m", text: memory }] };
+			},
+		} as unknown as HindsightApi;
 		return new HindsightSessionState({
 			sessionId: sessionManager.getSessionId(),
 			client,
@@ -518,5 +525,59 @@ describe("Hindsight recall across a resume", () => {
 			const state = startHindsight(await SessionManager.open(sessionFile, sessions), bankId, "gamma-3", scope);
 			expect(await hindsightFirstTurn(state)).toContain("gamma-3");
 		}
+	});
+
+	it("recalls afresh after a compaction, searching with the summary's goal under a relevance floor", async () => {
+		const dir = tempDir();
+		const live = startHindsight(newSession(dir), "project", "The deploy host is alpha-7.");
+		expect(await hindsightFirstTurn(live)).toContain("alpha-7");
+		const sessionManager = live.session.sessionManager;
+		await writeTranscript(sessionManager);
+		const goal = "## Goal\nMove the deploy host off alpha-7.";
+		sessionManager.appendCompaction(goal, undefined, sessionManager.getEntries().at(-1)!.id, 1000);
+		await sessionManager.flush();
+
+		const recalls: Array<{ query: string; options?: RecallOptions }> = [];
+		const sessions = dir.join("sessions");
+		const resumed = startHindsight(
+			await SessionManager.open(sessionManager.getSessionFile()!, sessions),
+			"project",
+			"The deploy host moved to beta-9.",
+			{},
+			recalls,
+		);
+		expect(await hindsightFirstTurn(resumed)).toContain("beta-9");
+		expect(recalls).toHaveLength(1);
+		expect(recalls[0].query.startsWith(goal)).toBe(true);
+		expect(recalls[0].query.endsWith(PROMPT)).toBe(true);
+		expect(recalls[0].options?.minScores?.reranker).toBeGreaterThan(0);
+	});
+
+	it("drops a live session's recall and its promoted prompt at compaction, keeping retain progress", async () => {
+		const dir = tempDir();
+		const state = startHindsight(newSession(dir), "project", "The deploy host is alpha-7.");
+		const prompts: string[][] = [];
+		const refresh = { count: 0 };
+		const host = {
+			settings: Settings.isolated({ "memory.backend": "hindsight" }),
+			getHindsightSessionState: () => state,
+			getMnemopiSessionState: () => undefined,
+			setBaseSystemPrompt: (prompt: string[]) => prompts.push(prompt),
+			refreshBaseSystemPrompt: async () => {
+				refresh.count++;
+			},
+		} as unknown as SessionMemoryHost;
+		const memory = new SessionMemory(host, {});
+		await hindsightFirstTurn(state);
+		memory.capturePromotionSnapshot(["base"]);
+		state.lastRetainedTurn = 4;
+
+		await memory.resetRecallAfterCompaction();
+
+		expect(state.hasRecalledForFirstTurn).toBe(false);
+		expect(state.lastRecallSnippet).toBeUndefined();
+		expect(prompts).toEqual([["base"]]);
+		expect(refresh.count).toBe(1);
+		expect(state.lastRetainedTurn).toBe(4);
 	});
 });

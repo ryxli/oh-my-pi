@@ -240,6 +240,29 @@ export class SessionMemory {
 		}
 	}
 
+	/**
+	 * A compaction replaced the conversation the recall answered: drop it and its promoted
+	 * prompt so the next prompt recalls for the work now in context. Retain tracking stays,
+	 * since the transcript itself continues.
+	 */
+	async resetRecallAfterCompaction(): Promise<void> {
+		const backend = cfgMemoryBackend.get(this.#host.settings);
+		const state =
+			backend === "hindsight"
+				? this.#host.getHindsightSessionState()
+				: backend === "mnemopi"
+					? this.#host.getMnemopiSessionState()
+					: undefined;
+		if (!state || state.aliasOf || !state.hasRecalledForFirstTurn) return;
+		state.resetRecall();
+		const promoted = this.#baseSystemPromptBeforeMemoryPromotion;
+		if (promoted !== undefined) {
+			this.#host.setBaseSystemPrompt(promoted);
+			this.#baseSystemPromptBeforeMemoryPromotion = undefined;
+		}
+		await this.#host.refreshBaseSystemPrompt();
+	}
+
 	/** Cancel the local rollout-memory startup owned by this session. */
 	cancelLocalMemoryStartup(): void {
 		this.#localMemoryStartupAbort?.abort();
