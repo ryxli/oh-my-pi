@@ -81,6 +81,57 @@ describe("readHindsightMemoryGraph", () => {
 		const graph = await readHindsightMemoryGraph(Settings.isolated({ "hindsight.apiUrl": "" }));
 		expect(graph).toEqual({ bankId: null, totalMemories: 0, limit: 0, nodes: [], edges: [] });
 	});
+
+	it("dates each fact by the transcript message it came from, not the conversation's start", async () => {
+		const chunk = (index: number, text: string) => ({ chunk_id: `c${index}`, chunk_index: index, chunk_text: text });
+		const server = Bun.serve({
+			port: 0,
+			fetch(request) {
+				const { pathname } = new URL(request.url);
+				if (pathname.endsWith("/documents/session-1/chunks"))
+					return Response.json({
+						items: [
+							chunk(2, "[role: user]\n[timestamp: 2026-10-23T15:00:00.000Z]\nlater\n[user:end]"),
+							chunk(1, "...the same long assistant message, continued"),
+							chunk(
+								0,
+								"[role: user]\n[timestamp: 2026-10-14T10:00:00.000Z]\nhi\n[user:end]\n[role: assistant]\n[timestamp: 2026-10-14T11:00:00.000Z]\nstart of a long message",
+							),
+						],
+					});
+				const fromSession = (id: string, chunkId: string) =>
+					unit(id, { mentioned_at: "2026-10-14T09:00:00Z", document_id: "session-1", chunk_id: chunkId });
+				return Response.json({
+					items: [
+						fromSession("early", "c0"),
+						fromSession("continued", "c1"),
+						fromSession("late", "c2"),
+						unit("no-chunk", { mentioned_at: "2026-10-20T08:00:00Z" }),
+						unit("obs", { fact_type: "observation", source_memory_ids: ["early", "late"] }),
+					],
+					total: 5,
+				});
+			},
+		});
+		servers.push(server);
+		const settings = Settings.isolated({
+			"hindsight.apiUrl": `http://127.0.0.1:${server.port}`,
+			"hindsight.scoping": "global",
+		});
+
+		const graph = await readHindsightMemoryGraph(settings);
+
+		const learned = Object.fromEntries(
+			graph.nodes.flatMap(node => (node.type === "fact" ? [[node.id, node.learnedAt]] : [])),
+		);
+		expect(learned).toEqual({
+			early: "2026-10-14T11:00:00.000Z",
+			continued: "2026-10-14T11:00:00.000Z",
+			late: "2026-10-23T15:00:00.000Z",
+			"no-chunk": "2026-10-20T08:00:00.000Z",
+			obs: "2026-10-23T15:00:00.000Z",
+		});
+	});
 });
 
 describe("searchHindsightMemory", () => {
@@ -114,7 +165,7 @@ describe("searchHindsightMemory", () => {
 			},
 		]);
 		expect(response.results.map(hit => [hit.id, hit.factType, hit.learnedAt])).toEqual([
-			["r1", "experience", "2026-10-22T00:00:00Z"],
+			["r1", "experience", "2026-10-22T00:00:00.000Z"],
 			["r2", "world", null],
 		]);
 		expect(JSON.stringify(response)).not.toContain(secret);

@@ -201,6 +201,16 @@ function formatRetentionMessage(msg: HindsightMessage, includeTimestamps = false
 	return `${stamped}\n${content}\n[${msg.role}:end]`;
 }
 
+/** Message timestamp markers written by formatRetentionMessage, one line per stamped message. */
+const MESSAGE_TIMESTAMP_REGEX = /^\[timestamp: (.+)\]$/gm;
+
+/** Timestamp of the last stamped message in a piece of retained transcript, if any. */
+export function lastMessageTimestamp(transcript: string): string | undefined {
+	let last: string | undefined;
+	for (const match of transcript.matchAll(MESSAGE_TIMESTAMP_REGEX)) last = match[1];
+	return last;
+}
+
 function formatRetentionMessages(messages: HindsightMessage[], includeTimestamps = false): RetentionTranscript {
 	const parts: string[] = [];
 	for (const msg of messages) {

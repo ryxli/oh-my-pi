@@ -411,6 +411,20 @@ export class HindsightApi {
 		);
 	}
 
+	/** List a document's chunks (source text pieces facts were extracted from), in pages. */
+	async listDocumentChunks(
+		bankId: string,
+		documentId: string,
+		options?: ListDocumentsOptions,
+	): Promise<ListDocumentsResponse> {
+		return this.#request<ListDocumentsResponse>(
+			"GET",
+			`/v1/default/banks/${encodeURIComponent(bankId)}/documents/${encodeURIComponent(documentId)}/chunks`,
+			"listDocumentChunks",
+			{ query: { limit: options?.limit, offset: options?.offset }, signal: options?.signal },
+		);
+	}
+
 	/** Fetch a document. Returns `null` on 404 instead of throwing. */
 	async getDocument(bankId: string, documentId: string): Promise<DocumentResponse | null> {
 		return this.#request<DocumentResponse | null>(

@@ -670,7 +670,10 @@ export interface MemoryGraphFact {
 	id: string;
 	factType: MemoryFactType;
 	text: string;
-	/** ISO time omp learned the fact (Hindsight mentioned_at), unlike the event time extraction may infer from text. */
+	/**
+	 * ISO time the conversation said it: the transcript message the fact was extracted from (an
+	 * observation: its newest source), falling back to the conversation's start when unknown.
+	 */
 	learnedAt: string | null;
 	tags: string[];
 	/** Number of source facts behind an observation; 1 for plain facts. */
