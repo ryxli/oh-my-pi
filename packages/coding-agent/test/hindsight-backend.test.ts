@@ -18,6 +18,9 @@ import {
 import { HindsightApi } from "@oh-my-pi/pi-coding-agent/hindsight/client";
 import { HindsightRetainQueue, type HindsightSessionState } from "@oh-my-pi/pi-coding-agent/hindsight/state";
 import type { AgentSessionEventListener } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { type SubagentLifecyclePayload, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
+import { emitSubagentFrame, EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { logger, TempDir } from "@oh-my-pi/pi-utils";
 
 import {
 	cfgHindsightBankId,
@@ -212,6 +215,209 @@ describe("hindsightBackend.start", () => {
 		});
 
 		expect(session.getHindsightSessionState()).toBeUndefined();
+	});
+});
+
+describe("subagent report retention", () => {
+	beforeEach(() => {
+		resetSettingsForTest();
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("retains a report with root identity, routing tags, and completion time", async () => {
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+			"hindsight.scoping": "per-project-tagged",
+			"hindsight.mentalModelsEnabled": false,
+		});
+		const retainSpy = vi.spyOn(HindsightApi.prototype, "retain").mockResolvedValue({});
+		const bankSpy = vi.spyOn(HindsightApi.prototype, "createBank").mockResolvedValue({});
+		const session = makeFakeSession({ sessionId: "root", cwd: "/tmp/reports" });
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+		const state = session.getHindsightSessionState()!;
+		const completedAt = new Date("2026-10-27T12:00:00Z");
+		await state.retainSubagentReport({
+			agentId: "Parent.Child",
+			agentName: "scout",
+			description: "Inspect retention",
+			report: "  Detailed findings  ",
+			completedAt,
+		});
+
+		expect(bankSpy).toHaveBeenCalledTimes(1);
+		expect(retainSpy).toHaveBeenCalledTimes(1);
+		expect(retainSpy).toHaveBeenCalledWith(
+			state.bankId,
+			"Subagent Parent.Child (scout): Inspect retention\n\nDetailed findings",
+			{
+				documentId: "root/Parent.Child",
+				context: state.config.retainContext,
+				metadata: { session_id: "root", agent_id: "Parent.Child" },
+				tags: state.retainTags,
+				timestamp: completedAt,
+				async: true,
+			},
+		);
+		expect(state.retainTags?.length).toBeGreaterThan(0);
+		state.dispose();
+	});
+
+	it.each([
+		{ autoRetain: false, report: "Findings" },
+		{ autoRetain: true, report: " \n\t " },
+	])("skips writes for $autoRetain and a possibly blank report", async ({ autoRetain, report }) => {
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+			"hindsight.autoRetain": autoRetain,
+			"hindsight.mentalModelsEnabled": false,
+		});
+		const retainSpy = vi.spyOn(HindsightApi.prototype, "retain").mockResolvedValue({});
+		const bankSpy = vi.spyOn(HindsightApi.prototype, "createBank").mockResolvedValue({});
+		const session = makeFakeSession({ sessionId: "root" });
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+		const state = session.getHindsightSessionState()!;
+		await state.retainSubagentReport({
+			agentId: "Scout",
+			agentName: "scout",
+			report,
+			completedAt: new Date(),
+		});
+		expect(retainSpy).not.toHaveBeenCalled();
+		expect(bankSpy).not.toHaveBeenCalled();
+		state.dispose();
+	});
+
+	it("captures published completions once on the root, including nested and republished reports", async () => {
+		using tempDir = TempDir.createSync("@pi-hindsight-reports-");
+		const outputPath = `${tempDir.path()}/Scout.md`;
+		await Bun.write(outputPath, "First findings");
+		const treeBus = new EventBus();
+		const sessionBus = new EventBus();
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+			"hindsight.mentalModelsEnabled": false,
+		});
+		let retained = Promise.withResolvers<void>();
+		const retainSpy = vi.spyOn(HindsightApi.prototype, "retain").mockImplementation(async () => {
+			retained.resolve();
+			return {};
+		});
+		vi.spyOn(HindsightApi.prototype, "createBank").mockResolvedValue({});
+		const root = makeFakeSession({ sessionId: "root", settings });
+		await hindsightBackend.start({
+			session: root as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+			subagentEventBus: treeBus,
+		});
+		const state = root.getHindsightSessionState()!;
+		const child = makeFakeSession({ sessionId: "child" });
+		await hindsightBackend.start({
+			session: child as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 1,
+			parentHindsightSessionState: state,
+			subagentEventBus: treeBus,
+		});
+		const frame: SubagentLifecyclePayload = {
+			id: "Scout",
+			agent: "scout",
+			agentSource: "bundled",
+			description: "Inspect writes",
+			status: "completed",
+			outputPath,
+			settledAt: Date.parse("2026-10-27T12:00:00Z"),
+			index: 0,
+		};
+		emitSubagentFrame(sessionBus, treeBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, { ...frame, status: "failed" });
+		emitSubagentFrame(sessionBus, treeBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, { ...frame, status: "aborted" });
+		emitSubagentFrame(sessionBus, treeBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
+			...frame,
+			outputPath: undefined,
+		});
+		emitSubagentFrame(sessionBus, treeBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, frame);
+		await retained.promise;
+		expect(retainSpy).toHaveBeenCalledTimes(1);
+		expect(retainSpy.mock.calls[0]?.[2]).toMatchObject({
+			documentId: "root/Scout",
+			timestamp: new Date(frame.settledAt!),
+		});
+
+		retained = Promise.withResolvers<void>();
+		emitSubagentFrame(sessionBus, treeBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, { ...frame, id: "Scout.Child" });
+		await retained.promise;
+		expect(retainSpy).toHaveBeenCalledTimes(2);
+		expect(retainSpy.mock.calls[1]?.[2]?.documentId).toBe("root/Scout.Child");
+
+		retained = Promise.withResolvers<void>();
+		await Bun.write(outputPath, "Updated findings");
+		emitSubagentFrame(treeBus, treeBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, frame);
+		await retained.promise;
+		expect(retainSpy).toHaveBeenCalledTimes(3);
+		expect(retainSpy.mock.calls[2]?.[1]).toContain("Updated findings");
+		expect(retainSpy.mock.calls[2]?.[2]?.documentId).toBe("root/Scout");
+		state.dispose();
+		child.getHindsightSessionState()?.dispose();
+	});
+
+	it("logs report read failures without interrupting lifecycle delivery", async () => {
+		const treeBus = new EventBus();
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+			"hindsight.mentalModelsEnabled": false,
+		});
+		const failed = Promise.withResolvers<void>();
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {
+			failed.resolve();
+		});
+		const session = makeFakeSession({ sessionId: "root" });
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+			subagentEventBus: treeBus,
+		});
+		const downstream = vi.fn();
+		treeBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, downstream);
+		treeBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
+			id: "Scout",
+			agent: "scout",
+			status: "completed",
+			outputPath: "/nonexistent-hindsight-report.md",
+			settledAt: Date.now(),
+		});
+		await failed.promise;
+		expect(downstream).toHaveBeenCalledTimes(1);
+		expect(warnSpy).toHaveBeenCalledWith(
+			"Hindsight: subagent report retain failed",
+			expect.objectContaining({ sessionId: "root", agentId: "Scout" }),
+		);
+		session.getHindsightSessionState()?.dispose();
 	});
 });
 

@@ -28,6 +28,10 @@ export interface SubagentLifecyclePayload {
 	description?: string;
 	status: "started" | "completed" | "failed" | "aborted";
 	sessionFile?: string;
+	/** Published report artifact for this turn, absent when publication failed or was skipped. */
+	outputPath?: string;
+	/** Settlement time in epoch milliseconds; absent on started frames. */
+	settledAt?: number;
 	parentToolCallId?: string;
 	index: number;
 	/**
