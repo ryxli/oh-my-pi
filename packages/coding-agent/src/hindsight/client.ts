@@ -9,6 +9,7 @@
  */
 
 import { USER_AGENT, truncate, tryParseJson } from "@oh-my-pi/pi-utils";
+import { redactMemorySecrets, redactMemoryTextFields } from "../memory-backend/redact";
 import { isTimeoutError, withTimeoutSignal } from "../utils/fetch-timeout";
 import type { HindsightConfig } from "./config";
 
@@ -661,12 +662,13 @@ interface BuiltMemoryItem {
 	update_mode?: UpdateMode;
 }
 
-function buildMemoryItem(item: MemoryItemInput): BuiltMemoryItem {
+function buildMemoryItem(input: MemoryItemInput): BuiltMemoryItem {
+	const item = redactMemoryTextFields(input);
 	const out: BuiltMemoryItem = { content: item.content };
 	if (item.timestamp !== undefined) {
 		out.timestamp = item.timestamp instanceof Date ? formatDateWithLocalOffset(item.timestamp) : item.timestamp;
 	}
-	if (item.context !== undefined) out.context = item.context;
+	if (item.context !== undefined) out.context = redactMemorySecrets(item.context);
 	if (item.metadata !== undefined) out.metadata = item.metadata;
 	if (item.documentId !== undefined) out.document_id = item.documentId;
 	if (item.tags !== undefined) out.tags = item.tags;

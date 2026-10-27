@@ -59,6 +59,43 @@ describe("HindsightApi timestamp serialization", () => {
 	});
 });
 
+describe("HindsightApi write redaction", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it.each(["retain", "retainBatch"] as const)("redacts every text field sent through %s", async method => {
+		const bodies = captureRequestBodies();
+		const client = new HindsightApi({ baseUrl: "http://hindsight.local" });
+		const token = `ghp_${"a".repeat(30)}`;
+		const item = {
+			content: `Credential ${token}`,
+			context: `Context ${token}`,
+			metadata: { credential: token, session_id: "session-1" },
+		};
+
+		if (method === "retain") {
+			await client.retain("omp", item.content, item);
+		} else {
+			await client.retainBatch("omp", [item, { content: "clean report" }]);
+		}
+
+		expect(bodies).toHaveLength(1);
+		expect(JSON.parse(bodies[0] ?? "{}")).toMatchObject({
+			items: [
+				{
+					content: "Credential [REDACTED]",
+					context: "Context [REDACTED]",
+					metadata: { credential: "[REDACTED]", session_id: "session-1" },
+				},
+				...(method === "retainBatch" ? [{ content: "clean report" }] : []),
+			],
+		});
+		expect(bodies[0]).not.toContain(token);
+		expect(item.metadata.credential).toBe(token);
+	});
+});
+
 /** Fake mental-model list endpoint paging like Hindsight's server (limit default 100, max 1000). */
 function serveMentalModels(count: number, { reportTotal }: { reportTotal: boolean }): string[] {
 	const urls: string[] = [];
