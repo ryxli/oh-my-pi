@@ -1271,6 +1271,10 @@ class SubagentLifecyclePayload:
     index: int
     description: str | None = None
     session_file: str | None = None
+    output_path: str | None = None
+    """Published report artifact for this turn."""
+    settled_at: int | None = None
+    """Settlement time in epoch milliseconds; absent on started frames."""
     parent_tool_call_id: str | None = None
     detached: bool | None = None
     """The subagent runs as a detached background job."""
@@ -2644,6 +2648,8 @@ def parse_subagent_lifecycle_payload(value: object, path: str = "SubagentLifecyc
         index=required(payload, "index", decode_int, path),
         description=optional(payload, "description", decode_str, path),
         session_file=optional(payload, "sessionFile", decode_str, path),
+        output_path=optional(payload, "outputPath", decode_str, path),
+        settled_at=optional(payload, "settledAt", decode_int, path),
         parent_tool_call_id=optional(payload, "parentToolCallId", decode_str, path),
         detached=optional(payload, "detached", decode_bool, path),
     )

@@ -60,6 +60,8 @@ export const frameDefs = {
 		"description?": "string",
 		status: "SubagentLifecycleStatus",
 		"sessionFile?": "string",
+		"outputPath?": doc("string", "Published report artifact for this turn."),
+		"settledAt?": doc("number.integer", "Settlement time in epoch milliseconds; absent on started frames."),
 		"parentToolCallId?": "string",
 		index: "number.integer",
 		"detached?": doc("boolean", "The subagent runs as a detached background job."),

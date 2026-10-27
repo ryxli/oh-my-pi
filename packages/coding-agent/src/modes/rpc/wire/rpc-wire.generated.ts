@@ -1065,6 +1065,10 @@ export interface SubagentLifecyclePayload {
 	index: number;
 	description?: string;
 	sessionFile?: string;
+	/** Published report artifact for this turn. */
+	outputPath?: string;
+	/** Settlement time in epoch milliseconds; absent on started frames. */
+	settledAt?: number;
 	parentToolCallId?: string;
 	/** The subagent runs as a detached background job. */
 	detached?: boolean;

@@ -4122,6 +4122,12 @@ pub struct SubagentLifecyclePayload {
 	pub description: Option<String>,
 	#[serde(rename = "sessionFile", default, skip_serializing_if = "Option::is_none")]
 	pub session_file: Option<String>,
+	/// Published report artifact for this turn.
+	#[serde(rename = "outputPath", default, skip_serializing_if = "Option::is_none")]
+	pub output_path: Option<String>,
+	/// Settlement time in epoch milliseconds; absent on started frames.
+	#[serde(rename = "settledAt", default, skip_serializing_if = "Option::is_none")]
+	pub settled_at: Option<i64>,
 	#[serde(rename = "parentToolCallId", default, skip_serializing_if = "Option::is_none")]
 	pub parent_tool_call_id: Option<String>,
 	/// The subagent runs as a detached background job.

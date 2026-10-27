@@ -3139,6 +3139,8 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		description: progress.description,
 		status: progress.status as "completed" | "failed" | "aborted",
 		sessionFile: args.sessionFile,
+		outputPath,
+		settledAt: Date.now(),
 		index,
 	};
 	emitSubagentFrame(args.eventBus, args.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, settledPayload);

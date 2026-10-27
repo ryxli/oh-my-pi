@@ -7,12 +7,40 @@ import {
 	hasSubstantiveContent,
 	prepareEmbeddableRetentionTranscript,
 	prepareRetentionTranscript,
+	prepareSubagentReport,
 	prepareUserRetentionTranscript,
 	sliceLastTurnsByUserBoundary,
 	stripMemoryTags,
 	stripRetentionProtocolMarkers,
+	subagentReportDocumentId,
 	truncateRecallQuery,
 } from "@oh-my-pi/pi-coding-agent/hindsight/content";
+
+describe("subagent report content", () => {
+	it("uses the root session and dotted output id for document identity", () => {
+		expect(subagentReportDocumentId("session-1", "Parent.Child")).toBe("session-1/Parent.Child");
+	});
+
+	it("frames the report without altering its internal text", () => {
+		expect(
+			prepareSubagentReport({
+				agentId: "Parent.Child",
+				agentName: "scout",
+				description: "Inspect memory\nwrites",
+				report: " \n# Findings\n\n<memories>quoted evidence</memories>\n  exact spacing\n ",
+			}),
+		).toBe(
+			"Subagent Parent.Child (scout): Inspect memory writes\n\n# Findings\n\n<memories>quoted evidence</memories>\n  exact spacing",
+		);
+	});
+
+	it("omits an absent description and ignores blank reports", () => {
+		expect(prepareSubagentReport({ agentId: "Scout", agentName: "scout", report: "report" })).toBe(
+			"Subagent Scout (scout)\n\nreport",
+		);
+		expect(prepareSubagentReport({ agentId: "Scout", agentName: "scout", report: " \n\t" })).toBe("");
+	});
+});
 
 describe("stripMemoryTags", () => {
 	it("removes both <memories> and legacy memory blocks", () => {

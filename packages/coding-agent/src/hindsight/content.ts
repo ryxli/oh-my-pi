@@ -285,3 +285,19 @@ export function prepareEmbeddableRetentionTranscript(messages: HindsightMessage[
 export function prepareUserRetentionTranscript(messages: HindsightMessage[]): RetentionTranscript {
 	return formatRetentionMessages(messages.filter(message => message.role === "user"));
 }
+
+export function subagentReportDocumentId(parentSessionId: string, agentId: string): string {
+	return `${parentSessionId}/${agentId}`;
+}
+
+export function prepareSubagentReport(input: {
+	agentId: string;
+	agentName: string;
+	description?: string;
+	report: string;
+}): string {
+	const report = input.report.trim();
+	if (!report) return "";
+	const header = `Subagent ${input.agentId} (${input.agentName})${input.description ? `: ${input.description}` : ""}`;
+	return `${header.replace(/[\r\n]+/g, " ")}\n\n${report}`;
+}

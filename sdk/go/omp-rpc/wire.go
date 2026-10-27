@@ -4813,14 +4813,18 @@ func (v *SubagentLifecycleStatus) UnmarshalJSON(data []byte) error {
 }
 
 type SubagentLifecyclePayload struct {
-	ID               string                  `json:"id"`
-	Agent            string                  `json:"agent"`
-	AgentSource      AgentSource             `json:"agentSource"`
-	Status           SubagentLifecycleStatus `json:"status"`
-	Index            int64                   `json:"index"`
-	Description      *string                 `json:"description,omitempty"`
-	SessionFile      *string                 `json:"sessionFile,omitempty"`
-	ParentToolCallID *string                 `json:"parentToolCallId,omitempty"`
+	ID          string                  `json:"id"`
+	Agent       string                  `json:"agent"`
+	AgentSource AgentSource             `json:"agentSource"`
+	Status      SubagentLifecycleStatus `json:"status"`
+	Index       int64                   `json:"index"`
+	Description *string                 `json:"description,omitempty"`
+	SessionFile *string                 `json:"sessionFile,omitempty"`
+	// Published report artifact for this turn.
+	OutputPath *string `json:"outputPath,omitempty"`
+	// Settlement time in epoch milliseconds; absent on started frames.
+	SettledAt        *int64  `json:"settledAt,omitempty"`
+	ParentToolCallID *string `json:"parentToolCallId,omitempty"`
 	// The subagent runs as a detached background job.
 	Detached *bool `json:"detached,omitempty"`
 }
@@ -4839,6 +4843,8 @@ func (v *SubagentLifecyclePayload) decodeFrom(raw map[string]json.RawMessage) er
 	d.required("index", &out.Index)
 	d.optional("description", &out.Description)
 	d.optional("sessionFile", &out.SessionFile)
+	d.optional("outputPath", &out.OutputPath)
+	d.optional("settledAt", &out.SettledAt)
 	d.optional("parentToolCallId", &out.ParentToolCallID)
 	d.optional("detached", &out.Detached)
 	if d.err != nil {

@@ -4,6 +4,9 @@ import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobManager } from "@oh-my-pi/pi
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import { HindsightApi } from "@oh-my-pi/pi-coding-agent/hindsight/client";
+import { loadHindsightConfig } from "@oh-my-pi/pi-coding-agent/hindsight/config";
+import { HindsightSessionState } from "@oh-my-pi/pi-coding-agent/hindsight/state";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { RpcSubagentRegistry } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
@@ -17,7 +20,7 @@ import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { buildBudgetNotice, resolveSoftRequestBudget, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { cfgTaskAgentSoftRequestBudget } from "@oh-my-pi/pi-coding-agent/task/settings";
-import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { AgentDefinition, SubagentLifecyclePayload } from "@oh-my-pi/pi-coding-agent/task/types";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -604,17 +607,34 @@ describe("runSubprocess soft request budget", () => {
 		);
 	});
 
-	it("an aliased observability bus does not duplicate lifecycle frames", async () => {
+	it("an aliased observability bus retains a published report exactly once on the root", async () => {
 		const id = "AliasScout";
 		// An SDK caller wiring the same EventBus into both slots must not see
 		// every frame twice — the executor skips the aliased re-emit.
 		const sharedBus = new EventBus();
+		const retained = Promise.withResolvers<void>();
+		const retainSpy = vi.spyOn(HindsightApi.prototype, "retain").mockImplementation(async () => {
+			retained.resolve();
+			return {};
+		});
+		const state = new HindsightSessionState({
+			sessionId: "root-session",
+			client: new HindsightApi({ baseUrl: "http://hindsight.local" }),
+			bankId: "reports",
+			config: loadHindsightConfig(Settings.isolated({ "hindsight.apiUrl": "http://hindsight.local" })),
+			session: { subscribe: () => () => {} } as never,
+			subagentEventBus: sharedBus,
+			banksSet: new Set(["reports"]),
+		});
+		state.attachSessionListeners();
+		const settledFrames: SubagentLifecyclePayload[] = [];
 		const settled: string[] = [];
 		const terminal = Promise.withResolvers<void>();
 		sharedBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, frame => {
-			const payload = frame as { id?: string; status?: string };
+			const payload = frame as SubagentLifecyclePayload;
 			if (payload.id !== id) return;
 			if (payload.status === "started") return;
+			settledFrames.push(payload);
 			settled.push(payload.status ?? "");
 			terminal.resolve();
 		});
@@ -634,10 +654,29 @@ describe("runSubprocess soft request budget", () => {
 		});
 		registerRunning(id, handle.session);
 
-		await runSubprocess(baseOptions(id, sharedBus, sharedBus));
+		const startedAt = Date.now();
+		const result = await runSubprocess(baseOptions(id, sharedBus, sharedBus));
 		await terminal.promise;
+		await retained.promise;
 
 		expect(settled).toEqual(["completed"]);
+		expect(settledFrames[0]?.outputPath).toBe(result.outputPath);
+		expect(settledFrames[0]?.settledAt).toBeGreaterThanOrEqual(startedAt);
+		expect(settledFrames[0]?.settledAt).toBeLessThanOrEqual(Date.now());
+		expect(retainSpy).toHaveBeenCalledTimes(1);
+		expect(retainSpy.mock.calls[0]?.[1]).toContain(await Bun.file(result.outputPath!).text());
+		expect(retainSpy.mock.calls[0]?.[2]?.documentId).toBe(`root-session/${id}`);
+
+		const failedId = "FailedScout";
+		const failedHandle = createMockSession(() => {
+			throw new Error("Provider unavailable");
+		});
+		mockCreateAgentSession(failedHandle.session);
+		registerRunning(failedId, failedHandle.session);
+		const failedResult = await runSubprocess(baseOptions(failedId, sharedBus, sharedBus));
+		expect(failedResult.exitCode).not.toBe(0);
+		expect(retainSpy).toHaveBeenCalledTimes(1);
+		state.dispose();
 	});
 
 	it("a caller-signal abort keeps the kept-alive agent resumable via irc", async () => {

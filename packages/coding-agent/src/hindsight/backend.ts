@@ -14,6 +14,7 @@ import { memoryToolRefs } from "../memory-backend/tool-names";
 import type { MemoryBackend, MemoryBackendStartOptions, MemoryPromptPreparation } from "../memory-backend/types";
 import hindsightInstructions from "../prompts/system/hindsight-instructions.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
+import type { EventBus } from "../utils/event-bus";
 import { type BankScope, computeBankScope } from "./bank";
 import { createHindsightClient } from "./client";
 import { type HindsightConfig, isHindsightConfigured, loadHindsightConfig } from "./config";
@@ -73,7 +74,7 @@ export const hindsightBackend: MemoryBackend = {
 			return;
 		}
 
-		await installPrimaryState(session, settings, new Set());
+		await installPrimaryState(session, settings, new Set(), options.subagentEventBus);
 	},
 
 	async buildDeveloperInstructions(_agentDir, _cwd, settings, session): Promise<string | undefined> {
@@ -261,6 +262,7 @@ async function installPrimaryState(
 	session: AgentSession,
 	settings: Settings,
 	banksSet: Set<string>,
+	subagentEventBus: EventBus | undefined = session.getHindsightSessionState()?.subagentEventBus,
 ): Promise<HindsightSessionState | undefined> {
 	const sessionId = session.sessionId;
 	if (!sessionId) return undefined;
@@ -297,6 +299,7 @@ async function installPrimaryState(
 		recallTagsMatch: scope.recallTagsMatch,
 		config,
 		session,
+		subagentEventBus,
 		banksSet,
 		lastRetainedTurn: 0,
 		hasRecalledForFirstTurn: false,

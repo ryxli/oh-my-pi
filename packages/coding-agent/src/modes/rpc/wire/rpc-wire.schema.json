@@ -4492,6 +4492,14 @@
 				"sessionFile": {
 					"type": "string"
 				},
+				"outputPath": {
+					"type": "string",
+					"description": "Published report artifact for this turn."
+				},
+				"settledAt": {
+					"type": "integer",
+					"description": "Settlement time in epoch milliseconds; absent on started frames."
+				},
 				"parentToolCallId": {
 					"type": "string"
 				},
