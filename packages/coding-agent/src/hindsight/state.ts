@@ -253,6 +253,14 @@ function extendRetentionPrefixKey(key: string, messages: HindsightMessage[], fro
 	return key;
 }
 
+function newestMessageTimestamp(messages: HindsightMessage[]): Date | undefined {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const parsed = new Date(messages[i]?.timestamp ?? "");
+		if (!Number.isNaN(parsed.getTime())) return parsed;
+	}
+	return undefined;
+}
+
 /** Per-session Hindsight runtime state owned by its AgentSession. */
 export class HindsightSessionState implements HindsightSessionStateApi {
 	/** Session id used for retain-queue metadata. */
@@ -406,25 +414,17 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		}
 	}
 
-	#sessionSourceTimestamp(): Date | undefined {
-		const header = this.session.sessionManager?.getHeader?.();
-		const timestamp = header?.timestamp;
-		if (typeof timestamp !== "string") return undefined;
-		const trimmed = timestamp.trim();
-		if (!trimmed) return undefined;
-		const parsed = new Date(trimmed);
-		return Number.isNaN(parsed.getTime()) ? undefined : parsed;
-	}
-
 	async retainSession(messages: HindsightMessage[]): Promise<void> {
 		const retainedAt = new Date();
-		const sourceTimestamp = this.#sessionSourceTimestamp() ?? retainedAt;
 		const retainFullWindow = this.config.retainMode === "full-session";
 		let documentId: string;
 		let transcript: string;
 		let nextCachedTranscript: string | undefined;
 		let prefixKey = "";
 		let hashedThrough = 0;
+		// Dated by the newest retained message: Hindsight's delta retain re-extracts only changed
+		// chunks, so facts from earlier chunks keep the date they were first retained with.
+		let sourceTimestamp: Date;
 
 		if (retainFullWindow) {
 			documentId = this.sessionId;
@@ -442,6 +442,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 			if (!newPart) return;
 			nextCachedTranscript = this.#cachedTranscript ? `${this.#cachedTranscript}\n\n${newPart}` : newPart;
 			transcript = nextCachedTranscript;
+			sourceTimestamp = newestMessageTimestamp(messages) ?? retainedAt;
 		} else {
 			const windowTurns = this.config.retainEveryNTurns + this.config.retainOverlapTurns;
 			const target = sliceLastTurnsByUserBoundary(messages, windowTurns);
@@ -452,6 +453,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 			const { transcript: windowTranscript } = prepareRetentionTranscript(target, true, { includeTimestamps: true });
 			if (!windowTranscript) return;
 			transcript = windowTranscript;
+			sourceTimestamp = newestMessageTimestamp(target) ?? retainedAt;
 		}
 
 		await ensureBankExists(this.client, this.bankId, this.config, this.banksSet);
