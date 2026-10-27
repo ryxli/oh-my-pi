@@ -264,7 +264,7 @@ async function installPrimaryState(
 	banksSet: Set<string>,
 	subagentEventBus: EventBus | undefined = session.getHindsightSessionState()?.subagentEventBus,
 ): Promise<HindsightSessionState | undefined> {
-	const sessionId = session.sessionId;
+	const sessionId = session.sessionManager.getSessionId();
 	if (!sessionId) return undefined;
 
 	const config = loadHindsightConfig(settings);

@@ -7,6 +7,8 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import { hindsightBackend } from "@oh-my-pi/pi-coding-agent/hindsight/backend";
+import { HindsightApi } from "@oh-my-pi/pi-coding-agent/hindsight/client";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -31,6 +33,7 @@ async function teardown(): Promise<void> {
 }
 
 async function createHarness(options?: {
+	settings?: Settings;
 	extension?: {
 		name: string;
 		register: (api: ExtensionAPI) => void;
@@ -61,7 +64,7 @@ async function createHarness(options?: {
 	const session = new AgentSession({
 		agent,
 		sessionManager,
-		settings: Settings.isolated(),
+		settings: options?.settings ?? Settings.isolated(),
 		modelRegistry,
 		extensionRunner,
 	});
@@ -108,6 +111,76 @@ describe("AgentSession.newSession boundary", () => {
 
 		expect(session.sessionId).not.toBe(previousSessionId);
 		expect(session.sessionId).toBe(sessionManager.getSessionId());
+	});
+
+	it("keys Hindsight documents to the journal across provider resets and real journal switches", async () => {
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://hindsight.local",
+			"hindsight.autoRecall": false,
+			"hindsight.mentalModelsEnabled": false,
+			"hindsight.retainMode": "full-session",
+		});
+		const { session, sessionManager } = await createHarness({ settings });
+		const target = await createHarness();
+		const retain = spyOn(HindsightApi.prototype, "retain").mockResolvedValue({});
+		const createBank = spyOn(HindsightApi.prototype, "createBank").mockResolvedValue({});
+		try {
+			sessionManager.appendMessage({ role: "user", content: "Before the scene cut", timestamp: 1 });
+			const journalId = sessionManager.getSessionId();
+			expect(session.freshSession()).toBeDefined();
+			expect(session.sessionId).not.toBe(journalId);
+			await hindsightBackend.start({
+				session,
+				settings,
+				modelRegistry,
+				agentDir: sessionManager.getCwd(),
+				taskDepth: 0,
+			});
+			const state = session.getHindsightSessionState()!;
+			expect(state.sessionId).toBe(journalId);
+			await state.forceRetainCurrentSession();
+			expect(retain.mock.calls[0]?.[2]?.documentId).toBe(journalId);
+
+			const previousProviderId = session.sessionId;
+			expect(await session.resetSessionContext()).toBeDefined();
+			expect(session.sessionId).not.toBe(previousProviderId);
+			expect(sessionManager.getSessionId()).toBe(journalId);
+			sessionManager.appendMessage({ role: "user", content: "After the scene cut", timestamp: 2 });
+			await state.forceRetainCurrentSession();
+			expect(retain.mock.calls[1]?.[2]?.documentId).toBe(journalId);
+			expect(retain.mock.calls[1]?.[1]).toContain("Before the scene cut");
+			expect(retain.mock.calls[1]?.[1]).toContain("After the scene cut");
+			const report = {
+				agentId: "Scout.Child",
+				agentName: "scout",
+				report: "Published findings",
+				completedAt: new Date(),
+			};
+			await state.retainSubagentReport(report);
+			expect(retain.mock.calls[2]?.[2]?.documentId).toBe(`${journalId}/Scout.Child`);
+
+			target.sessionManager.appendMessage({ role: "user", content: "Other journal", timestamp: 3 });
+			await target.sessionManager.ensureOnDisk();
+			await target.sessionManager.flush();
+			const targetFile = target.sessionManager.getSessionFile();
+			if (!targetFile) throw new Error("Expected persisted target journal");
+			expect(await session.switchSession(targetFile, { onCwdChange: async () => true })).toBe(true);
+			const targetJournalId = target.sessionManager.getSessionId();
+			expect(targetJournalId).not.toBe(journalId);
+			const switchedState = session.getHindsightSessionState()!;
+			expect(switchedState.sessionId).toBe(targetJournalId);
+			await switchedState.forceRetainCurrentSession();
+			expect(retain.mock.calls[3]?.[2]?.documentId).toBe(targetJournalId);
+			expect(retain.mock.calls[3]?.[1]).toContain("Other journal");
+			expect(retain.mock.calls[3]?.[1]).not.toContain("Before the scene cut");
+			await switchedState.retainSubagentReport(report);
+			expect(retain.mock.calls[4]?.[2]?.documentId).toBe(`${targetJournalId}/Scout.Child`);
+			expect(retain).toHaveBeenCalledTimes(5);
+		} finally {
+			retain.mockRestore();
+			createBank.mockRestore();
+		}
 	});
 
 	it("keeps old-session messages out of the new session when notifications finish late", async () => {
