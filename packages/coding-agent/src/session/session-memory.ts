@@ -12,6 +12,7 @@ import type { MnemopiSessionState } from "../mnemopi/state";
 import { releaseSharpshooterSession } from "../sharpshooter/backend";
 
 import { cfgMemoryBackend } from "../memory-backend/settings";
+import type { EventBus } from "../utils/event-bus";
 
 /** Id prefixes of the memory backends' own settings; their live edits reconfigure the active backend. */
 const MEMORY_BACKEND_SETTING_PREFIXES: readonly string[] = ["hindsight.", "mnemopi.", "sharpshooter."];
@@ -60,6 +61,7 @@ export class SessionMemory {
 	readonly #host: SessionMemoryHost;
 	readonly #memoryAgentDir: string | undefined;
 	readonly #memoryTaskDepth: number;
+	readonly #subagentEventBus: EventBus | undefined;
 	readonly #createMemoryTools: (() => Promise<AgentTool[]>) | undefined;
 	#memoryBackendTransition: Promise<void> = Promise.resolve();
 	#localMemoryStartupAbort: AbortController | undefined;
@@ -80,12 +82,14 @@ export class SessionMemory {
 			memoryEnabled?: boolean;
 			memoryAgentDir?: string;
 			memoryTaskDepth?: number;
+			subagentEventBus?: EventBus;
 			createMemoryTools?: () => Promise<AgentTool[]>;
 		},
 	) {
 		this.#host = host;
 		this.#memoryAgentDir = options.memoryAgentDir;
 		this.#memoryTaskDepth = options.memoryTaskDepth ?? 0;
+		this.#subagentEventBus = options.subagentEventBus;
 		this.#createMemoryTools = options.createMemoryTools;
 		if (this.#memoryAgentDir) this.#runtimeCwd = host.cwd();
 		// Subagents alias the parent's backend state and never replace it live.
@@ -361,6 +365,7 @@ export class SessionMemory {
 					modelRegistry: this.#host.modelRegistry,
 					agentDir: this.#memoryAgentDir,
 					taskDepth: this.#memoryTaskDepth,
+					subagentEventBus: this.#subagentEventBus,
 				});
 			}
 			if (this.#host.isDisposed()) return;

@@ -14,6 +14,7 @@ import { memoryToolRefs } from "../memory-backend/tool-names";
 import type { MemoryBackend, MemoryBackendStartOptions, MemoryPromptPreparation } from "../memory-backend/types";
 import hindsightInstructions from "../prompts/system/hindsight-instructions.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
+import type { EventBus } from "../utils/event-bus";
 import { type BankScope, computeBankScope, type HindsightBankSet } from "./bank";
 import { createHindsightClient } from "./client";
 import { type HindsightConfig, isHindsightConfigured, loadHindsightConfig } from "./config";
@@ -74,7 +75,7 @@ export const hindsightBackend: MemoryBackend = {
 			return;
 		}
 
-		await installPrimaryState(session, settings, new Set());
+		await installPrimaryState(session, settings, new Set(), options.subagentEventBus);
 	},
 
 	async buildDeveloperInstructions(_agentDir, _cwd, settings, session): Promise<string | undefined> {
@@ -263,6 +264,7 @@ async function installPrimaryState(
 	session: AgentSession,
 	settings: Settings,
 	banksSet: HindsightBankSet,
+	subagentEventBus: EventBus | undefined,
 ): Promise<HindsightSessionState | undefined> {
 	const sessionId = session.sessionId;
 	if (!sessionId) return undefined;
@@ -300,6 +302,7 @@ async function installPrimaryState(
 		recallTagsMatch: scope.recallTagsMatch,
 		config,
 		session,
+		subagentEventBus,
 		banksSet,
 		lastRetainedTurn: 0,
 		hasRecalledForFirstTurn: false,
@@ -367,7 +370,12 @@ async function reconcilePrimaryState(session: AgentSession): Promise<boolean> {
 		current.config.hindsightApiUrl === config.hindsightApiUrl &&
 		current.config.bankMission.trim() === config.bankMission.trim() &&
 		(current.config.retainMission?.trim() || "") === (config.retainMission?.trim() || "");
-	const state = await installPrimaryState(session, settings, sameBankConfig ? current.banksSet : new Set());
+	const state = await installPrimaryState(
+		session,
+		settings,
+		sameBankConfig ? current.banksSet : new Set(),
+		current.subagentEventBus,
+	);
 	if (!state) return false;
 	// A destination with no recall injection must not reuse the source bank's prompt.
 	await session.refreshBaseSystemPrompt();

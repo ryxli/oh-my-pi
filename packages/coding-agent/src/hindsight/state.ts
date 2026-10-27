@@ -1,9 +1,14 @@
+import {
+	type SubagentLifecyclePayload,
+	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
+} from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
 import { logger, sanitizeText, truncate } from "@oh-my-pi/pi-utils";
 import { getAgentDir } from "@oh-my-pi/pi-utils/dirs";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { findPersistedRecall, persistRecall } from "../memory-backend/recall-entry";
 import type { MemoryPromptPreparation } from "../memory-backend/types";
 import type { AgentSession } from "../session/agent-session";
+import type { EventBus } from "../utils/event-bus";
 import { type BankScope, ensureBankExists, type HindsightBankSet } from "./bank";
 import type { HindsightClientApi } from "./client";
 import type { HindsightConfig } from "./config";
@@ -12,6 +17,7 @@ import {
 	formatMemories,
 	type HindsightMessage,
 	prepareRetentionTranscript,
+	prepareSubagentReport,
 	sliceLastTurnsByUserBoundary,
 	truncateRecallQuery,
 } from "./content";
@@ -77,6 +83,7 @@ export interface HindsightSessionStateOptions {
 	recallTagsMatch?: "any" | "all" | "any_strict" | "all_strict";
 	config: HindsightConfig;
 	session: AgentSession;
+	subagentEventBus?: EventBus;
 	banksSet: HindsightBankSet;
 	lastRetainedTurn?: number;
 	hasRecalledForFirstTurn?: boolean;
@@ -259,6 +266,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 	recallTagsMatch?: "any" | "all" | "any_strict" | "all_strict";
 	config: HindsightConfig;
 	session: AgentSession;
+	readonly subagentEventBus?: EventBus;
 	banksSet: HindsightBankSet;
 	lastRetainedTurn: number;
 	#lastRetainedMessageIndex: number = 0;
@@ -301,6 +309,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		this.config = options.config;
 		this.session = options.session;
 		this.banksSet = options.banksSet;
+		this.subagentEventBus = options.subagentEventBus;
 		this.lastRetainedTurn = options.lastRetainedTurn ?? 0;
 		this.#lastRetainedMessageIndex = 0;
 		this.#cachedTranscript = "";
@@ -460,6 +469,27 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 			this.#lastRetainedPrefixKey = extendRetentionPrefixKey(prefixKey, messages, hashedThrough, messages.length);
 			this.#lastRetainedMessageIndex = messages.length;
 		}
+	}
+
+	async retainSubagentReport(input: {
+		agentId: string;
+		agentName: string;
+		description?: string;
+		report: string;
+		completedAt: Date;
+	}): Promise<void> {
+		if (!this.config.autoRetain) return;
+		const text = prepareSubagentReport(input);
+		if (!text) return;
+		await ensureBankExists(this.client, this.bankId, this.config, this.banksSet);
+		await this.client.retain(this.bankId, text, {
+			documentId: `${this.sessionId}/${input.agentId}`,
+			context: this.config.retainContext,
+			metadata: { session_id: this.sessionId, agent_id: input.agentId },
+			tags: this.retainTags,
+			timestamp: input.completedAt,
+			async: true,
+		});
 	}
 
 	async maybeRetainOnAgentEnd(): Promise<void> {
@@ -699,7 +729,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 
 	attachSessionListeners(): void {
 		this.unsubscribe?.();
-		this.unsubscribe = this.session.subscribe(event => {
+		const unsubscribeSession = this.session.subscribe(event => {
 			if (event.type === "agent_end") {
 				void this.maybeRetainOnAgentEnd();
 				// Drain any queued tool-initiated retain calls now that the turn
@@ -715,6 +745,32 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 				// stays the explicit in-session invalidation.
 			}
 		});
+		const unsubscribeReports = this.aliasOf
+			? undefined
+			: this.subagentEventBus?.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, async data => {
+					const frame = data as SubagentLifecyclePayload;
+					if (frame.status !== "completed" || !frame.outputPath || frame.settledAt === undefined) return;
+					if (!this.config.autoRetain) return;
+					try {
+						await this.retainSubagentReport({
+							agentId: frame.id,
+							agentName: frame.agent,
+							description: frame.description,
+							report: await Bun.file(frame.outputPath).text(),
+							completedAt: new Date(frame.settledAt),
+						});
+					} catch (error) {
+						logger.warn("Hindsight: subagent report retain failed", {
+							sessionId: this.sessionId,
+							agentId: frame.id,
+							error: String(error),
+						});
+					}
+				});
+		this.unsubscribe = () => {
+			unsubscribeSession();
+			unsubscribeReports?.();
+		};
 	}
 
 	dispose(): void {

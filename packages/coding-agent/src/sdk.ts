@@ -5167,6 +5167,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			memoryEnabled: !restrictToolNames,
 			memoryAgentDir: agentDir,
 			memoryTaskDepth: taskDepth,
+			memorySubagentEventBus: subagentEventBus,
 			createMemoryTools: restrictToolNames
 				? undefined
 				: async () => {
@@ -5728,6 +5729,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				modelRegistry,
 				agentDir,
 				taskDepth,
+				subagentEventBus,
 				parentHindsightSessionState: options.parentHindsightSessionState,
 				parentMnemopiSessionState: options.parentMnemopiSessionState,
 			});

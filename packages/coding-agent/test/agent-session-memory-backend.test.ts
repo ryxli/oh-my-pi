@@ -11,6 +11,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { hindsightBackend, rebindMemoryBackendForCwd } from "@oh-my-pi/pi-coding-agent/hindsight/backend";
+import { HindsightApi } from "@oh-my-pi/pi-coding-agent/hindsight/client";
 import { MEMORY_BACKEND_TOOL_NAMES } from "@oh-my-pi/pi-coding-agent/memory-backend/tool-names";
 import { computeMnemopiBankScope } from "@oh-my-pi/pi-coding-agent/mnemopi/config";
 import { mnemopiBackend } from "@oh-my-pi/pi-coding-agent/mnemopi/backend";
@@ -20,9 +21,11 @@ import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
+import { TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
 import { BUILTIN_TOOLS, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { tinyModelClient } from "@oh-my-pi/pi-coding-agent/tiny/title-client";
 import { resetMemoryForTests } from "@oh-my-pi/pi-mnemopi";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { getProjectAgentDir, getProjectDir, setProjectDir, TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
@@ -71,7 +74,7 @@ describe("AgentSession memory backend lifecycle", () => {
 		tempDir.removeSync();
 	});
 
-	function createSession(createMemoryTools: () => Promise<AgentTool[]>): AgentSession {
+	function createSession(createMemoryTools: () => Promise<AgentTool[]>, subagentEventBus?: EventBus): AgentSession {
 		const model = buildModel({
 			id: "mock",
 			name: "mock",
@@ -102,6 +105,7 @@ describe("AgentSession memory backend lifecycle", () => {
 			memoryAgentDir: tempDir.path(),
 			memoryTaskDepth: 0,
 			createMemoryTools,
+			memorySubagentEventBus: subagentEventBus,
 			toolRegistry,
 			builtInToolNames: [read.name],
 			rebuildSystemPrompt: async toolNames => ({
@@ -741,6 +745,31 @@ describe("AgentSession memory backend lifecycle", () => {
 
 		expect(current.getHindsightSessionState()).toBeUndefined();
 		expect(current.getActiveToolNames()).toEqual(["read"]);
+	});
+
+	it("retains subagent reports from a backend started by a live apply", async () => {
+		cfgMemoryBackend.override(settings, "hindsight");
+		cfgHindsightMentalModelsEnabled.override(settings, false);
+		vi.spyOn(HindsightApi.prototype, "createBank").mockResolvedValue({});
+		const retained = Promise.withResolvers<string>();
+		vi.spyOn(HindsightApi.prototype, "retain").mockImplementation(async (_bankId, content) => {
+			retained.resolve(content);
+			return {};
+		});
+		const subagentEventBus = new EventBus();
+		const current = createSession(async () => [], subagentEventBus);
+		await current.applyMemoryBackend();
+		const outputPath = path.join(tempDir.path(), "Scout.md");
+		await Bun.write(outputPath, "Scout findings");
+		subagentEventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
+			id: "Scout",
+			agent: "scout",
+			status: "completed",
+			outputPath,
+			settledAt: Date.now(),
+			index: 0,
+		});
+		expect(await retained.promise).toContain("Scout findings");
 	});
 
 	// A hook-triggered retry may find teardown already done; that no-op must preserve the failure.

@@ -51,6 +51,7 @@ import type { CodexAutoRedeemCoordinator } from "./codex-auto-reset";
 import type { SettingsGatedToolDelta, SystemPromptRebuilder } from "./session-tools";
 import type { CostGateApi } from "./cost-gate";
 import type { SessionManager } from "./session-manager";
+import type { EventBus } from "../utils/event-bus";
 
 /** Maximum time the interactive shutdown path waits for Mnemopi consolidation. */
 export const SHUTDOWN_CONSOLIDATE_BUDGET_MS = 1_500;
@@ -275,6 +276,8 @@ export interface AgentSessionConfig {
 	memoryAgentDir?: string;
 	/** Recursion depth used to suppress live backend replacement in subagents. */
 	memoryTaskDepth?: number;
+	/** Root-scoped subagent lifecycle bus handed to every memory backend start. */
+	memorySubagentEventBus?: EventBus;
 	/** Creates built-in memory tools for the current backend. */
 	createMemoryTools?: () => Promise<AgentTool[]>;
 	/** Creates the private `think` scratchpad tool for runtime setting changes. */
