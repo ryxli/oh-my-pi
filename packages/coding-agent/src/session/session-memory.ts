@@ -185,7 +185,7 @@ export class SessionMemory {
 	restorePromotionSnapshot(prompt: string[] | undefined): void {
 		this.#baseSystemPromptBeforeMemoryPromotion = prompt;
 	}
-	/** Rekeys every active memory backend to the current provider session. */
+	/** Rekeys active memory backends to their current journal or provider identity. */
 	rekeyForCurrentSessionId(): void {
 		this.#rekeyHindsightMemoryForCurrentSessionId();
 		this.#rekeyMnemopiMemoryForCurrentSessionId();
@@ -193,7 +193,7 @@ export class SessionMemory {
 
 	#rekeyHindsightMemoryForCurrentSessionId(): void {
 		if (cfgMemoryBackend.get(this.#host.settings) !== "hindsight") return;
-		const sid = this.#host.agent.sessionId;
+		const sid = this.#host.memoryBackendSession().sessionManager.getSessionId();
 		if (!sid) return;
 		this.#host.getHindsightSessionState()?.setSessionId(sid);
 	}
