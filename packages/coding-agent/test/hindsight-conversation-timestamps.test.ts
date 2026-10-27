@@ -149,7 +149,7 @@ describe("Hindsight conversation source timestamps", () => {
 		expect(extracted.some(m => m.content.includes("secret tool output"))).toBe(false);
 	});
 
-	it("uses the session start timestamp on every retain of the same conversation", async () => {
+	it("dates each retain of a conversation by its newest message, not the session start", async () => {
 		const bodies = captureBodies();
 		const client = new HindsightApi({ baseUrl: "http://hindsight.local" });
 		const entries = conversationEntries();
@@ -193,8 +193,8 @@ describe("Hindsight conversation source timestamps", () => {
 		await state.retainSession(extractMessages({ getEntries: () => laterEntries }));
 
 		expect(bodies).toHaveLength(2);
-		expectSameInstant(firstItem(bodies[0]).timestamp, SESSION_START);
-		expectSameInstant(firstItem(bodies[1]).timestamp, SESSION_START);
+		expectSameInstant(firstItem(bodies[0]).timestamp, ASSISTANT_TS);
+		expectSameInstant(firstItem(bodies[1]).timestamp, "2026-08-21T15:00:00.000Z");
 		expect(String(firstItem(bodies[0]).content)).toContain("[timestamp: 2026-08-17T10:00:00.000Z]");
 		expect(String(firstItem(bodies[0]).content)).toContain("[timestamp: 2026-08-17T10:00:05.000Z]");
 		expect(String(firstItem(bodies[1]).content)).toContain("same conversation, later thursday turn");
@@ -203,7 +203,7 @@ describe("Hindsight conversation source timestamps", () => {
 		expect(String(firstItem(bodies[1]).content)).not.toContain("<memories>");
 	});
 
-	it("falls back to retain-time when the session header timestamp is invalid", async () => {
+	it("falls back to retain-time when no retained message carries a timestamp", async () => {
 		const bodies = captureBodies();
 		const client = new HindsightApi({ baseUrl: "http://hindsight.local" });
 		const entries = conversationEntries();
@@ -228,7 +228,7 @@ describe("Hindsight conversation source timestamps", () => {
 			banksSet: new Set(["personal"]),
 		});
 
-		await state.retainSession(extractMessages({ getEntries: () => entries }));
+		await state.retainSession([{ role: "user", content: "an untimed message" }]);
 		expect(bodies).toHaveLength(1);
 		expect(firstItem(bodies[0]).timestamp).not.toBe("not-a-date");
 		expect(Number.isNaN(Date.parse(String(firstItem(bodies[0]).timestamp)))).toBe(false);
