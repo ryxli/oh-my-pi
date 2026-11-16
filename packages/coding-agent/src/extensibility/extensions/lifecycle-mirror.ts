@@ -127,7 +127,7 @@ export function extensionEventFromSessionEvent(
 				...(event.awaiting ? { awaitingAsyncWork: true } : {}),
 			};
 		case "agent_end":
-			return { type: "agent_end", messages: event.messages };
+			return { type: "agent_end", runId, messages: event.messages };
 		case "turn_start":
 			return { type: "turn_start", turnIndex, timestamp: Date.now() };
 		case "turn_end":

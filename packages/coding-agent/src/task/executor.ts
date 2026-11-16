@@ -5590,12 +5590,18 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 			// last report turn, or a `yield`) as the run's result. Only a kept-alive
 			// agent has wake turns left to answer held messages in.
 			if (options.keepAlive !== false) releaseIrcWakes = session.holdIrcWakes();
-			const outcome = await driveSessionToResult(session, monitor, task, {
-				solutionSpace: options.solutionSpace,
-				structured,
-				steps: options.steps?.length ? { prompts: options.steps, sent: 1 } : undefined,
-				stepReports: options.parentAgentId ? { from: id, to: options.parentAgentId } : undefined,
-			}, executeGuard);
+			const outcome = await driveSessionToResult(
+				session,
+				monitor,
+				task,
+				{
+					solutionSpace: options.solutionSpace,
+					structured,
+					steps: options.steps?.length ? { prompts: options.steps, sent: 1 } : undefined,
+					stepReports: options.parentAgentId ? { from: id, to: options.parentAgentId } : undefined,
+				},
+				executeGuard,
+			);
 			// Acceptance boundary (#11079): the run's final result is settled, so
 			// stamp the lifecycle and terminalize a ref the run-state mirror left
 			// `running` before the (possibly slow) cleanup below.
