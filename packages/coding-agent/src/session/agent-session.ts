@@ -5195,7 +5195,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			logProviderTurnError(msg);
 			if (this.#sceneCut.hasStaged) {
 				maintenanceRoute("scene-cut-staged");
-				endLoop();
+				// Scene application is session-owned follow-up work, not the run's end.
+				endLoop({ continuing: true });
 				return;
 			}
 

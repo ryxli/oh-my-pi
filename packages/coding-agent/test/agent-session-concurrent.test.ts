@@ -175,8 +175,14 @@ describe("AgentSession concurrent prompt guard", () => {
 			modelRegistry: sharedModelRegistry,
 		});
 		let interrupted: Promise<void> | undefined;
+		const applied: string[] = [];
 		session.subscribe(event => {
-			if (event.type === "agent_end" && !interrupted) {
+			if (event.type === "scene_cut_applied") applied.push(event.continuation);
+			// The public run ends only after all continuations. Intercept the stopped
+			// loop's pause, before the staged scene can replace the current context.
+			if (event.type === "agent_pause" && !interrupted) {
+				expect(event.yielded).toBe(false);
+				expect(event.awaiting).toBe(false);
 				interrupted = session.abort({ reason: USER_INTERRUPT_LABEL });
 			}
 		});
@@ -188,13 +194,16 @@ describe("AgentSession concurrent prompt guard", () => {
 			continue: true,
 		});
 		await session.prompt("Original task");
+		expect(interrupted).toBeDefined();
 		await interrupted;
 		await session.waitForIdle();
 		expect(mock.calls).toHaveLength(1);
+		expect(applied).toEqual([]);
 		expect(JSON.stringify(session.messages)).not.toContain("Cancelled scene");
 		await session.prompt("New user task");
 		expect(mock.calls).toHaveLength(2);
 		expect(JSON.stringify(mock.calls[1].context.messages)).not.toContain("Cancelled scene");
+		expect(applied).toEqual([]);
 	});
 
 	it("drops a staged scene cut when a new session is queued ahead of it", async () => {
@@ -213,8 +222,14 @@ describe("AgentSession concurrent prompt guard", () => {
 			modelRegistry: sharedModelRegistry,
 		});
 		let switched: Promise<boolean> | undefined;
+		const applied: string[] = [];
 		session.subscribe(event => {
-			if (event.type === "agent_end" && !switched) switched = session.newSession();
+			if (event.type === "scene_cut_applied") applied.push(event.continuation);
+			if (event.type === "agent_pause" && !switched) {
+				expect(event.yielded).toBe(false);
+				expect(event.awaiting).toBe(false);
+				switched = session.newSession();
+			}
 		});
 		session.stageSceneCut({
 			label: "Outgoing scene",
@@ -224,10 +239,16 @@ describe("AgentSession concurrent prompt guard", () => {
 			continue: true,
 		});
 		await session.prompt("Original task");
+		expect(switched).toBeDefined();
 		expect(await switched).toBe(true);
 		await session.waitForIdle();
 		expect(mock.calls).toHaveLength(1);
+		expect(applied).toEqual([]);
 		expect(JSON.stringify(session.messages)).not.toContain("Belongs to the outgoing session");
+		await session.prompt("New session task");
+		expect(mock.calls).toHaveLength(2);
+		expect(JSON.stringify(mock.calls[1].context.messages)).not.toContain("Belongs to the outgoing session");
+		expect(applied).toEqual([]);
 	});
 
 	it.each(["abort", "dispose", "steer"] as const)(
