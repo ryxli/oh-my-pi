@@ -1512,16 +1512,16 @@ describe("AgentSession owner-routed async delivery", () => {
 			job.resolve("PRESERVED SCENE RESULT");
 			await manager.waitForOwnerJobs("SceneOwner");
 			expect(session.isSessionTransitioning).toBe(true);
-			expect(session.hasPendingAsyncWork()).toBe(true);
+			expect(session.wakeSources).toBeDefined();
 			expect(manager.isJobResultConsumed("scene-job")).toBe(false);
 			expect(mock.calls).toHaveLength(1);
 		} finally {
 			release.resolve();
 		}
 		await pending;
-		await session.settleAsyncWork();
+		await settleOwnedJobs(session, manager);
 		refresh.mockRestore();
-		expect(session.hasPendingAsyncWork()).toBe(false);
+		expect(session.wakeSources).toBeUndefined();
 		expect(manager.isJobResultConsumed("scene-job")).toBe(true);
 		expect(
 			session.messages.filter(message => JSON.stringify(message).includes("PRESERVED SCENE RESULT")),

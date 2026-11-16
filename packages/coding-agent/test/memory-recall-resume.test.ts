@@ -947,7 +947,7 @@ describe("Hindsight recall across a resume", () => {
 			settings: Settings.isolated({ "memory.backend": "hindsight" }),
 			getHindsightSessionState: () => state,
 			getMnemopiSessionState: () => undefined,
-			setBaseSystemPrompt: (prompt: string[]) => prompts.push(prompt),
+			restoreBaseSystemPromptBeforeMemoryPromotion: (prompt: string[]) => prompts.push(prompt),
 			refreshBaseSystemPrompt: async () => {
 				refresh.count++;
 			},
