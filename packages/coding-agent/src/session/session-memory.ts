@@ -262,7 +262,7 @@ export class SessionMemory {
 		state.resetRecall();
 		const promoted = this.#baseSystemPromptBeforeMemoryPromotion;
 		if (promoted !== undefined) {
-			this.#host.setBaseSystemPrompt(promoted);
+			this.#host.restoreBaseSystemPromptBeforeMemoryPromotion(promoted);
 			this.#baseSystemPromptBeforeMemoryPromotion = undefined;
 		}
 		await this.#host.refreshBaseSystemPrompt();

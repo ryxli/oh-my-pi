@@ -64,6 +64,7 @@ export const BUILTIN_TOOL_HELP: Record<BuiltinToolName, BuiltinToolHelp> = {
 	wait: { summary: "Wait for background jobs", defaultState: "on" },
 	todo: { summary: "Track a todo list", defaultState: "on" },
 	ask: { summary: "Ask the user questions (interactive mode only)", defaultState: "on" },
+	cut: { summary: "Stage a fresh visible scene after the current turn", defaultState: "on" },
 	web_search: { summary: "Search the web", defaultState: "on" },
 	lsp: { summary: "Language server queries (code intelligence)", defaultState: "on" },
 	ast_edit: { summary: "Rewrite code with AST patterns", defaultState: "on" },
