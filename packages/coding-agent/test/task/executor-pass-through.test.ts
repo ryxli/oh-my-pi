@@ -141,6 +141,7 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 			cwd: tempDir.path(),
 			mode: "execute",
 			writes: ["output.txt"],
+			outputSchema: {},
 		});
 		expect(turns).toBe(writeOnTurn === 1 ? 1 : 2);
 		expect(result.exitCode).toBe(writeOnTurn === 0 ? 1 : 0);
@@ -191,7 +192,6 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 				cwd: tempDir.path(),
 				mode: "execute",
 				writes: ["output.txt"],
-				structured: false,
 				settings: Settings.isolated({
 					"task.softRequestBudget": budgetStop ? 2 : 0,
 					"task.softRequestBudgetNotice": false,
